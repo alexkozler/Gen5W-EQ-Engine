@@ -1,0 +1,3 @@
+# LF line endings in every checkout, including on Windows: the shell scripts run on the car's
+# mksh and the build runs on Linux, and a CRLF script breaks both.
+* text=auto eol=lf
