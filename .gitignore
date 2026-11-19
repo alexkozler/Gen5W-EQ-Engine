@@ -1,0 +1,15 @@
+# Build output
+build/
+native/out/
+*.zip
+tests/host_test
+tests/conf/parse
+vhq/neon/*.o
+vhq/neon/*.elf
+vhq/neon/*.bin
+
+# Not for git (see CLAUDE.md): build tools, files copied from the car (Hyundai's), the app's signing key
+devtools/
+car-files/
+keys/
+tools/apktool/*.class

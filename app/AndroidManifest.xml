@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.eqengine.app"
+    android:versionCode="9"
+    android:versionName="0.6.0">
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="19" />
+    <!-- Needed to put an effect on the global music output (session 0). -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- HMG's ActivityManager checks GET_TASKS in finishActivity() (same as NEMESIS Manager). -->
+    <uses-permission android:name="android.permission.GET_TASKS" />
+    <application
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Holo.NoActionBar"
+        android:allowBackup="false">
+        <!-- Not full screen: the car's own top bar (Back, Home, clock) stays visible. -->
+        <activity
+            android:name=".MainActivity"
+            android:label="@string/app_name"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden|locale|fontScale">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
+        <!-- Started by the NEMESIS boot step (as root) and by the screen; not reachable by other apps. -->
+        <service
+            android:name=".EqService"
+            android:exported="false" />
+    </application>
+</manifest>
