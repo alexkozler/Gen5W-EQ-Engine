@@ -37,7 +37,7 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements Engine.Listener, EqPanel.Listener, NavRail.Listener,
         CarView.Listener, HSlider.Listener {
-    static final String VERSION = "0.6.0";
+    static final String VERSION = "0.6.1";
     private static final String ACT = "sh /data/eqengine/bin/act.sh";
     private static final String STATE = BootStatus.STATE_DIR;
     private static final String LAB = "/data/eqengine/lab";
@@ -51,6 +51,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     private EqSettings s;
     private volatile boolean busy;
     private boolean restarting;
+    private boolean labSwitch48; // the running Lab action only switches the 48 kHz output (no audio restart)
     private String convTarget;
     private TextView convLine, watchInfo, rateInfo;
     private final TextView[] convChips = new TextView[3];
@@ -517,7 +518,8 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         if (convLine != null) {
             String[] v = convStatus(c, want);
             if (restarting) {
-                convLine.setText(convTarget != null ? "Switching to " + convName(convTarget) + ": audio is restarting"
+                convLine.setText(labSwitch48 ? "Switching the main output's rate"
+                        : convTarget != null ? "Switching to " + convName(convTarget) + ": audio is restarting"
                         : "Android's audio is restarting");
                 convLine.setTextColor(Ui.SECONDARY);
             } else {
@@ -617,7 +619,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
             for (String line : Root.readLines(new File(DRV + "/status"), 40)) {
                 if (line.startsWith("state=")) l.drvState = line.substring(6);
                 else if (line.startsWith("reason=")) l.drvReason = line.substring(7);
-                else if (line.startsWith("out=") && line.contains(" flags=0x2 ") || line.startsWith("out=") && l.drvMain == null) {
+                else if (line.startsWith("link=pcm2p ") || line.startsWith("link=") && l.drvMain == null) {
                     l.drvMain = drvSummary(line);
                 }
             }
@@ -625,18 +627,18 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         return l;
     }
 
-    /** "out=13 rate=48000 ... fps=47998 peak_db=-1.2 ..." -> "48000 Hz, taken at 47998 frames/s, peak -1.2 dBFS" */
+    /** "link=pcm2p card=0 owner=4258 rate=44100 fps=44100" -> "link pcm2p 44100 Hz, measured 44100 frames/s" */
     private static String drvSummary(String line) {
-        String rate = null, fps = null, peak = null;
+        String link = null, rate = null, fps = null;
         for (String f : line.split(" ")) {
-            if (f.startsWith("rate=")) rate = f.substring(5);
+            if (f.startsWith("link=")) link = f.substring(5);
+            else if (f.startsWith("rate=")) rate = f.substring(5);
             else if (f.startsWith("fps=")) fps = f.substring(4);
-            else if (f.startsWith("peak_db=")) peak = f.substring(8);
         }
         StringBuilder b = new StringBuilder();
-        if (rate != null) b.append(rate).append(" Hz");
-        if (fps != null && !fps.equals("0")) b.append(", taken at ").append(fps).append(" frames/s");
-        if (peak != null && !peak.startsWith("-999")) b.append(", peak ").append(peak).append(" dBFS");
+        if (link != null) b.append("link ").append(link);
+        if (rate != null) b.append(b.length() > 0 ? " " : "").append(rate).append(" Hz");
+        if (fps != null && !fps.equals("0")) b.append(", measured ").append(fps).append(" frames/s");
         return b.toString();
     }
 
@@ -649,7 +651,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         String w, r;
         boolean ww = false, rw = false;
         if (l.watch) {
-            if ("watching".equals(l.drvState)) w = "Watching" + (l.drvMain != null && l.drvMain.length() > 0 ? ": main output " + l.drvMain : "");
+            if ("watching".equals(l.drvState)) w = "Watching" + (l.drvMain != null && l.drvMain.length() > 0 ? ": " + l.drvMain : "");
             else if ("pass-through".equals(l.drvState)) {
                 w = "Pass-through only: " + (l.drvReason != null ? l.drvReason : "the driver's table looked unfamiliar");
                 ww = true;
@@ -660,20 +662,41 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         } else if (l.ended != null && l.ended.contains("watch")) {
             w = cap(l.ended);
             ww = true;
-        } else w = "Off. Writes down every call to Hyundai's audio driver, until the next car start";
+        } else w = "Off. Writes down Android's calls to Hyundai's driver and measures the link, until the next car start";
         if (l.rate48) {
-            r = l.rateLast != null ? cap(l.rateLast) : "On";
-        } else if (l.ended != null && l.ended.contains("rate48")) {
+            r = l.rateLast != null ? rateShort(l.rateLast) : "On";
+        } else if (l.ended != null && (l.ended.contains("rate48") || l.ended.contains("48 kHz"))) {
             r = cap(l.ended);
             rw = true;
-        } else if (l.rateLast != null && !l.rateLast.startsWith("accepted")) {
-            r = "Last try: " + l.rateLast;
+        } else if (l.rateLast != null && l.rateLast.startsWith("refused")) {
+            r = "Last try: " + rateShort(l.rateLast);
             rw = true;
-        } else r = "Off. Asks Hyundai's driver for 48 kHz on the main output, until the next car start";
+        } else r = "Off. Asks Hyundai's driver to switch the main output to 48 kHz while music plays";
         watchInfo.setText(w);
         watchInfo.setTextColor(ww ? Ui.WARN : Ui.ON_SURFACE_VAR);
         rateInfo.setText(r);
         rateInfo.setTextColor(rw ? Ui.WARN : Ui.ON_SURFACE_VAR);
+    }
+
+    /**
+     * act.sh's 48 kHz result, short enough for the Lab line (the whole line stays in the saved logs):
+     * "accepted: output 101 at 48000 Hz, link pcm2p at 48000 Hz, measured 47998 frames/s; driver: ..." ->
+     * "Accepted: link pcm2p at 48000 Hz, measured 47998 frames/s";
+     * "refused: the driver kept 44.1 kHz (driver answered -22; ...); driver: ...; back at 44.1 kHz" ->
+     * "refused: the driver kept 44.1 kHz; back at 44.1 kHz".
+     */
+    static String rateShort(String t) {
+        if (t.startsWith("accepted: ")) {
+            int a = t.indexOf("link "), b = t.indexOf(';', a < 0 ? 0 : a);
+            return a < 0 ? "Accepted" : "Accepted: " + (b < 0 ? t.substring(a) : t.substring(a, b));
+        }
+        if (t.startsWith("refused: ")) {
+            int a = t.indexOf(" (driver answered");
+            int b = t.lastIndexOf("; ");
+            String what = a < 0 ? t : t.substring(0, a);
+            return b > a && a >= 0 ? what + t.substring(b) : what;
+        }
+        return cap(t);
     }
 
     /** which: 0 = driver watch, 1 = 48 kHz output */
@@ -694,23 +717,29 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         String title, body;
         if (which == 1 && on) {
             title = "Try a 48 kHz main output?";
-            body = "Android's main output (Android Auto's music and EQ Engine) asks Hyundai's driver for 48,000 Hz instead of "
-                    + "44,100. If the driver and the car's amplifier take it, Android Auto's 48 kHz music plays with no conversion "
-                    + "at all. If the driver keeps 44.1 kHz or the audio server does not keep running, EQ Engine removes the test "
-                    + "and restarts audio again. Start at low volume: if the amplifier does not follow, music can play off pitch "
-                    + "or crackle until you switch this off. Lasts until you switch it off or the next car start.";
+            body = "Play Android Auto's music first. EQ Engine then asks Hyundai's driver, through Android's own run-time setting, "
+                    + "to switch the main output (Android Auto's music and EQ Engine) from 44,100 to 48,000 Hz while it plays. "
+                    + "It counts as working only if Android, the driver's link setting and the rate the hardware really takes all "
+                    + "say 48,000; then Android Auto's 48 kHz music plays with no conversion at all. Anything else is put back to "
+                    + "44.1 kHz at once. Start at low volume: if the car's amplifier does not follow, music can play off pitch or "
+                    + "crackle until you switch this off. Lasts until you switch it off, an audio restart or the next car start. "
+                    + "No audio restart, a short gap in the sound. Parked only.";
         } else if (which == 0 && on) {
             title = "Watch Hyundai's audio driver?";
-            body = "A pass-through layer in front of Hyundai's audio driver writes down what Android sends it: stream set-ups, "
-                    + "settings strings, volumes, and what reaches each output (rate, levels). It changes nothing in the audio. "
-                    + "It runs inside Android's audio server, which also runs the rear camera; if the audio server stops "
-                    + "unexpectedly, EQ Engine removes the layer at once. Lasts until you switch it off or the next car start.";
+            body = "A pass-through layer in front of Hyundai's audio driver writes down what Android asks of it: stream set-ups, "
+                    + "settings strings, volumes and modes. It also measures the rate each hardware link really runs at, from the "
+                    + "kernel's own counters. It changes nothing in the audio. It runs inside Android's audio server, which also "
+                    + "runs the rear camera; if the audio server stops unexpectedly, EQ Engine removes the layer at once. Lasts "
+                    + "until you switch it off or the next car start.";
+        } else if (which == 1) {
+            title = "Back to 44.1 kHz?";
+            body = "Puts the main output back to 44,100 Hz. No audio restart, a short gap in the sound.";
         } else {
-            title = which == 0 ? "Stop watching the driver?" : "Back to 44.1 kHz?";
-            body = "Takes the test away and restarts Android's audio without it.";
+            title = "Stop watching the driver?";
+            body = "Takes the layer away and restarts Android's audio without it.";
         }
-        body += " Restarts Android's audio: a few seconds of silence. Parked only, never while reversing (the camera service "
-                + "restarts too).";
+        if (which == 0) body += " Restarts Android's audio: a few seconds of silence. Parked only, never while reversing (the "
+                + "camera service restarts too).";
         overlay.confirm(title, body, on ? "Start test" : "Stop test", new Runnable() {
             public void run() {
                 runLab(w, r);
@@ -721,12 +750,14 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     private void runLab(boolean w, boolean r) {
         if (!canRestartNow()) return;
         restarting = true;
+        labSwitch48 = w == labState().watch;
         engine.detachForRestart();
         EqLog.i("Lab tests: driver watch " + (w ? "on" : "off") + ", 48 kHz output " + (r ? "on" : "off"));
         syncConverterViews();
         rootAsync(ACT + " lab " + (w ? 1 : 0) + " " + (r ? 1 : 0), null, null, new Done() {
             public void done(boolean ok, String out) {
                 restarting = false;
+                labSwitch48 = false;
                 engine.restartFinished();
                 List<String> res = new ArrayList<String>();
                 boolean bad = false;
@@ -734,7 +765,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                     l = l.trim();
                     if (!l.startsWith("EQE_LAB ")) continue;
                     String t = l.substring(8);
-                    res.add(t);
+                    res.add(t.startsWith("rate48 ") ? "48 kHz " + rateShort(t.substring(7)) : t);
                     EqLog.i("Lab: " + t);
                     if (t.startsWith("failed") || t.contains("refused") || t.contains("not-loaded") || t.contains("pass-through")
                             || t.contains("error")) bad = true;

@@ -399,4 +399,18 @@ echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /
 rununtilstop
 ok "lab_active cleared, lab_result moved to lab_result.prev" "[ ! -f $VS/lab_active ] && [ ! -f $VS/lab_result ] && grep -q 'watch watching' $VS/lab_result.prev"
 
+echo "== 25. the start right after an install: a car restart before 'good' is not a strike"
+setup bootI1; mkdir -p $VS; echo installed > $VS/fresh_install
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "that start is marked 'installed' and the marker is used up" "grep -q 'bootI1 installed' $VS/lastboot && [ ! -f $VS/fresh_install ]"
+rm -f $T/stop; echo bootI2 > $T/proc/sys/kernel/random/boot_id
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 240 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "the next start counts no strike and is confirmed good" "grep -q \"install's\" $T/out.txt && ! grep -q 'strike 1' $T/out.txt && [ \"\$(cat $VS/strikes)\" = 0 ] && grep -q 'bootI2 good' $VS/lastboot"
+echo "   the marker only covers the run right after the install:"
+setup bootI3; mkdir -p $VS; echo installed > $VS/fresh_install; echo "turned off in the app" > $VS/disabled
+runboot 50
+ok "used up even when EQ Engine is off" "[ ! -f $VS/fresh_install ] && [ \"\$(st state)\" = off ]"
+
 echo "$SH: $pass passed, $fail failed"

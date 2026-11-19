@@ -17,9 +17,11 @@ KEEP=/dev/eqengine-keep
 mkdir -p $D/lib $D/conf $D/state $D/bin $SET
 cp bin/act.sh $D/bin/act.sh.new && mv $D/bin/act.sh.new $D/bin/act.sh
 cp bin/alsactl_dump $D/bin/alsactl_dump.new && mv $D/bin/alsactl_dump.new $D/bin/alsactl_dump
-cp bin/eqe_patch $D/bin/eqe_patch.new && mv $D/bin/eqe_patch.new $D/bin/eqe_patch
-chown root:root $D/bin $D/bin/act.sh $D/bin/alsactl_dump $D/bin/eqe_patch
-chmod 755 $D/bin $D/bin/act.sh $D/bin/alsactl_dump $D/bin/eqe_patch
+cp bin/eqe_lab $D/bin/eqe_lab.new && mv $D/bin/eqe_lab.new $D/bin/eqe_lab
+# 0.6.0 had a policy-copy 48 kHz test; its files are not used any more
+rm -f $D/bin/eqe_patch $D/conf/audio_policy_48k.conf
+chown root:root $D/bin $D/bin/act.sh $D/bin/alsactl_dump $D/bin/eqe_lab
+chmod 755 $D/bin $D/bin/act.sh $D/bin/alsactl_dump $D/bin/eqe_lab
 cp lib/libeqengine.so $D/lib/libeqengine.so.new && mv $D/lib/libeqengine.so.new $D/lib/libeqengine.so
 cp conf/audio_effects.conf $D/conf/audio_effects.conf.new && mv $D/conf/audio_effects.conf.new $D/conf/audio_effects.conf
 # Very high quality converter tables (Lab test) and their md5 from the build: the boot step only
@@ -36,6 +38,10 @@ chmod 644 $D/lib/libeqengine.so $D/conf/audio_effects.conf $D/lib/libaudio-resam
     $D/lib/eqe_drvwatch.so $D/conf/eqe_drvwatch.md5
 rm -f $D/state/disabled $D/state/strikes $D/state/lastboot $D/state/expected_restart $D/state/vhq_load $D/state/vhq_cut \
     $D/state/conv_cut $D/state/conv_fallback $D/state/lab_active
+# The boot step NEMESIS starts next runs alongside an audio server that cannot load the new filter
+# until it restarts: it marks that start "installed", so a car restart before it is confirmed good
+# is not counted as a strike (see boot.sh).
+echo installed > $D/state/fresh_install
 for f in $D/state/*; do
     [ -f "$f" ] && chmod 644 "$f"
 done
@@ -61,7 +67,7 @@ if [ -n "$OWNER" ]; then
     chmod 700 $SET
 fi
 read up rest < /proc/uptime
-echo "${up%%.*} installed EQ Engine 0.6.0 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
+echo "${up%%.*} installed EQ Engine 0.6.1 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
 chmod 644 $D/state/events.log
 
 # Note the result on the install stick, if it is still plugged in.
@@ -69,7 +75,7 @@ for d in /mnt/media_rw/usb0 /mnt/media_rw/usb1 /mnt/media_rw/usb2 /mnt/media_rw/
          /storage/usb0 /storage/usb1 /storage/usb2 /storage/usb3; do
     if [ -f "$d/README-EQENGINE.txt" ]; then
         mkdir -p "$d/EQENGINE" && {
-            echo "EQ Engine 0.6.0 installed"
+            echo "EQ Engine 0.6.1 installed"
             date
             pm path com.eqengine.app
             echo "settings folder owner: ${OWNER:-unknown}; kept settings restored: $RESTORED"

@@ -30,8 +30,9 @@
 #    can play, so before it converts any audio), then loads those tables into the audio server
 #    (only there). Without the marker nothing is loaded and 4 behaves like 3. The marker stays
 #    between starts, so it is already there when the next start's audio server comes up.
-#  - Lab tests (act.sh lab): the driver watch and the 48 kHz output are in-memory bind mounts,
-#    gone at the next car start (this step then clears state/lab_active). An unexpected audio
+#  - Lab tests (act.sh lab): the driver watch is an in-memory bind mount and the 48 kHz output a
+#    run-time switch in the running audio server; both are gone at the next car start (this step
+#    then clears state/lab_active), and the switch with any audio restart. An unexpected audio
 #    server restart while one is on removes them at once; such restarts (and those in the next
 #    60 s) are put down to the test: they neither step the converter down nor count towards
 #    "kept restarting".
@@ -41,7 +42,7 @@
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.6.0
+VER=0.6.1
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -211,7 +212,8 @@ lab_off() {
             _i=$((_i + 1))
         done
     done
-    rm -f $S/lab_active
+    # the 48 kHz test (0.6.1) is a run-time switch: a new audio server starts at 44.1 kHz anyway
+    rm -f $S/lab_active $S/rate48
     ! lab_mounted
 }
 
@@ -338,7 +340,7 @@ if [ "$_rb" != "$BID" ]; then
     rm -f $S/resampler.log $S/resampler.log.1 $S/resampler_now.log $S/last_restart $S/expected_restart
     rm -rf $S/restart.lock
     # Lab tests are in-memory: a new start has none
-    rm -f $S/lab_active $S/lab_ended
+    rm -f $S/lab_active $S/lab_ended $S/rate48
     [ -f $S/lab_result ] && mv $S/lab_result $S/lab_result.prev
     echo "$BID" > $S/runboot
 fi
@@ -347,6 +349,13 @@ fi
 if [ -f $S/events.log ]; then
     set -- $(ls -l $S/events.log)
     [ "$(num $4)" -gt 65536 ] && mv $S/events.log $S/events.old.log
+fi
+
+# Started by NEMESIS right after an install? (postinstall leaves this; only this run uses it)
+FRESH=0
+if [ -f $S/fresh_install ]; then
+    rm -f $S/fresh_install
+    FRESH=1
 fi
 
 STRIKES=0
@@ -361,6 +370,9 @@ if [ -f $S/lastboot ]; then
             applied|crashed)
                 STRIKES=$((STRIKES + 1))
                 event "previous start ended before it was confirmed good ($PPHASE): strike $STRIKES"
+                ;;
+            installed)
+                event "previous start was the install's (the running audio server could not load the filter yet): not counted"
                 ;;
             good)
                 STRIKES=0
@@ -400,7 +412,13 @@ else
     chmod 755 $D $D/lib $D/conf
     chmod 644 $LIB $OURS
     # Mark first: if the unit restarts during or right after this, the next start counts a strike.
-    set_lastboot applied
+    # Except right after an install (state/fresh_install, from postinstall): the audio server that
+    # is running then started before the install and cannot load the filter until it restarts, so
+    # that start can never be confirmed good, and restarting the car after installing is the
+    # instruction. That start is marked "installed" and does not count.
+    PHASE=applied
+    [ $FRESH = 1 ] && PHASE=installed
+    set_lastboot $PHASE
     if ! mount -o bind $OURS $TARGET; then
         stop_here refused "the in-memory overlay could not be mounted" refused
     fi

@@ -1,4 +1,4 @@
-EQ Engine 0.6.0 (NEMESIS package "eqengine")
+EQ Engine 0.6.1 (NEMESIS package "eqengine")
 =============================================
 
 A 10-band EQ and a listening-position delay for Android's main audio output
@@ -59,23 +59,28 @@ Converter (Lab: Stock, High, Very high; Very high is the default)
   Android's audio server, only by EQ Engine's own filter, and only while Very
   high is chosen and the file matches its checksum. Nothing in /system changes.
 
-Driver tests (Lab, new in 0.6.0, off until you start one; each lasts until you
-stop it or the next car start, and needs one audio restart, parked)
-- 48 kHz output: asks Hyundai's audio driver to run Android's main output at
-  48,000 Hz instead of 44,100 (an in-memory copy of Android's audio policy with
-  that one number changed, checked against the original first). If the driver
-  and the car's amplifier take it, Android Auto's 48 kHz music plays with no
-  conversion at all. EQ Engine checks the result: if the driver keeps
-  44.1 kHz, or the audio server does not keep running, it removes the test and
-  restarts audio again. Start at LOW volume: if the amplifier does not follow
-  the new rate, music can play off pitch or crackle until you stop the test.
-- Driver watch: a pass-through layer in front of Hyundai's audio driver
-  (loaded from an unchanged copy, checked first) writes down what Android
-  sends it: stream set-ups, settings strings, volumes, modes, and every 30 s
-  what reaches each output (the rate the driver really takes the audio at,
-  how long each write waits, levels). It changes nothing in the audio. If the
-  driver's tables look unfamiliar it hands everything over untouched and says
-  so. The notes go into Settings > Save logs to USB (drv_*.txt).
+Driver tests (Lab, off until you start one; parked, never while reversing)
+- 48 kHz output (changed in 0.6.1): with Android Auto's music playing, asks
+  Hyundai's driver, through Android's own run-time setting, to switch the main
+  output from 44,100 to 48,000 Hz. No audio restart, a short gap in the sound.
+  It counts as working only if Android, the driver's link setting and the rate
+  the hardware really takes (the kernel's own counters) all say 48,000; then
+  Android Auto's 48 kHz music plays with no conversion at all. Anything else
+  is put back to 44.1 kHz at once, and the Lab line says what was seen. Start
+  at LOW volume: if the amplifier does not follow the new rate, music can play
+  off pitch or crackle until you stop the test. Lasts until you stop it, an
+  audio restart or the next car start. (0.6.0 asked through a copy of the
+  audio policy at the audio server's start; the driver ignored that and kept
+  44.1 kHz.)
+- Driver watch (version 2 in 0.6.1): a pass-through layer in front of
+  Hyundai's audio driver (loaded from an unchanged copy, checked first) writes
+  down what Android asks of it: stream set-ups, settings strings, volumes and
+  modes, and every 30 s the rate each hardware link really runs at, from the
+  kernel's own counters. It changes nothing in the audio and no longer touches
+  the output streams. If the driver's tables look unfamiliar it hands
+  everything over untouched and says so. Switching it on or off needs one
+  audio restart; it lasts until you stop it or the next car start. The notes
+  go into Settings > Save logs to USB (drv_*.txt).
 - Both run inside Android's audio server, which also runs the rear camera.
   If the audio server restarts unexpectedly while a test is on, EQ Engine
   removes the test at once (and that restart does not count against the

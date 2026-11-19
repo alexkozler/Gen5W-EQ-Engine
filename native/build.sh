@@ -50,11 +50,13 @@ python3 "$HERE/gen_tramp.py" "$HERE/drvwatch_exports.txt" "$OUT/drvwatch_tramp.S
     -Wl,--no-undefined -Wl,--build-id=sha1 -Wl,--no-rosegment -Wl,--fatal-warnings -ldl -llog -lm
 "$BIN/llvm-strip" --strip-unneeded "$OUT/eqe_drvwatch.so"
 echo "built $OUT/eqe_drvwatch.so"
-# One-number file patcher for the Lab's 48 kHz test.
+# Lab helper for the 48 kHz test (0.6.1): measures the hardware links' real rate from the kernel's
+# counters, and sends Android's own per-output settings through the car's libmedia (found by name
+# at run time, so nothing of Android's is linked in).
 "$BIN/armv7a-linux-androideabi19-clang" \
     -std=c11 -O2 -Wall -Wextra -Werror -fPIE -pie \
     -march=armv7-a -mfloat-abi=softfp -mfpu=vfpv3-d16 -mthumb \
-    -o "$OUT/eqe_patch" "$HERE/eqe_patch.c" \
-    -Wl,--hash-style=both -Wl,-z,noexecstack -Wl,-z,relro -Wl,--no-rosegment -Wl,--fatal-warnings
-"$BIN/llvm-strip" --strip-unneeded "$OUT/eqe_patch"
-echo "built $OUT/eqe_patch"
+    -o "$OUT/eqe_lab" "$HERE/eqe_lab.c" \
+    -Wl,--hash-style=both -Wl,-z,noexecstack -Wl,-z,relro -Wl,--no-rosegment -Wl,--fatal-warnings -ldl
+"$BIN/llvm-strip" --strip-unneeded "$OUT/eqe_lab"
+echo "built $OUT/eqe_lab"

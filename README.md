@@ -18,15 +18,27 @@ It is a plain NEMESIS package. It is **not** an HMG-API mod and does not need HM
 
 ## Status
 
-**0.6.0** is built but **not yet tested on a car**. **0.5.0** was the last version tested on the
-car below. 0.6.0 adds the three-way converter choice (Stock, High, Very high) and two Lab tests of
-Hyundai's audio driver.
+**0.6.1** is built but **not yet tested on a car**.
+
+**0.6.0** was tested on the car below on 2026-11-19:
+- The EQ and the Very high converter worked, and the converter status after a car start was right.
+- Its Lab test "48 kHz output" showed that Hyundai's driver ignores the rate Android asks for when
+  an output opens: the driver kept 44.1 kHz, and the test removed itself as designed.
+- Its "Driver watch" did not report output streams. Hyundai's driver orders its function table
+  differently from Android 4.4's, so the watch's hooks were one position off from `set_parameters`
+  on. Audio was not affected.
+
+**0.6.1** changes:
+- The 48 kHz test uses the driver's run-time rate switch, through Android's own setting.
+- The driver watch is rebuilt for Hyundai's table and measures the real link rate from the
+  kernel's counters.
+- The first start after an install no longer counts against the failsafe.
 
 ## Verified vehicles
 
 | Car | Region | Audio system | Head unit software | Tested versions |
 |---|---|---|---|---|
-| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 (`NEEV.USA.0000.V015.012.260507`) | 0.1.0 to 0.5.0 |
+| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 (`NEEV.USA.0000.V015.012.260507`) | 0.1.0 to 0.6.0 |
 
 No other car or software version has been tested. Other cars may have a different amplifier (for
 example Bose), audio driver or audio settings. The package is marked for US Ioniq 5 software
@@ -273,37 +285,46 @@ built-in tables. EQ Engine supplies the library:
 - Each unexpected restart of Android's audio server steps the choice down one level (Very high,
   High, Stock) and keeps it. The Lab page says why. Choosing again undoes it.
 
-### Lab: driver tests (0.6.0, untested)
+### Lab: driver tests (0.6.1, not yet tested on the car)
 
-Both tests are off until you start one. Each lasts until you stop it or until the next car start,
-and needs one audio restart, parked.
+Both tests are off until you start one. Do them parked, never while reversing.
 
-- **48 kHz output:** asks Hyundai's audio driver to run Android's main output at 48,000 Hz, using
-  an in-memory copy of Android's audio policy with one number changed.
-  - The original file is checked against its checksum first.
-  - If the driver and the amplifier accept 48 kHz, Android Auto's music plays with no conversion
-    at all.
-  - If the driver keeps 44.1 kHz, or the audio server does not stay up, EQ Engine removes the test
-    and restarts audio again.
+- **48 kHz output:** with Android Auto's music playing, asks Hyundai's driver to switch the main
+  output from 44,100 to 48,000 Hz while it plays.
+  - **How it asks:** through Android's own run-time setting (`sampling_rate=48000` for the main
+    output). Android 4.4's mixer hands that to the driver, reads back the rate the driver reports
+    and rebuilds itself at that rate. Hyundai's driver has its own handling for that setting.
+  - **When it counts as working:** only if Android's output, the driver's link setting and the rate
+    the hardware link really takes (counted by the kernel) all say 48,000. Then Android Auto's
+    music plays with no conversion at all.
+  - **Anything else** is put back to 44.1 kHz at once, and the Lab line says what was seen.
   - **Start at low volume:** if the amplifier does not follow the new rate, music can play off
     pitch or crackle until you stop the test.
+  - No audio restart is needed, only a short gap in the sound. It lasts until you stop it, an audio
+    restart or the next car start.
+  - In 0.6.0 this test asked through a copy of Android's audio policy at the audio server's start.
+    Hyundai's driver received the 48 kHz request and started the hardware at 44.1 kHz anyway, so
+    that route cannot work on this car.
 - **Driver watch:** a pass-through layer in front of Hyundai's audio driver that records what
-  Android sends it.
-  - It records stream set-ups, settings strings, volumes and modes. Every 30 s it also records the
-    rate the driver really takes audio at, write waits and levels.
-  - It changes no audio.
-  - It loads an unchanged, checksum-checked copy of the driver. If the driver's tables look
-    unfamiliar, it hands everything over untouched and says so.
+  Android asks of it.
+  - It records stream set-ups (rate asked for and returned), settings strings, volumes and modes.
+    Every 30 s it also records the rate each hardware link really runs at, from the kernel's own
+    counters.
+  - It changes no audio and does not touch the output streams.
+  - It loads an unchanged, checksum-checked copy of the driver, and checks every entry of the
+    driver's function table before forwarding it. If anything looks unfamiliar, it hands
+    everything over untouched and says so.
+  - Switching it on or off needs one audio restart. It lasts until you stop it or the next car
+    start.
 
 If the audio server restarts unexpectedly while a test is on, EQ Engine removes the test at once.
 
 ## Safety and failsafes
 
-- **Nothing is written to `/system`.** All changes are in-memory bind mounts that end at the next
-  start.
+- **Nothing is written to `/system`.** All changes are in-memory bind mounts or run-time settings
+  that end at the next start.
 - **Firmware check:** the overlay is applied only if Android's effects list is byte for byte the
-  one the package was built from. The Lab tests check Hyundai's audio policy and driver the same
-  way.
+  one the package was built from. The Lab tests check Hyundai's audio driver the same way.
 - **Two-strike rule:** a start that is never confirmed good counts as a strike. Two in a row turn
   EQ Engine off.
 - **Crash watch:** unexpected audio server restarts, twice within 60 s or three times in one start,
@@ -326,8 +347,21 @@ before you post a log anywhere public, for example in a GitHub issue.
 
 ## Building from source
 
-The build runs on Linux x86_64, or on Windows with WSL. It was built and tested on Ubuntu 24.04
-with OpenJDK 21.
+The build runs on Linux x86_64, on Windows with WSL, or in Docker. It was built and tested on Ubuntu
+24.04 with OpenJDK 21.
+
+**With Docker** (Windows or macOS): `tools/build-env/Dockerfile` has everything except the NDK.
+Keep the NDK in a Docker volume:
+
+```sh
+docker build -t eqengine-build tools/build-env
+docker volume create eqengine-ndk
+docker run --rm -v eqengine-ndk:/opt/ndk eqengine-build sh -c 'cd /opt/ndk && curl -sSLO https://dl.google.com/android/repository/android-ndk-r25c-linux.zip && echo "53af80a1cce9144025b81c78c8cd556bff42bd0e  android-ndk-r25c-linux.zip" | sha1sum -c - && unzip -q android-ndk-r25c-linux.zip && rm android-ndk-r25c-linux.zip'
+docker run --rm -v "$PWD:/src" -v eqengine-ndk:/opt/ndk eqengine-build sh build.sh
+```
+
+The checksum is Google's published SHA-1 for that file. Run the tests below the same way, with
+`bash -c '...'` after `eqengine-build`.
 
 **What it needs:**
 - The Android NDK r25c for Linux (`NDK=`, default `~/ndk/android-ndk-r25c`) and a JDK (`javac`,
@@ -353,6 +387,7 @@ bash vhq/host/run.sh 40 9                     # converter tables against Android
 gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I tests -I native \
     -o tests/host_test tests/host_test.c -lm -ldl -lpthread && ./tests/host_test   # after vhq/host
 sh native/drvtest/run.sh                      # driver watch against a stand-in driver
+bash tests/lab/run.sh                         # the 48 kHz test's helper (link rates, Android's settings)
 python3 native/drvtest/tramp_test.py native/out/eqe_drvwatch.so \
     $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf native/drvwatch_exports.txt
 python3 tests/meta/check_meta.py pkg/NEMESIS.data
@@ -371,14 +406,14 @@ mksh.
 | `native/eqengine.c` | the audio filter, loaded by Android's audio server |
 | `vhq/` | EQ Engine's converter tables: the design script, the generated tables and their tests |
 | `native/drvwatch.c`, `native/gen_tramp.py` | Lab driver watch, a pass-through layer in front of Hyundai's audio driver |
-| `native/eqe_patch.c` | makes the 48 kHz test's copy of the audio policy |
+| `native/eqe_lab.c` | the 48 kHz test's helper: the links' real rate from the kernel's counters, and Android's own run-time settings |
 | `native/aosp44/`, `third_party/aosp-af/` | Android 4.4.2 headers and audio code, for building and testing |
 | `pkg/` | the NEMESIS package: `NEMESIS.data`, the boot step (`bin/boot.sh`), the app's root actions (`bin/act.sh`), install scripts, and the effects list overlay (`conf/audio_effects.conf`: Android's standard list plus EQ Engine's entry) |
 | `app/` | the Android app (Java, no Gradle) |
 | `rescue/` | the rescue stick |
 | `stick/README-EQENGINE.txt` | the README that goes on the install stick |
 | `tests/` | boot step, actions, filter, effects-list parsing and package metadata tests |
-| `tools/` | the signing helper and a mockup renderer for the app's pages at the car's screen size |
+| `tools/` | the signing helper, a mockup renderer for the app's pages at the car's screen size, and the Docker build environment (`tools/build-env/`) |
 | `docs/NOTES.md` | measurements, facts about the car and project history |
 
 ## License and credits

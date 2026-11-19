@@ -1,9 +1,10 @@
 /*
- * PC stand-in for Hyundai's audio driver, built against the Android 4.4 headers, for the driver
- * watch tests. It records every call it receives so the test can check that the watch layer
- * forwards each one exactly. FAKE_CORRUPT=1 puts a value that is not a function into one slot
- * (the watch must then hand the device over untouched). Writes wait as long as the audio lasts,
- * like a real driver.
+ * PC stand-in for Hyundai's audio driver, with Hyundai's 19-entry device table (hy_audio.h) and
+ * Android 4.4's stream table, for the driver watch tests. It records every call it receives so the
+ * test can check that the watch layer forwards each one exactly. FAKE_CORRUPT=1 puts a value that
+ * is not a function into one entry, FAKE_DATA_SLOT=1 a pointer to the driver's own data (the watch
+ * must then hand the device over untouched). Writes wait as long as the audio lasts, like a real
+ * driver.
  */
 #include <errno.h>
 #include <stdio.h>
@@ -14,6 +15,8 @@
 
 #include <hardware/audio.h>
 #include <hardware/hardware.h>
+
+#include "hy_audio.h"
 
 #define EXPORT __attribute__((visibility("default")))
 
@@ -92,25 +95,25 @@ static int o_get_presentation_position(const struct audio_stream_out *s, uint64_
     return -ENOSYS;
 }
 
-static uint32_t d_get_supported_devices(const struct audio_hw_device *d) { (void)d; return 0xffff; }
-static int d_init_check(const struct audio_hw_device *d) { (void)d; rec("init_check"); return 0; }
-static int d_set_voice_volume(struct audio_hw_device *d, float v) {
+static uint32_t d_get_supported_devices(const struct hy_dev *d) { (void)d; return 0xffff; }
+static int d_init_check(const struct hy_dev *d) { (void)d; rec("init_check"); return 0; }
+static int d_set_voice_volume(struct hy_dev *d, float v) {
     (void)d;
     fake_last_float[0] = v;
     rec("set_voice_volume %.3f", v);
     return 0;
 }
-static int d_set_master_volume(struct audio_hw_device *d, float v) {
+static int d_set_master_volume(struct hy_dev *d, float v) {
     (void)d;
     fake_last_float[0] = v;
     rec("set_master_volume %.3f", v);
     return -ENOSYS;
 }
-static int d_get_master_volume(struct audio_hw_device *d, float *v) { (void)d; (void)v; return -ENOSYS; }
-static int d_set_mode(struct audio_hw_device *d, audio_mode_t m) { (void)d; rec("set_mode %d", m); return 0; }
-static int d_set_mic_mute(struct audio_hw_device *d, bool m) { (void)d; rec("set_mic_mute %d", m); return 0; }
-static int d_get_mic_mute(const struct audio_hw_device *d, bool *m) { (void)d; *m = false; return 0; }
-static int d_set_parameters(struct audio_hw_device *d, const char *kv) {
+static int d_get_master_volume(struct hy_dev *d, float *v) { (void)d; (void)v; return -ENOSYS; }
+static int d_set_mode(struct hy_dev *d, audio_mode_t m) { (void)d; rec("set_mode %d", m); return 0; }
+static int d_set_mic_mute(struct hy_dev *d, bool m) { (void)d; rec("set_mic_mute %d", m); return 0; }
+static int d_get_mic_mute(const struct hy_dev *d, bool *m) { (void)d; *m = false; return 0; }
+static int d_set_parameters(struct hy_dev *d, const char *kv) {
     (void)d;
     if (bad(kv)) {
         rec("set_parameters (bad pointer)");
@@ -119,17 +122,17 @@ static int d_set_parameters(struct audio_hw_device *d, const char *kv) {
     rec("set_parameters %s", kv);
     return 0;
 }
-static char *d_get_parameters(const struct audio_hw_device *d, const char *k) {
+static char *d_get_parameters(const struct hy_dev *d, const char *k) {
     (void)d;
     rec("get_parameters %s", bad(k) ? "(bad)" : k);
     return strdup("sampling_rate=44100");
 }
-static size_t d_get_input_buffer_size(const struct audio_hw_device *d, const struct audio_config *c) {
+static size_t d_get_input_buffer_size(const struct hy_dev *d, const struct audio_config *c) {
     (void)d;
     rec("get_input_buffer_size %u", c->sample_rate);
     return 2048;
 }
-static int d_open_output_stream(struct audio_hw_device *d, audio_io_handle_t h, audio_devices_t devs,
+static int d_open_output_stream(struct hy_dev *d, audio_io_handle_t h, audio_devices_t devs,
                                 audio_output_flags_t flags, struct audio_config *c, struct audio_stream_out **out) {
     (void)d;
     fake_last_ptr[0] = c;
@@ -168,34 +171,35 @@ static int d_open_output_stream(struct audio_hw_device *d, audio_io_handle_t h, 
     *out = &o->s;
     return 0;
 }
-static void d_close_output_stream(struct audio_hw_device *d, struct audio_stream_out *s) {
+static void d_close_output_stream(struct hy_dev *d, struct audio_stream_out *s) {
     (void)d;
     rec("close_output_stream secret 0x%x", ((struct fake_out *)s)->secret);
     free(s);
 }
-static int d_open_input_stream(struct audio_hw_device *d, audio_io_handle_t h, audio_devices_t devs,
+static int d_open_input_stream(struct hy_dev *d, audio_io_handle_t h, audio_devices_t devs,
                                struct audio_config *c, struct audio_stream_in **in) {
     (void)d; (void)in;
     rec("open_input_stream %d 0x%x %u", h, devs, c->sample_rate);
     return -ENOSYS;
 }
-static void d_close_input_stream(struct audio_hw_device *d, struct audio_stream_in *s) { (void)d; (void)s; }
-static int d_dump(const struct audio_hw_device *d, int fd) { (void)d; (void)fd; return 0; }
-static int d_set_master_mute(struct audio_hw_device *d, bool m) { (void)d; rec("set_master_mute %d", m); return -ENOSYS; }
-static int d_get_master_mute(struct audio_hw_device *d, bool *m) { (void)d; (void)m; return -ENOSYS; }
+static void d_close_input_stream(struct hy_dev *d, struct audio_stream_in *s) { (void)d; (void)s; }
+static int d_dump(const struct hy_dev *d, int fd) { (void)d; (void)fd; return 0; }
+static int d_set_master_mute(struct hy_dev *d, bool m) { (void)d; rec("set_master_mute %d", m); return -ENOSYS; }
+static int d_get_master_mute(struct hy_dev *d, bool *m) { (void)d; (void)m; return -ENOSYS; }
+static int d_hy_extra(struct hy_dev *d, int v) { (void)d; rec("hy_extra %d", v); return 7; }
 static int d_close(hw_device_t *d) { free(d); return 0; }
 
 struct fake_dev {
-    struct audio_hw_device dev;
+    struct hy_dev dev;
     int secret;
 };
 
-EXPORT struct audio_hw_device *fake_device;
+EXPORT struct hy_dev *fake_device;
 
 static int d_open(const hw_module_t *mod, const char *name, hw_device_t **device) {
     if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0) return -EINVAL;
     struct fake_dev *f = calloc(1, sizeof(*f));
-    struct audio_hw_device *d = &f->dev;
+    struct hy_dev *d = &f->dev;
     d->common.tag = HARDWARE_DEVICE_TAG;
     d->common.version = AUDIO_DEVICE_API_VERSION_2_0;
     d->common.module = (struct hw_module_t *)mod;
@@ -207,6 +211,7 @@ static int d_open(const hw_module_t *mod, const char *name, hw_device_t **device
     d->get_master_volume = d_get_master_volume;
     d->set_mode = d_set_mode;
     d->set_mic_mute = d_set_mic_mute;
+    d->hy_extra = d_hy_extra;
     d->get_mic_mute = d_get_mic_mute;
     d->set_parameters = d_set_parameters;
     d->get_parameters = d_get_parameters;
@@ -218,7 +223,8 @@ static int d_open(const hw_module_t *mod, const char *name, hw_device_t **device
     d->dump = d_dump;
     d->set_master_mute = d_set_master_mute;
     d->get_master_mute = d_get_master_mute;
-    if (getenv("FAKE_CORRUPT")) d->get_master_mute = (int (*)(struct audio_hw_device *, bool *))(uintptr_t)0x1234;
+    if (getenv("FAKE_CORRUPT")) d->get_master_mute = (int (*)(struct hy_dev *, bool *))(uintptr_t)0x1234;
+    if (getenv("FAKE_DATA_SLOT")) d->get_master_mute = (int (*)(struct hy_dev *, bool *))(void *)fake_calls;
     f->secret = 0x7a5;
     fake_device = d;
     *device = &d->common;

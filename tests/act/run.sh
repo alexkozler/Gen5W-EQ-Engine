@@ -70,15 +70,11 @@ if [ "$1" = "$p" ]; then
 fi
 exit 0
 S
-    # what a new audio server finds at its start: the Lab mounts decide its driver and output rates
+    # what a new audio server finds at its start: the policy's 44100, and the driver watch if it is mounted
     cat > $T/stubs/server_start <<'S'
 #!/bin/sh
 T=/tmp/eqeact; n=$1
 echo "44100 44100" > $T/rates
-if grep -q " $T/system/etc/audio_policy.conf " $T/proc/mounts 2>/dev/null; then
-    [ -f $T/accept48 ] && echo "48000 44100" > $T/rates
-    [ -f $T/crash48 ] && { read u r < $T/proc/uptime; echo $(( ${u%%.*} + 2 )) > $T/crash_at; }
-fi
 if grep -q " $T/system/lib/hw/audio.primary.tcc803x.so " $T/proc/mounts 2>/dev/null; then
     echo "b6b00000-b6b20000 r-xp 00000000 b3:19 99   /data/eqengine/lib/hal/eqe_hal_orig.so" >> $T/proc/$n/maps
     mkdir -p $T/data/eqengine/drv; printf 'version=1\nstate=watching\n' > $T/data/eqengine/drv/status
@@ -91,7 +87,7 @@ read u r < /tmp/eqeact/proc/uptime; u=${u%%.*}; echo "$((u + $1)).10 50.00" > /t
 T=/tmp/eqeact
 if [ -f $T/crash_at ] && [ $((u + $1)) -ge $(cat $T/crash_at) ]; then
     rm -f $T/crash_at
-    # init starts a new audio server; it crashes again while the 48 kHz policy is still there
+    # init starts a new audio server
     p=$(cat $T/mspid); rm -rf $T/proc/$p; n=$((p + 1)); mkdir -p $T/proc/$n; echo $n > $T/mspid
     echo "crash $p" >> $T/crash.log
     $T/stubs/server_start $n
@@ -122,6 +118,7 @@ S
 #!/bin/sh
 case "$*" in
     *AudioService*) cat /tmp/eqeact/as.log ;;
+    *audio_hw_primary*) cat /tmp/eqeact/hal.log 2>/dev/null ;;
     *AudioResampler*)
         case "$*" in
             *AudioResampler:D*) echo "11-18 19:28:01.120 D/AudioResampler( 5156): forcing AudioResampler quality to 3" ;;
@@ -146,9 +143,15 @@ mkdumps() {
     dump_playing > $T/dump_playing.txt; dump_stuck > $T/dump_stuck.txt
     cat > $T/stubs/dumpsys <<'S'
 #!/bin/sh
+# one "internals" block per output thread (io handles 101, 102, ...; the main output first), then the tracks
+i=0
+for r in $(cat /tmp/eqeact/rates 2>/dev/null || echo 44100); do
+    i=$((i + 1))
+    printf 'Output thread 0xb5ae300%d internals\nNormal frame count: 2048\nio handle: %d\nTID: %d\nstandby: 0\nSample rate: %s\nHAL frame count: 2048\n' $i $((100 + i)) $((4257 + i)) $r
+    echo "Output thread 0xb5ae300$i stream volumes in dB:"
+done
 f=/tmp/eqeact/dump_$(cat /tmp/eqeact/now).txt
 [ -f "$f" ] && cat "$f"
-for r in $(cat /tmp/eqeact/rates 2>/dev/null || echo 44100); do echo "Sample rate: $r"; done
 exit 0
 S
     chmod +x $T/stubs/dumpsys
@@ -246,16 +249,17 @@ ok "a plain restart keeps the marker; the new server has the tables" "[ $(rc) = 
 
 echo "== Lab tests (driver watch, 48 kHz) under $SH"
 CAR=${EQE_CAR:-$R/car-files}
-labsetup() {  # a unit with Hyundai's driver and policy, EQ Engine's watch layer and patcher
+labsetup() {  # a unit with Hyundai's driver, EQ Engine's watch layer and Lab helper, Android Auto playing
     setup; mkdumps
     mkdir -p $T/system/lib/hw $T/system/etc $T/data/eqengine/lib $T/data/eqengine/conf $T/data/eqengine/bin
     cp $CAR/audio.primary.tcc803x.so $T/system/lib/hw/
-    cp $CAR/audio_policy.conf $T/system/etc/
     echo "watch layer" > $T/data/eqengine/lib/eqe_drvwatch.so
     md5sum < $T/data/eqengine/lib/eqe_drvwatch.so | cut -c1-32 > $T/data/eqengine/conf/eqe_drvwatch.md5
-    cp /tmp/eqeact_patch $T/data/eqengine/bin/eqe_patch
     echo "/dev/block/system /system ext4 ro 0 0" > $T/proc/mounts
-    rm -f $T/accept48 $T/crash48 $T/crash_at $T/crash.log $T/rates
+    rm -f $T/crash_at $T/crash.log $T/lab_calls.log $T/hal.log
+    echo "44100 44100" > $T/rates
+    echo 44100 > $T/link_rate; echo 44100 > $T/link_fps; touch $T/playing
+    echo accept > $T/driver48   # how the simulated driver takes sampling_rate=48000: accept | keep | convert | mismatch | crash | sticky
     cat > $T/stubs/mount <<'S'
 #!/bin/sh
 # mount -o bind SRC DST
@@ -268,12 +272,53 @@ grep -q " $1 " /tmp/eqeact/proc/mounts || exit 1
 cp "$1.under" "$1" && rm -f "$1.under"
 grep -v " $1 " /tmp/eqeact/proc/mounts > /tmp/eqeact/proc/mounts.n; mv /tmp/eqeact/proc/mounts.n /tmp/eqeact/proc/mounts
 S
-    chmod +x $T/stubs/*
+    # eqe_lab: link rates from the simulated kernel, sampling_rate through the simulated mixer and driver
+    cat > $T/data/eqengine/bin/eqe_lab <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+hal() { echo "11-19 15:16:26.210 D/audio_hw_primary( $(cat $T/mspid)): $1" >> $T/hal.log; }
+case "$1" in
+rate)
+    if [ -f $T/playing ]; then
+        set -- $(cat $T/rates); echo "link pcm2p card0 state=RUNNING owner=4258 rate=$(cat $T/link_rate) fps=$(cat $T/link_fps).0"
+    else echo "link none"; fi ;;
+set)
+    echo "set $2 $3" >> $T/lab_calls.log
+    case "$3" in
+    sampling_rate=48000)
+        case "$(cat $T/driver48)" in
+        accept|sticky) hal "sample rate  44100 is changed to 48000"; echo "48000 44100" > $T/rates; echo 48000 > $T/link_rate; echo 48000 > $T/link_fps; echo "status 0" ;;
+        keep) hal "Set sampling_rate error, out->pcm_config->rate (44100)"; echo "status -22" ;;
+        convert) echo "48000 44100" > $T/rates; echo "status 0" ;;
+        mismatch) hal "sample rate  44100 is changed to 48000"; echo 48000 > $T/link_rate; echo 48000 > $T/link_fps; echo "status 0" ;;
+        crash) p=$(cat $T/mspid); rm -rf $T/proc/$p; n=$((p + 1)); mkdir -p $T/proc/$n; echo $n > $T/mspid; echo "44100 44100" > $T/rates; echo "status -32" ;;
+        esac ;;
+    sampling_rate=44100)
+        if [ "$(cat $T/driver48)" != sticky ]; then
+            hal "sample rate  48000 is changed to 44100"; echo "44100 44100" > $T/rates; echo 44100 > $T/link_rate; echo 44100 > $T/link_fps
+        fi
+        echo "status 0" ;;
+    esac ;;
+esac
+exit 0
+S
+    # an audio restart (kill) brings back the policy's 44100
+    cat > $T/stubs/server_start <<'S'
+#!/bin/sh
+T=/tmp/eqeact; n=$1
+echo "44100 44100" > $T/rates; echo 44100 > $T/link_rate; echo 44100 > $T/link_fps
+if grep -q " $T/system/lib/hw/audio.primary.tcc803x.so " $T/proc/mounts 2>/dev/null; then
+    echo "b6b00000-b6b20000 r-xp 00000000 b3:19 99   /data/eqengine/lib/hal/eqe_hal_orig.so" >> $T/proc/$n/maps
+    mkdir -p $T/data/eqengine/drv; printf 'version=2\nstate=watching\n' > $T/data/eqengine/drv/status
+fi
+exit 0
+S
+    chmod +x $T/stubs/* $T/data/eqengine/bin/eqe_lab
 }
-gcc -O2 -o /tmp/eqeact_patch $R/native/eqe_patch.c
 LS=$T/data/eqengine/state
-HALT=$T/system/lib/hw/audio.primary.tcc803x.so; POLT=$T/system/etc/audio_policy.conf
+HALT=$T/system/lib/hw/audio.primary.tcc803x.so
 nkills() { [ -f $T/kill.log ] && wc -l < $T/kill.log || echo 0; }
+later() { echo "$(( $(cut -d. -f1 $T/proc/uptime) + ${1:-11} )).00 50.00" > $T/proc/uptime; }
 
 labsetup
 run lab 1 0
@@ -281,34 +326,62 @@ ok "watch: mounted over Hyundai's driver, with an exact copy of the driver kept"
 ok "watch: one audio restart, the new server runs Hyundai's driver behind the layer" "[ $(nkills) = 1 ] && grep -q 'EQE_LAB watch watching' $T/out.txt && grep -q ' watch' $LS/lab_active"
 run lab 1 0
 ok "watch again: nothing to do, no restart" "[ $(rc) = 0 ] && grep -q 'already on: watch' $T/out.txt && [ $(nkills) = 1 ]"
-echo "$(( $(cut -d. -f1 $T/proc/uptime) + 11 )).00 50.00" > $T/proc/uptime
+later
 run lab 0 0
 ok "off: unmounted, Hyundai's driver file back, one more restart" "[ $(rc) = 0 ] && ! grep -q \" $HALT \" $T/proc/mounts && [ \"\$(md5sum < $HALT | cut -c1-32)\" = 4e23b3753aecde59b180b374745653a7 ] && [ $(nkills) = 2 ] && [ ! -f $LS/lab_active ] && grep -q 'EQE_LAB off' $T/out.txt"
 
-labsetup; touch $T/accept48
-run lab 0 1
-ok "48 kHz accepted: the policy copy differs by that one number and is mounted" "[ $(rc) = 0 ] && grep -q \" $POLT \" $T/proc/mounts && [ \"\$(diff $CAR/audio_policy.conf $POLT | grep -c '^[<>]')\" = 2 ] && grep -q 'sampling_rates 48000' $POLT"
-ok "48 kHz accepted: reported with the output rates" "grep -q 'EQE_LAB rate48 accepted: outputs 48000 44100' $T/out.txt && grep -q 'rate48' $LS/lab_active"
-
 labsetup
 run lab 0 1
-ok "48 kHz kept at 44.1 by the driver: copy removed, restarted again, reported" "[ $(rc) = 0 ] && ! grep -q \" $POLT \" $T/proc/mounts && [ $(nkills) = 2 ] && grep -q 'EQE_LAB rate48 refused' $T/out.txt && [ ! -f $LS/lab_active ]"
-
-labsetup; touch $T/crash48
+ok "48 kHz accepted: one setting sent to the main output (io 101), no audio restart" "[ $(rc) = 0 ] && [ \"\$(cat $T/lab_calls.log)\" = 'set 101 sampling_rate=48000' ] && [ $(nkills) = 0 ]"
+ok "48 kHz accepted: Android, the link setting and the measured rate all reported, with the driver's own line" "grep -q 'EQE_LAB rate48 accepted: output 101 at 48000 Hz, link pcm2p at 48000 Hz, measured 48000 frames/s; driver: sample rate  44100 is changed to 48000' $T/out.txt"
+ok "48 kHz accepted: marked as on in this audio server" "grep -q rate48 $LS/lab_active && [ \"\$(cat $LS/rate48)\" = \"\$(cat $T/mspid) 101\" ]"
 run lab 0 1
-ok "48 kHz makes the audio server crash: test removed, audio restarted, reported" "[ $(rc) = 1 ] && ! grep -q \" $POLT \" $T/proc/mounts && grep -q 'EQE_LAB failed' $T/out.txt && [ ! -f $LS/lab_active ] && [ -f $T/crash.log ]"
-ok "after the failure the audio server stays up (stock policy back)" "[ -d $T/proc/\$(cat $T/mspid) ] && [ \"\$(md5sum < $POLT | cut -c1-32)\" = e99f7849076cd3767f5d93b2200ab8aa ]"
+ok "48 kHz again: nothing to do" "[ $(rc) = 0 ] && grep -q 'already on: rate48' $T/out.txt && [ \$(wc -l < $T/lab_calls.log) = 1 ]"
+later
+run lab 0 0
+ok "48 kHz off: 44100 sent back, both at 44.1 kHz again, no restart" "[ $(rc) = 0 ] && grep -q 'set 101 sampling_rate=44100' $T/lab_calls.log && grep -q 'EQE_LAB rate48 off: back at 44.1 kHz' $T/out.txt && [ \"\$(cat $T/rates)\" = '44100 44100' ] && [ $(nkills) = 0 ] && [ ! -f $LS/lab_active ] && [ ! -f $LS/rate48 ]"
 
-labsetup; touch $T/accept48
+labsetup; echo keep > $T/driver48
+run lab 0 1
+ok "the driver keeps 44.1 kHz: refused with its answer and its own line, nothing to undo, no restart" "[ $(rc) = 0 ] && grep -q 'EQE_LAB rate48 refused: the driver kept 44.1 kHz (driver answered -22; output 101 at 44100 Hz, link pcm2p at 44100 Hz, measured 44100 frames/s); driver: Set sampling_rate error' $T/out.txt && [ \$(wc -l < $T/lab_calls.log) = 1 ] && [ $(nkills) = 0 ] && [ ! -f $LS/lab_active ]"
+labsetup; echo convert > $T/driver48
+run lab 0 1
+ok "Android at 48 kHz but the link at 44.1 kHz (the driver converts): refused and put back" "[ $(rc) = 0 ] && grep -q 'rate48 refused: Android runs at 48 kHz but the link stays at 44.1 kHz' $T/out.txt && grep -q 'sampling_rate=44100' $T/lab_calls.log && [ \"\$(cat $T/rates)\" = '44100 44100' ] && [ $(nkills) = 0 ]"
+labsetup; echo mismatch > $T/driver48
+run lab 0 1
+ok "the link switched but Android did not: refused and put back" "[ $(rc) = 0 ] && grep -q \"rate48 refused: the link switched but Android's mixer did not follow\" $T/out.txt && grep -q 'sampling_rate=44100' $T/lab_calls.log && [ \"\$(cat $T/link_rate)\" = 44100 ]"
+labsetup; echo sticky > $T/driver48
+run lab 0 1
+later
+run lab 0 0
+ok "44.1 kHz does not come back by itself: audio restarted to get it back" "[ $(rc) = 0 ] && grep -q 'rate48 off: audio restarted to get 44.1 kHz back' $T/out.txt && [ $(nkills) = 1 ] && [ \"\$(cat $T/rates)\" = '44100 44100' ] && [ ! -f $LS/rate48 ]"
+labsetup; echo crash > $T/driver48
+run lab 0 1
+ok "the audio server stops after the switch: reported, marked for the boot step, not left on" "[ $(rc) = 1 ] && grep -q 'EQE_LAB failed: the audio server stopped after the 48 kHz switch' $T/out.txt && [ -f $LS/lab_ended ] && [ ! -f $LS/rate48 ] && [ ! -f $LS/lab_active ]"
+
+labsetup; rm -f $T/playing
+run lab 0 1
+ok "nothing playing: not started, nothing sent" "[ $(rc) = 1 ] && grep -q 'start Android Auto' $T/out.txt && [ ! -f $T/lab_calls.log ]"
+labsetup; echo "changed" >> $HALT
+run lab 0 1
+ok "a different Hyundai driver: the 48 kHz test is refused, nothing sent" "[ $(rc) = 1 ] && grep -q 'not the one this was built for' $T/out.txt && [ ! -f $T/lab_calls.log ]"
+labsetup; rm -f $T/data/eqengine/bin/eqe_lab
+run lab 0 1
+ok "the helper missing: refused" "[ $(rc) = 1 ] && grep -q 'not installed' $T/out.txt"
+
+labsetup
 run lab 1 1
-ok "both tests at once: both mounted, both reported, one restart" "[ $(rc) = 0 ] && grep -q \" $HALT \" $T/proc/mounts && grep -q \" $POLT \" $T/proc/mounts && [ $(nkills) = 1 ] && grep -q 'EQE_LAB watch watching' $T/out.txt && grep -q 'EQE_LAB rate48 accepted' $T/out.txt"
+ok "both tests at once: one restart for the watch, then the switch in the new audio server" "[ $(rc) = 0 ] && grep -q \" $HALT \" $T/proc/mounts && [ $(nkills) = 1 ] && grep -q 'EQE_LAB watch watching' $T/out.txt && grep -q 'EQE_LAB rate48 accepted' $T/out.txt && grep -q 'watch rate48' $LS/lab_active"
+later
+run restart
+ok "an audio restart ends the 48 kHz switch (marker gone, watch still listed)" "[ $(rc) = 0 ] && [ ! -f $LS/rate48 ] && ! grep -q rate48 $LS/lab_active && grep -q watch $LS/lab_active"
+labsetup; echo "1234 101" > $LS/rate48
+run lab 0 0
+ok "a marker from an earlier audio server counts as off" "[ $(rc) = 0 ] && grep -q 'no Lab test is on' $T/out.txt && [ ! -f $LS/rate48 ]"
 
 labsetup; echo "changed" >> $HALT
 run lab 1 0
-ok "a different Hyundai driver: refused, nothing mounted, no restart" "[ $(rc) = 1 ] && grep -q 'not the one this was built for' $T/out.txt && ! grep -q ' none ' $T/proc/mounts && [ $(nkills) = 0 ]"
-labsetup; echo "# changed" >> $POLT
-run lab 0 1
-ok "a different audio policy: refused, nothing mounted, no restart" "[ $(rc) = 1 ] && grep -q 'not the one this was built for' $T/out.txt && ! grep -q ' none ' $T/proc/mounts && [ $(nkills) = 0 ]"
+ok "a different Hyundai driver: the watch is refused, nothing mounted, no restart" "[ $(rc) = 1 ] && grep -q 'not the one this was built for' $T/out.txt && ! grep -q ' none ' $T/proc/mounts && [ $(nkills) = 0 ]"
 labsetup; echo "changed" >> $T/data/eqengine/lib/eqe_drvwatch.so
 run lab 1 0
 ok "a damaged watch layer: refused" "[ $(rc) = 1 ] && grep -q 'failed its check' $T/out.txt && [ $(nkills) = 0 ]"
@@ -323,7 +396,7 @@ run lab 2 0
 ok "a wrong argument is rejected" "[ $(rc) = 2 ]"
 labsetup
 run lab 1 0
-echo "$(( $(cut -d. -f1 $T/proc/uptime) + 3 )).00 50.00" > $T/proc/uptime
+later 3
 run lab 0 0
 ok "the 10 s gap between restarts applies to Lab tests too (nothing changed)" "[ $(rc) = 3 ] && grep -q EQE_WAIT $T/out.txt && grep -q \" $HALT \" $T/proc/mounts"
 

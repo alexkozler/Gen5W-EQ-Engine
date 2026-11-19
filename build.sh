@@ -58,7 +58,7 @@ echo "$1" > "$P/lib/libaudio-resampler.md5"
 set -- $(md5sum "$HERE/native/out/eqe_drvwatch.so")
 echo "$1" > "$P/lib/eqe_drvwatch.md5"
 cp "$HERE/pkg/conf/audio_effects.conf" "$P/conf/"
-cp "$HERE/pkg/bin/boot.sh" "$HERE/pkg/bin/act.sh" "$HERE/native/out/alsactl_dump" "$HERE/native/out/eqe_patch" "$P/bin/"
+cp "$HERE/pkg/bin/boot.sh" "$HERE/pkg/bin/act.sh" "$HERE/native/out/alsactl_dump" "$HERE/native/out/eqe_lab" "$P/bin/"
 cp "$HERE/pkg/scripts/"*.sh "$P/scripts/"
 chmod 755 "$P/bin/"* "$P/scripts/"*.sh
 chmod 644 "$P/lib/"*

@@ -9,9 +9,10 @@
 #                          Android reports its audio reconnected (or RECONNECT_MAX seconds)
 #   act.sh conv 4|3|0      converter choice without a restart: the next audio server start (an
 #                          audio restart or a car start) uses it (4 very high, 3 high, 0 stock)
-#   act.sh lab <w> <r>     Lab tests until the next car start, applied with one audio restart:
-#                          w = 1 driver watch (pass-through layer in front of Hyundai's audio driver),
-#                          r = 1 48 kHz main output. 0 0 removes both.
+#   act.sh lab <w> <r>     Lab tests until the next car start: w = 1 driver watch (pass-through
+#                          layer in front of Hyundai's audio driver; switching it needs one audio
+#                          restart), r = 1 48 kHz main output (Android's run-time switch, no
+#                          restart; an audio restart ends it). 0 0 removes both.
 #   act.sh off             turn EQ Engine off (later starts are stock)
 #   act.sh on              turn EQ Engine back on and start the boot step
 #   act.sh open <pkg/cls>  open one of Hyundai's Sound Settings screens (Lab page)
@@ -48,12 +49,11 @@ HAL_COPY=$D/lib/hal/eqe_hal_orig.so
 WATCH=$D/lib/eqe_drvwatch.so
 WATCHSUM=$D/conf/eqe_drvwatch.md5
 DRV=$D/drv
+# 0.6.0's 48 kHz test laid a policy copy here; still taken off if one is ever found mounted
 POL_T=$SYS/system/etc/audio_policy.conf
-POL_V=$SYS/vendor/etc/audio_policy.conf
-POL_MD5=e99f7849076cd3767f5d93b2200ab8aa
-POL48=$D/conf/audio_policy_48k.conf
-POL48_MD5=6b669d485f1f07d85cc925724de6697d
-POL_OFF=1514
+# 48 kHz test (0.6.1): "<audio server pid> <io handle>" while the switch is made
+R48=$S/rate48
+LABBIN=$D/bin/eqe_lab
 LAB_SETTLE=${EQE_LAB_SETTLE:-6}
 
 ms_pid() {
@@ -240,7 +240,7 @@ lab_unmount_all() {
 lab_write_active() {
     _a=""
     mounted_at $HAL_T && _a="$_a watch"
-    mounted_at $POL_T && _a="$_a rate48"
+    r48_live && _a="$_a rate48"
     if [ -n "$_a" ]; then
         echo "$_a" > $S/lab_active
         chmod 644 $S/lab_active
@@ -286,23 +286,178 @@ watch_on() {
     return 0
 }
 
-# Prepares and mounts the 48 kHz policy copy (one number changed). 0 = mounted, 1 = refused.
-rate48_on() {
-    mounted_at $POL_T && return 0
-    [ -f $POL_V ] && { echo "this unit has $POL_V, which Android reads instead; not starting the 48 kHz test"; return 1; }
-    [ "$(md5of $POL_T)" = "$POL_MD5" ] || {
-        echo "Android's audio policy is not the one this was built for (md5 $(md5of $POL_T)); not starting the 48 kHz test"
+# ------------------------------------------------------------------ 48 kHz test (run-time switch)
+#
+# Android 4.4's mixer thread takes "sampling_rate=N" for one output, hands it to Hyundai's driver,
+# reads back the rate the driver reports and rebuilds its mixer at that rate. Hyundai's driver has
+# its own handling for that key ("sample rate %d is changed to %d"). No file changes and no audio
+# restart; an audio restart or a car start brings back the policy's 44100. The test counts as
+# accepted only if Android's output, the hardware link's setting and the frames per second the
+# link really takes (the kernel's counters, eqe_lab rate) all say 48000; anything else is put
+# back to 44100 at once.
+
+# the switch was made in the audio server that is running now
+r48_live() {
+    [ -f $R48 ] || return 1
+    read _rp _rio < $R48
+    [ -n "$_rp" ] && [ "$_rp" = "$(ms_pid)" ]
+}
+
+# "<io> <tid> <rate>" of the main output: the first output thread in the audio server's dump
+# (Android opens the primary output first and lists threads by io handle)
+main_out() {
+    dumpsys media.audio_flinger 2>/dev/null | {
+        _in=0; _io=""; _tid=""; _sr=""
+        while read _a _b _c _rest; do
+            case "$_a $_b" in
+                "Output thread")
+                    # "Output thread 0xb5ae3008 internals" starts a thread's block
+                    [ $_in = 1 ] && break
+                    [ "$_rest" = internals ] && _in=1
+                    ;;
+                "io handle:") [ $_in = 1 ] && [ -z "$_io" ] && _io=$_c ;;
+                "Sample rate:") [ $_in = 1 ] && [ -z "$_sr" ] && _sr=$_c ;;
+                *) [ $_in = 1 ] && [ "$_a" = "TID:" ] && [ -z "$_tid" ] && _tid=$_b ;;
+            esac
+        done
+        echo "$_io $_tid $_sr"
+    }
+}
+
+# "<pcm> <rate> <frames/s>" of the hardware link the thread $1 plays on (nothing if none), counted
+# over $2 ms by the kernel's own counters
+link_of() {
+    $LABBIN rate ${2:-3000} 2>/dev/null | {
+        while read _k _pcm _card _st _ow _ra _fp _note; do
+            [ "$_k" = link ] && [ "$_ow" = "owner=$1" ] && [ -z "$_note" ] && { echo "$_pcm ${_ra#rate=} ${_fp#fps=}"; break; }
+        done
+    }
+}
+
+# Hyundai's driver's own lines about its rate, from the system log (newest last)
+hal_rate_lines() {
+    logcat -d -v time -s audio_hw_primary:V 2>/dev/null | {
+        while read _l; do
+            case "$_l" in
+                *"is changed to"*|*"same samplerate"*|*"sampling_rate error"*|*" rate : "*) echo "$_l" ;;
+            esac
+        done
+    }
+}
+
+hal_count() {
+    hal_rate_lines > $S/r48_hal.txt
+    _n=0
+    while read _l; do _n=$((_n + 1)); done < $S/r48_hal.txt
+    rm -f $S/r48_hal.txt
+    echo $_n
+}
+
+# the newest line hal_rate_lines has gained since it had $1, without the log prefix
+hal_new() {
+    hal_rate_lines > $S/r48_hal.txt
+    _n=0; _last=""
+    while read _l; do
+        _n=$((_n + 1))
+        [ $_n -gt $1 ] && _last=$_l
+    done < $S/r48_hal.txt
+    rm -f $S/r48_hal.txt
+    [ -n "$_last" ] && echo "${_last#*): }"
+}
+
+# puts output $1 back to 44100 if it or its link is elsewhere; restarts audio if that does not work
+rate48_back() {
+    set -- $1 $(main_out)
+    _io=$1; _tid=$3; _sr=$4
+    set -- $(link_of $_tid 1000)
+    if [ "$_sr" != 44100 ] || { [ -n "$2" ] && [ "$2" != 44100 ]; }; then
+        $LABBIN set $_io sampling_rate=44100 > /dev/null 2>&1
+        sleep 2
+        set -- $(main_out)
+        _sr=$3
+        set -- $(link_of $_tid 1000)
+        if [ "$_sr" != 44100 ] || { [ -n "$2" ] && [ "$2" != 44100 ]; }; then
+            rm -f $R48
+            restart_now "" > /dev/null
+            return 1
+        fi
+    fi
+    rm -f $R48
+    return 0
+}
+
+# 0 = done (accepted, or refused and put back: lab_result says which); 1 = not started, or failed
+rate48_start() {
+    [ -x $LABBIN ] || { echo "the 48 kHz test is not installed"; return 1; }
+    _drv=$HAL_T
+    mounted_at $HAL_T && _drv=$HAL_COPY
+    [ "$(md5of $_drv)" = "$HAL_MD5" ] || {
+        echo "Hyundai's audio driver is not the one this was built for (md5 $(md5of $_drv)); not starting the 48 kHz test"
         return 1
     }
-    if [ "$(md5of $POL48)" != "$POL48_MD5" ]; then
-        $D/bin/eqe_patch $POL_T $POL48.new $POL_OFF 44100 48000 || { rm -f $POL48.new; echo "making the 48 kHz policy copy failed"; return 1; }
-        mv $POL48.new $POL48
+    set -- $(main_out)
+    IO=$1; TID=$2; SR0=$3
+    [ -n "$IO" ] && [ -n "$TID" ] && [ -n "$SR0" ] || { echo "the audio server's main output was not found"; return 1; }
+    set -- $(link_of $TID 2000)
+    [ -n "$1" ] || { echo "nothing is playing on the main output: start Android Auto's music first, then the test"; return 1; }
+    [ "$SR0" = 44100 ] && [ "$2" = 44100 ] || {
+        echo "the main output runs at $SR0 Hz and its link at $2 Hz, not 44100; not starting the 48 kHz test"
+        return 1
+    }
+    N0=$(hal_count)
+    P0=$(ms_pid)
+    # marked first: if the audio server stops during the switch, the boot step puts it down to the test
+    echo "$P0 $IO" > $R48
+    chmod 644 $R48
+    lab_write_active
+    ANS=$($LABBIN set $IO sampling_rate=48000 2>&1)
+    case "$ANS" in
+        "status "*) ;;
+        *)
+            rm -f $R48
+            lab_write_active
+            echo "the 48 kHz switch could not be sent: $ANS"
+            return 1
+            ;;
+    esac
+    sleep 2
+    if [ "$(ms_pid)" != "$P0" ]; then
+        uptime_s > $S/lab_ended
+        chmod 644 $S/lab_ended
+        rm -f $R48
+        lab_write_active
+        lab_result "failed: the audio server stopped after the 48 kHz switch; it started again at 44.1 kHz"
+        return 1
     fi
-    chmod 644 $POL48
-    [ "$(md5of $POL48)" = "$POL48_MD5" ] || { rm -f $POL48; echo "the 48 kHz policy copy did not check out"; return 1; }
-    mount -o bind $POL48 $POL_T || { echo "the 48 kHz policy could not be mounted"; return 1; }
-    [ "$(md5of $POL_T)" = "$POL48_MD5" ] || { unmount_at $POL_T; echo "the 48 kHz policy did not check out after mounting; removed it"; return 1; }
+    set -- $(main_out)
+    SR1=$3
+    set -- $(link_of $TID 3000)
+    LP=$1; LR=$2; LF=${3%%.*}
+    HL=$(hal_new $N0)
+    SEEN="output $IO at ${SR1:-?} Hz, link ${LP:-?} at ${LR:-?} Hz, measured ${LF:-?} frames/s"
+    if [ "$SR1" = 48000 ] && [ "$LR" = 48000 ] && [ -n "$LF" ] && [ "$LF" -ge 47760 ] && [ "$LF" -le 48240 ]; then
+        lab_result "rate48 accepted: $SEEN${HL:+; driver: $HL}"
+        return 0
+    fi
+    case "$SR1/$LR" in
+        44100/44100) WHAT="the driver kept 44.1 kHz" ;;
+        48000/44100) WHAT="Android runs at 48 kHz but the link stays at 44.1 kHz (the driver converts)" ;;
+        44100/48000) WHAT="the link switched but Android's mixer did not follow" ;;
+        *) WHAT="unexpected result" ;;
+    esac
+    _b="back at 44.1 kHz"
+    rate48_back $IO || _b="audio restarted to get 44.1 kHz back"
+    lab_write_active
+    lab_result "rate48 refused: $WHAT (driver answered ${ANS#status }; $SEEN)${HL:+; driver: $HL}; $_b"
     return 0
+}
+
+rate48_stop() {
+    read _rp _rio < $R48
+    _b="back at 44.1 kHz"
+    rate48_back $_rio || _b="audio restarted to get 44.1 kHz back"
+    lab_write_active
+    lab_result "rate48 off: $_b"
 }
 
 # What the audio server's output threads run at ("44100 48000"), from its own dump.
@@ -347,78 +502,63 @@ lab_action() {
     [ -f $S/disabled ] && { echo "EQ Engine is off; turn it on first"; return 1; }
     WANT_W=$1
     WANT_R=$2
-    HAD=""
-    mounted_at $HAL_T && HAD="$HAD watch"
-    mounted_at $POL_T && HAD="$HAD rate48"
-    WANTED=""
-    [ $WANT_W = 1 ] && WANTED="$WANTED watch"
-    [ $WANT_R = 1 ] && WANTED="$WANTED rate48"
-    if [ "$WANTED" = "$HAD" ]; then
+    HAD_W=0
+    mounted_at $HAL_T && HAD_W=1
+    HAD_R=0
+    if r48_live; then HAD_R=1; else rm -f $R48; fi
+    if [ $WANT_W = $HAD_W ] && [ $WANT_R = $HAD_R ]; then
         lab_write_active
-        if [ -n "$HAD" ]; then echo "already on:$HAD"; else echo "no Lab test is on"; fi
+        _on=""
+        [ $HAD_W = 1 ] && _on="$_on watch"
+        [ $HAD_R = 1 ] && _on="$_on rate48"
+        if [ -n "$_on" ]; then echo "already on:$_on"; else echo "no Lab test is on"; fi
         return 0
     fi
     restart_lock || return 3
-    # take off what is no longer wanted, put on what is (nothing changes if a check fails)
-    [ $WANT_W = 0 ] && { unmount_at $HAL_T || { echo "the driver watch could not be removed"; return 1; }; }
-    [ $WANT_R = 0 ] && { unmount_at $POL_T || { echo "the 48 kHz policy could not be removed"; return 1; }; }
-    if [ $WANT_W = 1 ] && ! watch_on; then
-        lab_write_active
-        return 1
-    fi
-    if [ $WANT_R = 1 ] && ! rate48_on; then
-        [ $WANT_W = 1 ] && [ -z "$HAD" ] && unmount_at $HAL_T
-        lab_write_active
-        return 1
-    fi
-    lab_write_active
-    NOWA=""
-    mounted_at $HAL_T && NOWA="$NOWA watch"
-    mounted_at $POL_T && NOWA="$NOWA rate48"
-    restart_now "" || return 1
-    # Lab tests have to keep the audio server running, with outputs
-    RATES=""
-    if [ -n "$NOWA" ]; then
-        if ! server_steady $NP || [ -z "$(output_rates)" ]; then
-            # tells the boot step that the audio server restarts around now belong to the Lab test
-            uptime_s > $S/lab_ended
-            chmod 644 $S/lab_ended
-            lab_unmount_all
-            lab_result "failed: the audio server did not keep running with$NOWA; removed the Lab test and restarted audio"
-            sleep 2
-            restart_now "" || return 1
+    if [ $WANT_W != $HAD_W ]; then
+        # the driver watch is a file in place before the audio server starts: one restart, which
+        # also ends a 48 kHz switch (the new audio server starts at 44.1 kHz)
+        rm -f $R48
+        if [ $WANT_W = 0 ]; then
+            unmount_at $HAL_T || { echo "the driver watch could not be removed"; return 1; }
+        elif ! watch_on; then
+            lab_write_active
             return 1
         fi
-    fi
-    RATES=$(output_rates)
-    if [ $WANT_W = 1 ]; then
-        if maps_has $NP eqe_hal_orig.so; then
-            _st=""
-            [ -f $DRV/status ] && while read _l; do
-                case "$_l" in
-                    state=*) _st=${_l#state=} ;;
-                esac
-            done < $DRV/status
-            lab_result "watch ${_st:-started}"
-        else
-            lab_result "watch not-loaded"
-        fi
-    fi
-    if [ $WANT_R = 1 ]; then
-        case " $RATES " in
-            *" 48000 "*) lab_result "rate48 accepted: outputs $RATES; hardware $(hw_rates)" ;;
-            *)
-                # the driver kept another rate: take the copy away and restart once more, so the
-                # audio server runs exactly as before
-                unmount_at $POL_T
-                lab_write_active
-                lab_result "rate48 refused: outputs $RATES; removed the 48 kHz policy and restarted audio"
+        lab_write_active
+        restart_now "" || return 1
+        if [ $WANT_W = 1 ]; then
+            if ! server_steady $NP || [ -z "$(output_rates)" ]; then
+                # tells the boot step that the audio server restarts around now belong to the Lab test
+                uptime_s > $S/lab_ended
+                chmod 644 $S/lab_ended
+                lab_unmount_all
+                lab_result "failed: the audio server did not keep running with the driver watch; removed it and restarted audio"
                 sleep 2
                 restart_now "" || return 1
-                ;;
-        esac
+                return 1
+            fi
+            if maps_has $NP eqe_hal_orig.so; then
+                _st=""
+                [ -f $DRV/status ] && while read _l; do
+                    case "$_l" in
+                        state=*) _st=${_l#state=} ;;
+                    esac
+                done < $DRV/status
+                lab_result "watch ${_st:-started}"
+            else
+                lab_result "watch not-loaded"
+            fi
+        fi
+        HAD_R=0
     fi
-    [ -z "$NOWA" ] && lab_result "off: outputs $RATES"
+    if [ $WANT_R = 1 ] && [ $HAD_R = 0 ]; then
+        rate48_start || { lab_write_active; return 1; }
+    elif [ $WANT_R = 0 ] && [ $HAD_R = 1 ]; then
+        rate48_stop
+    fi
+    lab_write_active
+    [ $WANT_W = 0 ] && [ $WANT_R = 0 ] && lab_result "off: outputs $(output_rates)"
     logcat -d -v time -s audio_hw_primary:V EQEDrv:V AudioFlinger:V AudioPolicyManagerBase:V > $S/lab_now.log 2>/dev/null
     chmod 644 $S/lab_now.log 2>/dev/null
     return 0
@@ -526,6 +666,11 @@ restart_now() {
     WAITED=$(($(uptime_s) - T0))
     uptime_s > $S/last_restart
     chmod 644 $S/last_restart
+    # a 48 kHz switch ends with the audio server it was made in
+    if [ -f $R48 ]; then
+        rm -f $R48
+        lab_write_active
+    fi
     # the new audio server's converter line (it logs it when it first converts audio; the boot
     # step's capture records later ones). Matched to the server by its pid in the app.
     logcat -d -v time -s AudioResampler:D AudioResamplerSinc:E > $S/resampler_now.log 2>/dev/null
