@@ -2,10 +2,10 @@
 
 > [!WARNING]
 > **Mostly written by AI. Use at your own risk.** The code, the measurements and this README were
-> mostly written by an AI assistant (Anthropic's Claude). A person directed the work and tested it
+> mostly written by an AI assistant. A person directed the work and tested it
 > on one car. Tests on a PC and on that car have not shown problems, but this software runs inside
 > Android's audio server on your head unit, and you are responsible for anything you install on
-> your car. EQ Engine is not affiliated with Hyundai, Kia, Genesis, NEMESIS or HMG-API.
+> your car.
 
 A [NEMESIS](https://github.com/xwtk/hmg_nemesis) package for Hyundai's Gen5W head unit (Android
 4.4). It adds a 10-band EQ, a clip guard and a listening-position delay to Android's main audio
