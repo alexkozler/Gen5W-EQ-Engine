@@ -516,7 +516,6 @@ mksh.
 | `stick/README-EQENGINE.txt` | the README that goes on the install stick |
 | `tests/` | boot step, actions, filter, effects-list parsing and package metadata tests |
 | `tools/` | the signing helper, a mockup renderer for the app's pages at the car's screen size, and the Docker build environment |
-| `docs/NOTES.md` | measurements, facts about the car and the project's history |
 
 ## License and credits
 

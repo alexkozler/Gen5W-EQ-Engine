@@ -4,7 +4,7 @@
 # framework-res.apk, Google's apksig (v1 signature, min SDK 9, like the HMG-API app).
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-# Build tools (devtools/, not in git: see CLAUDE.md) and files copied from the car (car-files/,
+# Build tools (devtools/, not in git: see README.md) and files copied from the car (car-files/,
 # not in git: Hyundai's, never published). Both can be moved with EQE_TOOLS and EQE_CAR.
 T=${EQE_TOOLS:-$HERE/devtools}
 CAR=${EQE_CAR:-$HERE/car-files}
@@ -32,7 +32,7 @@ cp "$B/res.apk" "$B/unsigned.apk"
 (cd "$B/dex" && zip -q -X "$B/unsigned.apk" classes.dex)
 # The app must keep its signing key, or updates will not install over the app on the car.
 if [ ! -f "$KEYS/eqengine.keystore" ] && [ "${EQE_NEW_KEY:-}" != 1 ]; then
-    echo "keys/eqengine.keystore is missing. Restore it (see CLAUDE.md); EQE_NEW_KEY=1 makes a new one." >&2
+    echo "keys/eqengine.keystore is missing. Restore it (see README.md, Building from source); EQE_NEW_KEY=1 makes a new one." >&2
     exit 1
 fi
 if [ ! -f "$KEYS/eqengine.keystore" ]; then
@@ -70,8 +70,8 @@ cp "$HERE/stick/README-EQENGINE.txt" "$S/"
 mkdir -p "$S/EQENGINE-source"
 cp -r "$HERE/native" "$S/EQENGINE-source/"
 rm -rf "$S/EQENGINE-source/native/out"
-cp -r "$HERE/app" "$HERE/pkg" "$HERE/rescue" "$HERE/tests" "$HERE/vhq" "$HERE/third_party" "$HERE/tools" "$HERE/docs" \
-    "$HERE/build.sh" "$HERE/CLAUDE.md" "$S/EQENGINE-source/"
+cp -r "$HERE/app" "$HERE/pkg" "$HERE/rescue" "$HERE/tests" "$HERE/vhq" "$HERE/third_party" "$HERE/tools" \
+    "$HERE/build.sh" "$S/EQENGINE-source/"
 rm -f "$S/EQENGINE-source/tests/host_test" "$S/EQENGINE-source/tests/conf/parse"
 rm -f "$S/EQENGINE-source/vhq/neon/"*.o "$S/EQENGINE-source/vhq/neon/"*.elf "$S/EQENGINE-source/vhq/neon/"*.bin
 rm -f "$HERE/eqengine-stick.zip" "$HERE/eqengine-rescue-stick.zip"

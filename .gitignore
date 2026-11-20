@@ -8,7 +8,7 @@ vhq/neon/*.o
 vhq/neon/*.elf
 vhq/neon/*.bin
 
-# Not for git (see CLAUDE.md): build tools, files copied from the car (Hyundai's), the app's signing key
+# Not for git (see README.md): build tools, files copied from the car (Hyundai's), the app's signing key
 devtools/
 car-files/
 keys/
