@@ -4,7 +4,8 @@
 # while Android is down (because NEMESIS.emergency is on the stick).
 # It writes /data/eqengine/state/disabled (later starts skip the boot step), stops the boot step,
 # removes the in-memory overlay of Android's effects list, and puts Android's converter setting
-# back to its default (the very high quality converter's marker goes too). Nothing else.
+# back to its default (the very high quality converter's marker goes too), and stops the 48 kHz
+# keeper once it has put 44.1 kHz back (and its helper). Nothing else.
 # Results go to EQENGINE-RESCUE/ on this stick.
 
 U="$PWD"
@@ -47,7 +48,7 @@ mounted() {
     else
         echo "overlay removed (or was not there)"
     fi
-    # Lab tests (driver watch, 48 kHz policy), if one was on
+    # Lab tests (the driver watch, or 0.6.0's 48 kHz policy copy), if one was on
     for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf; do
         i=0
         while [ $i -lt 5 ]; do
@@ -57,11 +58,37 @@ mounted() {
             done < /proc/mounts
             [ $m = 0 ] && break
             umount $t
+            # busy while the audio server has the file loaded: detach it instead
+            [ $i = 0 ] && [ -x $D/bin/eqe_lab ] && $D/bin/eqe_lab umount $t
             i=$((i + 1))
         done
         [ $m = 1 ] && echo "Lab test $t still mounted: it goes away when the head unit restarts"
     done
     rm -f $D/state/lab_active
+    # the 48 kHz keeper puts 44.1 kHz back and stops once it sees "disabled"; then it is stopped
+    if [ -f $D/state/keep.pid ]; then
+        read kp < $D/state/keep.pid
+        i=0
+        while [ -n "$kp" ] && [ -f /proc/$kp/cmdline ] && [ $i -lt 15 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        if [ -n "$kp" ] && [ -f /proc/$kp/cmdline ]; then
+            read c < /proc/$kp/cmdline
+            case "$c" in
+                *act.sh*) kill $kp 2>/dev/null; echo "48 kHz keeper stopped" ;;
+            esac
+        fi
+    fi
+    if [ -f $D/state/hold/pid ]; then
+        read hp < $D/state/hold/pid
+        if [ -n "$hp" ] && [ -f /proc/$hp/cmdline ]; then
+            read c < /proc/$hp/cmdline
+            case "$c" in
+                *app_process*) kill $hp 2>/dev/null; echo "48 kHz helper stopped" ;;
+            esac
+        fi
+    fi
     echo "--- status"
     cat $D/state/status 2>&1
     echo "--- events"

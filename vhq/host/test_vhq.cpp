@@ -104,9 +104,9 @@ static double rms(const std::vector<int32_t> &y, double scale, size_t from, size
 }
 
 // Output for a DC input of 16384, per unit of input: the converter's gain in AudioMixer units.
-static double dcGain(AudioResampler::src_quality q, int inRate) {
+static double dcGain(AudioResampler::src_quality q, int inRate, int outRate = 44100) {
     std::vector<int16_t> in(48000 * 2, 16384);
-    std::vector<int32_t> y = run(q, inRate, 44100, in, 20000);
+    std::vector<int32_t> y = run(q, inRate, outRate, in, 20000);
     double s = 0;
     for (size_t i = 5000; i < 15000; i++) s += y[2 * i];
     return s / 10000 / 16384.0;
@@ -204,6 +204,21 @@ int main(int argc, char **argv) {
         if (f <= 6500) CHECK(rV < -80, "up-sampling images at %.0f Hz: %.1f dB", f, rV);
     }
 
+    // ---- 44.1 kHz -> 48 kHz: a 44.1 kHz source when the main output runs at 48 kHz (EQ Engine's
+    // 48 kHz output). Android uses the "up" table for it. Measured and reported, not judged: the
+    // "up" table was designed for voice prompts (flat to 0.42 x the input rate).
+    double gH44 = dcGain(HQ, 44100, 48000), gV44 = dcGain(VHQ, 44100, 48000);
+    printf("\n44.1 kHz -> 48 kHz (a 44.1 kHz source at a 48 kHz output); gain %.3f dB vs high\n", 20 * log10(gV44 / gH44));
+    printf("   tone      high: level   rest       very high: level   rest\n");
+    for (double f : {1000.0, 5000.0, 10000.0, 14000.0, 16000.0, 17000.0, 18000.0, 18500.0, 19000.0, 20000.0, 21000.0}) {
+        std::vector<int16_t> in = tone(f, 44100, 44100, 0.5);
+        std::vector<int32_t> yH = run(HQ, 44100, 48000, in, 44000), yV = run(VHQ, 44100, 48000, in, 44000);
+        double aH, rH, aV, rV;
+        fit(yH, gH44 * 32767 * 0.5, f / 48000, 2000, 42000, &aH, &rH);
+        fit(yV, gV44 * 32767 * 0.5, f / 48000, 2000, 42000, &aV, &rV);
+        printf("  %6.0f Hz     %7.2f dB %6.1f dB          %7.2f dB %6.1f dB\n", f, 20 * log10(aH), rH, 20 * log10(aV), rV);
+    }
+
     // ---- 32-bit headroom inside Android's sum: worst-case and full-scale noise inputs.
     // (UBSan aborts on signed overflow in Android's int32 arithmetic.)
     {
@@ -222,7 +237,14 @@ int main(int argc, char **argv) {
             run(VHQ, rate, 44100, wn, 44100 * 2, 5, 300);
             run(VHQ, rate, 44100, ny, 44100 * 2, 9, 2048);
         }
-        printf("\nfull-scale noise, random +/- full scale and a full-scale Nyquist square wave at 6 input rates: no overflow\n");
+        // and into a 48 kHz output (EQ Engine's 48 kHz output)
+        for (int rate : {44100, 16000, 22050, 32000, 11025, 8000}) {
+            run(VHQ, rate, 48000, sq, 48000 * 2, 3, 700);
+            run(VHQ, rate, 48000, wn, 48000 * 2, 5, 300);
+            run(VHQ, rate, 48000, ny, 48000 * 2, 9, 2048);
+        }
+        printf("\nfull-scale noise, random +/- full scale and a full-scale Nyquist square wave at 6 input rates, into 44.1 and "
+               "48 kHz: no overflow\n");
     }
 
     // ---- random rates, chunk sizes and signals: no out-of-range reads (ASan), no overflow (UBSan)

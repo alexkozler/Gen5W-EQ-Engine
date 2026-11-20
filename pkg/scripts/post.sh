@@ -37,7 +37,7 @@ chmod 755 $D $D/lib $D/conf $D/state
 chmod 644 $D/lib/libeqengine.so $D/conf/audio_effects.conf $D/lib/libaudio-resampler.so $D/conf/libaudio-resampler.md5 \
     $D/lib/eqe_drvwatch.so $D/conf/eqe_drvwatch.md5
 rm -f $D/state/disabled $D/state/strikes $D/state/lastboot $D/state/expected_restart $D/state/vhq_load $D/state/vhq_cut \
-    $D/state/conv_cut $D/state/conv_fallback $D/state/lab_active
+    $D/state/conv_cut $D/state/conv_fallback $D/state/lab_active $D/state/rate48_cut $D/state/idle48_bad
 # The boot step NEMESIS starts next runs alongside an audio server that cannot load the new filter
 # until it restarts: it marks that start "installed", so a car restart before it is confirmed good
 # is not counted as a strike (see boot.sh).
@@ -67,7 +67,7 @@ if [ -n "$OWNER" ]; then
     chmod 700 $SET
 fi
 read up rest < /proc/uptime
-echo "${up%%.*} installed EQ Engine 0.6.1 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
+echo "${up%%.*} installed EQ Engine 0.6.4 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
 chmod 644 $D/state/events.log
 
 # Note the result on the install stick, if it is still plugged in.
@@ -75,7 +75,7 @@ for d in /mnt/media_rw/usb0 /mnt/media_rw/usb1 /mnt/media_rw/usb2 /mnt/media_rw/
          /storage/usb0 /storage/usb1 /storage/usb2 /storage/usb3; do
     if [ -f "$d/README-EQENGINE.txt" ]; then
         mkdir -p "$d/EQENGINE" && {
-            echo "EQ Engine 0.6.1 installed"
+            echo "EQ Engine 0.6.4 installed"
             date
             pm path com.eqengine.app
             echo "settings folder owner: ${OWNER:-unknown}; kept settings restored: $RESTORED"

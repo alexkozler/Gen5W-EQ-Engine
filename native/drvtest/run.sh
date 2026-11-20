@@ -18,11 +18,11 @@ for v in out out_corrupt out_data; do
 done
 gcc $CF $SAN $INC -o $O/test_drv $HERE/test_drv.c -ldl -lpthread -lm
 export ASAN_OPTIONS=detect_leaks=0
-echo "== driver watch 2, Hyundai's layout"
+echo "== driver watch 3, Hyundai's layout"
 $O/test_drv $O/shim_out.so $O/fake_hal.so $O/out
-echo "== driver watch 2, an entry that is not a function"
+echo "== driver watch 3, an entry that is not a function"
 FAKE_CORRUPT=1 $O/test_drv $O/shim_out_corrupt.so $O/fake_hal.so $O/out_corrupt corrupt
-echo "== driver watch 2, an entry that points at the driver's data, not its code"
+echo "== driver watch 3, an entry that points at the driver's data, not its code"
 FAKE_DATA_SLOT=1 $O/test_drv $O/shim_out_data.so $O/fake_hal.so $O/out_data corrupt
 echo "--- sample of the log"
 head -40 $O/out/drv.log

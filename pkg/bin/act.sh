@@ -9,10 +9,13 @@
 #                          Android reports its audio reconnected (or RECONNECT_MAX seconds)
 #   act.sh conv 4|3|0      converter choice without a restart: the next audio server start (an
 #                          audio restart or a car start) uses it (4 very high, 3 high, 0 stock)
-#   act.sh lab <w> <r>     Lab tests until the next car start: w = 1 driver watch (pass-through
-#                          layer in front of Hyundai's audio driver; switching it needs one audio
-#                          restart), r = 1 48 kHz main output (Android's run-time switch, no
-#                          restart; an audio restart ends it). 0 0 removes both.
+#   act.sh lab <w>         Lab driver watch until the next car start: 1 = a pass-through layer in
+#                          front of Hyundai's audio driver, 0 = removed; switching it needs one
+#                          audio restart
+#   act.sh keep            the 48 kHz output keeper: runs in the background, started by the boot
+#                          step (see "48 kHz output" below)
+#   act.sh report <usb root> <app files dir> <seconds>
+#                          the car report: one text file on the stick, for sharing (no personal data)
 #   act.sh off             turn EQ Engine off (later starts are stock)
 #   act.sh on              turn EQ Engine back on and start the boot step
 #   act.sh open <pkg/cls>  open one of Hyundai's Sound Settings screens (Lab page)
@@ -20,6 +23,7 @@
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
+VER=0.6.4
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -51,10 +55,27 @@ WATCHSUM=$D/conf/eqe_drvwatch.md5
 DRV=$D/drv
 # 0.6.0's 48 kHz test laid a policy copy here; still taken off if one is ever found mounted
 POL_T=$SYS/system/etc/audio_policy.conf
-# 48 kHz test (0.6.1): "<audio server pid> <io handle>" while the switch is made
-R48=$S/rate48
+EFX_T=$SYS/system/etc/audio_effects.conf
+# the stock effects list this package was built for (the same value as in boot.sh)
+EFX_MD5=4d98c1b38bd1d9eaf929d9b616c0d118
 LABBIN=$D/bin/eqe_lab
 LAB_SETTLE=${EQE_LAB_SETTLE:-6}
+# 48 kHz output: "<audio server pid> <io handle>" while the main output runs at 48 kHz
+R48=$S/rate48
+OUTST=$S/output
+OUTLOG=$S/output.log
+SENT=$S/rate48_sent
+KEEP_PID=$S/keep.pid
+KEEP_POLL=${EQE_KEEP_POLL:-1}
+KEEP_TRIES=3
+# 0.6.3's marker (a switch made while nothing played did not reach the link); removed by the keeper
+IDLE_BAD=$S/idle48_bad
+# a new audio server gets this long (s) for its clients to reconnect before a switch while idle
+IDLE_AFTER=${EQE_IDLE_AFTER:-8}
+# Hold.java (in the app's package) keeps the main output's tracks safe during a rate change
+HOLD_D=$S/hold
+HOLD_MAX=90
+APP_PROCESS=${EQE_APP_PROCESS:-/system/bin/app_process}
 
 ms_pid() {
     # Reads all of ps's output: stopping early would kill ps with SIGPIPE (and leave a tombstone).
@@ -184,8 +205,8 @@ vhq_ok() {
 maps_has() {
     # $1 = pid, $2 = file name: is it mapped into that process?
     [ -f $PROC/$1/maps ] || return 1
-    while read _a _p _o _d _i _f; do
-        case "$_f" in
+    while read _ma _mp _mo _md _mi _mf; do
+        case "$_mf" in
             */$2) return 0 ;;
         esac
     done < $PROC/$1/maps
@@ -218,12 +239,20 @@ mounted_at() {
     return 1
 }
 
+# While the audio server has the file open (the driver watch is loaded in it), a plain umount
+# says "busy" (0.6.2 on the car): then it is detached instead (eqe_lab umount). The running audio
+# server keeps what it has loaded until the restart that follows; the next one opens Hyundai's file.
 unmount_at() {
+    mounted_at $1 || return 0
+    umount $1 2>/dev/null
+    if mounted_at $1 && [ -x $LABBIN ]; then
+        $LABBIN umount $1 > /dev/null 2>&1
+    fi
     _i=0
-    while mounted_at $1 && [ $_i -lt 5 ]; do
-        umount $1
+    while mounted_at $1 && [ $_i -lt 3 ]; do
+        sleep 1
+        umount $1 2>/dev/null
         _i=$((_i + 1))
-        mounted_at $1 && sleep 1
     done
     ! mounted_at $1
 }
@@ -240,7 +269,6 @@ lab_unmount_all() {
 lab_write_active() {
     _a=""
     mounted_at $HAL_T && _a="$_a watch"
-    r48_live && _a="$_a rate48"
     if [ -n "$_a" ]; then
         echo "$_a" > $S/lab_active
         chmod 644 $S/lab_active
@@ -286,21 +314,45 @@ watch_on() {
     return 0
 }
 
-# ------------------------------------------------------------------ 48 kHz test (run-time switch)
+# ------------------------------------------------------------------ 48 kHz output (act.sh keep)
 #
 # Android 4.4's mixer thread takes "sampling_rate=N" for one output, hands it to Hyundai's driver,
-# reads back the rate the driver reports and rebuilds its mixer at that rate. Hyundai's driver has
-# its own handling for that key ("sample rate %d is changed to %d"). No file changes and no audio
-# restart; an audio restart or a car start brings back the policy's 44100. The test counts as
-# accepted only if Android's output, the hardware link's setting and the frames per second the
-# link really takes (the kernel's counters, eqe_lab rate) all say 48000; anything else is put
-# back to 44100 at once.
+# reads back the rate the driver reports and rebuilds its mixer at that rate. On the test car the
+# driver then restarts the main link (I2S_3) at 48 kHz, so Android Auto's 48 kHz music plays with
+# no conversion. No file changes and no audio restart.
+#
+# "act.sh keep" runs in the background, started by the boot step. Once a second it reads the main
+# link's state from the kernel (/proc/asound; nothing is started for that).
+#  - While nothing plays (a new audio server, after IDLE_AFTER s), it switches the main output to
+#    the rate wanted with a silent track of its own running the link (Hold.java "wake"), so the
+#    music then starts at that rate with no gap. Hyundai's driver applies sampling_rate only to an
+#    active stream: sent while the stream is in standby, Android takes the new rate but the link
+#    later starts at the old one (0.6.3: 7 s of slow music). So nothing is ever sent while the
+#    main link is not running.
+#  - Each time the link starts playing or changes rate, it checks that Android's output and the
+#    link agree, and:
+#    - 48 kHz wanted (settings/rate48, on unless it says 0) and both at 44100: switches, and
+#      accepts only if Android's output, the link's setting and the frames per second the link
+#      really takes (eqe_lab rate) all say 48000. Anything else is put back to 44100 and held
+#      there for the rest of this audio server's life.
+#    - 48 kHz not wanted (or EQ Engine off) and both at 48000: puts 44100 back the same way.
+#    - Android and the link disagree (music would play at the wrong speed): sets both to the rate
+#      wanted, or else to 44100.
+#  - Every rate change is made with the main output's tracks held (hold_begin, below), and the
+#    tracks' buffers are checked after it and at every link start.
+# At most KEEP_TRIES switches per audio server. It never restarts the audio server. state/output
+# tells the app what it found and state/output.log what it did; state/rate48_sent (the time of
+# the last switch) lets the boot step put an audio server crash right after a switch down to it.
 
-# the switch was made in the audio server that is running now
-r48_live() {
-    [ -f $R48 ] || return 1
-    read _rp _rio < $R48
-    [ -n "$_rp" ] && [ "$_rp" = "$(ms_pid)" ]
+# 1 = 48 kHz wanted (the default), 0 = not (the setting is 0, or EQ Engine is off)
+rate48_wanted() {
+    _v=1
+    [ -f $D/settings/rate48 ] && read _v < $D/settings/rate48
+    [ -f $S/disabled ] && _v=0
+    case "$_v" in
+        0) echo 0 ;;
+        *) echo 1 ;;
+    esac
 }
 
 # "<io> <tid> <rate>" of the main output: the first output thread in the audio server's dump
@@ -334,130 +386,1167 @@ link_of() {
     }
 }
 
+# "<pcm> <state> <rate>" of the playback link the thread $1 has open (nothing if none), read
+# straight from the kernel's files: cheap enough to do every second
+link_now() {
+    for _f in $PROC/asound/card*/pcm*p/sub0/status; do
+        [ -f $_f ] || continue
+        _st=""
+        _ow=""
+        while read -r _k _a _b _c; do
+            case "$_k" in
+                state:) _st=$_a ;;
+                owner_pid) _ow=$_b ;;
+            esac
+        done < $_f
+        [ -n "$_ow" ] && [ "$_ow" = "$1" ] || continue
+        _d=${_f%/sub0/status}
+        _r=""
+        if [ -f $_d/sub0/hw_params ]; then
+            while read -r _k _a _b; do
+                [ "$_k" = "rate:" ] && _r=$_a
+            done < $_d/sub0/hw_params
+        fi
+        echo "${_d##*/} ${_st:-unknown} ${_r:-unknown}"
+        return 0
+    done
+    return 1
+}
+
 # Hyundai's driver's own lines about its rate, from the system log (newest last)
 hal_rate_lines() {
     logcat -d -v time -s audio_hw_primary:V 2>/dev/null | {
         while read _l; do
             case "$_l" in
-                *"is changed to"*|*"same samplerate"*|*"sampling_rate error"*|*" rate : "*) echo "$_l" ;;
+                *"is changed to"*|*"same samplerate"*|*"sampling_rate error"*|*" rate : "*|*"samplerate("*) echo "$_l" ;;
             esac
         done
     }
 }
 
-hal_count() {
-    hal_rate_lines > $S/r48_hal.txt
-    _n=0
-    while read _l; do _n=$((_n + 1)); done < $S/r48_hal.txt
-    rm -f $S/r48_hal.txt
-    echo $_n
+# the time of day as HHMMSS, on the system log's clock (the driver's lines are picked by it, so
+# no log is read before a switch: logcat -d takes seconds on the car)
+hms_now() {
+    date +%H%M%S 2>/dev/null
 }
 
-# the newest line hal_rate_lines has gained since it had $1, without the log prefix
-hal_new() {
+# hal_rate_lines from the time $1 (HHMMSS) on, without the log prefix, one per line
+hal_from() {
     hal_rate_lines > $S/r48_hal.txt
-    _n=0; _last=""
-    while read _l; do
-        _n=$((_n + 1))
-        [ $_n -gt $1 ] && _last=$_l
+    while read -r _d _t _rest; do
+        _c=${_t%%.*}
+        _h=${_c%%:*}; _c=${_c#*:}
+        _m=${_c%%:*}; _c=${_c#*:}
+        [ "1$_h$_m$_c" -ge "1$1" ] 2>/dev/null || continue
+        echo "${_rest#*): }"
     done < $S/r48_hal.txt
     rm -f $S/r48_hal.txt
-    [ -n "$_last" ] && echo "${_last#*): }"
 }
 
-# puts output $1 back to 44100 if it or its link is elsewhere; restarts audio if that does not work
-rate48_back() {
-    set -- $1 $(main_out)
-    _io=$1; _tid=$3; _sr=$4
-    set -- $(link_of $_tid 1000)
-    if [ "$_sr" != 44100 ] || { [ -n "$2" ] && [ "$2" != 44100 ]; }; then
-        $LABBIN set $_io sampling_rate=44100 > /dev/null 2>&1
-        sleep 2
-        set -- $(main_out)
-        _sr=$3
-        set -- $(link_of $_tid 1000)
-        if [ "$_sr" != 44100 ] || { [ -n "$2" ] && [ "$2" != 44100 ]; }; then
-            rm -f $R48
-            restart_now "" > /dev/null
-            return 1
+# the newest driver line about its rate since the time $1
+hal_new() {
+    _last=""
+    hal_from "$1" > $S/r48_haln.txt
+    while IFS= read -r _l; do _last=$_l; done < $S/r48_haln.txt
+    rm -f $S/r48_haln.txt
+    [ -n "$_last" ] && echo "$_last"
+}
+
+# all driver lines about its rate since the time $1, joined by " | "
+hal_since() {
+    _all=""
+    hal_from "$1" > $S/r48_haln.txt
+    while IFS= read -r _l; do _all="${_all:+$_all | }$_l"; done < $S/r48_haln.txt
+    rm -f $S/r48_haln.txt
+    echo "$_all"
+}
+
+out_log() {
+    echo "$(uptime_s) $*" >> $OUTLOG
+    chmod 644 $OUTLOG
+}
+
+# keep_note <state> <note>: what the app shows. state: 48k | 44k | held | mismatch | waiting | off
+keep_note() {
+    [ "$1|$2|$K_FPS" = "$K_NOTED" ] && return
+    K_NOTED="$1|$2|$K_FPS"
+    K_STATE=$1
+    {
+        echo "want=$K_WANT"
+        echo "state=$1"
+        echo "server=$K_PID"
+        echo "out=$K_OUT"
+        echo "link=$K_LINK"
+        echo "link_rate=$K_LR"
+        echo "fps=$K_FPS"
+        echo "at=$(uptime_s)"
+        echo "note=$2"
+    } > $OUTST.tmp
+    chmod 644 $OUTST.tmp
+    mv $OUTST.tmp $OUTST
+}
+
+# r48_send <rate>: sends sampling_rate=<rate> to the main output, then reads back what Android's
+# output (SR1), the link's setting (LP, LR) and the link's measured frames/s (LF) say; SEEN sums
+# it up and HL is the driver's own line. 0: all say <rate>; 1: they do not; 2: Android says <rate>
+# but nothing plays, so the link could not be checked; 3: the audio server stopped.
+r48_send() {
+    _want=$1
+    R48_T0=$(hms_now)
+    uptime_s > $SENT
+    chmod 644 $SENT
+    ANS=$($LABBIN set $K_IO sampling_rate=$_want 2>&1)
+    SR1=""; LP=""; LR=""; LF=""; HL=""
+    # A driver that takes the rate restarts the link at it within a fraction of a second. Until
+    # then Android may already mix at the new rate (wrong speed), so look at once, twice at most.
+    _i=0
+    while [ $_i -lt 2 ]; do
+        sleep 1
+        _i=$((_i + 1))
+        if [ "$(ms_pid)" != "$K_PID" ]; then
+            SEEN="the audio server stopped"
+            return 3
         fi
-    fi
-    rm -f $R48
-    return 0
-}
-
-# 0 = done (accepted, or refused and put back: lab_result says which); 1 = not started, or failed
-rate48_start() {
-    [ -x $LABBIN ] || { echo "the 48 kHz test is not installed"; return 1; }
-    _drv=$HAL_T
-    mounted_at $HAL_T && _drv=$HAL_COPY
-    [ "$(md5of $_drv)" = "$HAL_MD5" ] || {
-        echo "Hyundai's audio driver is not the one this was built for (md5 $(md5of $_drv)); not starting the 48 kHz test"
-        return 1
-    }
+        set -- $(link_now $K_TID)
+        LP=$1; LR=$3
+        [ "$2" = RUNNING ] || { LR=""; break; }
+        [ "$LR" = $_want ] && break
+    done
     set -- $(main_out)
-    IO=$1; TID=$2; SR0=$3
-    [ -n "$IO" ] && [ -n "$TID" ] && [ -n "$SR0" ] || { echo "the audio server's main output was not found"; return 1; }
-    set -- $(link_of $TID 2000)
-    [ -n "$1" ] || { echo "nothing is playing on the main output: start Android Auto's music first, then the test"; return 1; }
-    [ "$SR0" = 44100 ] && [ "$2" = 44100 ] || {
-        echo "the main output runs at $SR0 Hz and its link at $2 Hz, not 44100; not starting the 48 kHz test"
-        return 1
-    }
-    N0=$(hal_count)
-    P0=$(ms_pid)
-    # marked first: if the audio server stops during the switch, the boot step puts it down to the test
-    echo "$P0 $IO" > $R48
-    chmod 644 $R48
-    lab_write_active
-    ANS=$($LABBIN set $IO sampling_rate=48000 2>&1)
+    SR1=$3
+    # R48_QUICK (a switch made with the silent track): the frames/s are counted when music next
+    # plays and the driver's line is read after the silence, so the silence lasts only seconds
+    if [ -z "$R48_QUICK" ] && [ -n "$LR" ] && [ "$LR" = $_want ] && [ "$SR1" = $_want ]; then
+        set -- $(link_of $K_TID 3000)
+        [ -n "$1" ] && { LP=$1; LR=$2; LF=${3%%.*}; }
+        # the driver's own line; on a failure it is read after the put-back (logcat takes a while)
+        HL=$(hal_new "$R48_T0")
+    fi
+    if [ -z "$LR" ]; then
+        SEEN="output $K_IO at ${SR1:-?} Hz; the link is not playing"
+    else
+        SEEN="output $K_IO at ${SR1:-?} Hz, link ${LP:-?} at $LR Hz${LF:+, measured $LF frames/s}"
+    fi
     case "$ANS" in
         "status "*) ;;
-        *)
-            rm -f $R48
-            lab_write_active
-            echo "the 48 kHz switch could not be sent: $ANS"
+        *) SEEN="the setting could not be sent: $ANS"; return 1 ;;
+    esac
+    [ "$SR1" = $_want ] || return 1
+    [ -n "$LR" ] || return 2
+    [ "$LR" = $_want ] || return 1
+    [ -n "$R48_QUICK" ] && return 0
+    [ -n "$LF" ] && [ "$LF" -ge $((_want - _want / 200)) ] && [ "$LF" -le $((_want + _want / 200)) ]
+}
+
+# why a switch to 48 kHz did not take, from what r48_send read back
+r48_why() {
+    case "$SR1/$LR" in
+        44100/44100|44100/) echo "the driver kept 44.1 kHz" ;;
+        48000/44100) echo "Android went to 48 kHz but the link stayed at 44.1 kHz" ;;
+        44100/48000) echo "the link went to 48 kHz but Android's mixer stayed at 44.1 kHz" ;;
+        48000/48000) echo "the link took ${LF:-?} frames/s instead of 48000" ;;
+        *) echo "unexpected result ($SEEN)" ;;
+    esac
+}
+
+# keep_switch <rate>: one switch with its check. 0 = done (or done and checked when music plays
+# again); 1 = it did not take (K_PID is emptied if the audio server stopped)
+keep_switch() {
+    _to=$1
+    K_TRIES=$((K_TRIES + 1))
+    out_log "switching the main output to $_to Hz"
+    r48_send $_to
+    _rc=$?
+    case $_rc in
+        0)
+            K_OUT=$_to; K_LINK=$LP; K_LR=$LR; K_FPS=$LF; K_MEASURED="$K_PID $_to"
+            # with the silent track the frames/s are counted when music plays
+            [ -n "$R48_QUICK" ] && K_MEASURED=""
+            out_log "switched to $_to Hz: $SEEN${R48_QUICK:+ (a silent track ran the link)}${HL:+; driver: $HL}"
+            if [ $_to = 48000 ]; then
+                echo "$K_PID $K_IO" > $R48
+                chmod 644 $R48
+                keep_note 48k "48 kHz: Android Auto's music is not converted"
+            else
+                rm -f $R48
+                keep_note 44k "44.1 kHz"
+            fi
+            return 0
+            ;;
+        2)
+            K_OUT=$_to
+            out_log "switched to $_to Hz while nothing played (output $K_IO at $SR1 Hz); the link is checked when music plays"
+            K_LAST=""
+            keep_note waiting "Switched to $_to Hz; checked when music plays"
+            return 0
+            ;;
+        3)
+            out_log "the audio server stopped right after the switch to $_to Hz"
+            [ $_to = 48000 ] && K_NO48="the audio server stopped right after a switch to 48 kHz"
+            K_PID=""
             return 1
             ;;
     esac
-    sleep 2
-    if [ "$(ms_pid)" != "$P0" ]; then
-        uptime_s > $S/lab_ended
-        chmod 644 $S/lab_ended
+    out_log "the switch to $_to Hz did not take: $(r48_why) (driver answered ${ANS#status }; $SEEN)"
+    return 1
+}
+
+# keep_hold <why>: 44100 back, held there for this audio server; if even that does not work, says
+# that the rates disagree
+keep_hold() {
+    K_HELD=$1
+    if [ "$SR1" = 44100 ] && [ "$LR" != 48000 ]; then
+        # the switch changed nothing: Android is still at 44100 (and the link too, or idle)
+        K_OUT=44100
         rm -f $R48
-        lab_write_active
-        lab_result "failed: the audio server stopped after the 48 kHz switch; it started again at 44.1 kHz"
-        return 1
-    fi
-    set -- $(main_out)
-    SR1=$3
-    set -- $(link_of $TID 3000)
-    LP=$1; LR=$2; LF=${3%%.*}
-    HL=$(hal_new $N0)
-    SEEN="output $IO at ${SR1:-?} Hz, link ${LP:-?} at ${LR:-?} Hz, measured ${LF:-?} frames/s"
-    if [ "$SR1" = 48000 ] && [ "$LR" = 48000 ] && [ -n "$LF" ] && [ "$LF" -ge 47760 ] && [ "$LF" -le 48240 ]; then
-        lab_result "rate48 accepted: $SEEN${HL:+; driver: $HL}"
+        out_log "nothing to put back: Android's output stayed at 44.1 kHz; held there until the next audio restart or car start: $K_HELD"
+        keep_note held "$K_HELD; 44.1 kHz"
         return 0
     fi
-    case "$SR1/$LR" in
-        44100/44100) WHAT="the driver kept 44.1 kHz" ;;
-        48000/44100) WHAT="Android runs at 48 kHz but the link stays at 44.1 kHz (the driver converts)" ;;
-        44100/48000) WHAT="the link switched but Android's mixer did not follow" ;;
-        *) WHAT="unexpected result" ;;
+    r48_send 44100
+    _rc=$?
+    case $_rc in
+        0)
+            K_OUT=44100; K_LINK=$LP; K_LR=$LR; K_FPS=$LF; K_MEASURED="$K_PID 44100"
+            rm -f $R48
+            out_log "back at 44.1 kHz ($SEEN); held there until the next audio restart or car start: $K_HELD"
+            keep_note held "$K_HELD; back at 44.1 kHz"
+            ;;
+        2)
+            K_OUT=44100
+            rm -f $R48
+            K_LAST=""
+            keep_note held "$K_HELD; back at 44.1 kHz"
+            ;;
+        3)
+            out_log "the audio server stopped while putting 44.1 kHz back"
+            K_PID=""
+            ;;
+        *)
+            K_OUT=$SR1; K_LR=$LR
+            if [ -n "$SR1" ] && [ "$SR1" = "$LR" ]; then
+                out_log "44.1 kHz did not come back: $SEEN"
+                keep_note held "$K_HELD; stays at $SR1 Hz until the next audio restart or car start"
+            else
+                out_log "could not bring Android and the link back together: $SEEN"
+                keep_note mismatch "Android at ${SR1:-?} Hz, link at ${LR:-?} Hz: wrong speed. Restart Android audio (parked)"
+            fi
+            ;;
     esac
-    _b="back at 44.1 kHz"
-    rate48_back $IO || _b="audio restarted to get 44.1 kHz back"
-    lab_write_active
-    lab_result "rate48 refused: $WHAT (driver answered ${ANS#status }; $SEEN)${HL:+; driver: $HL}; $_b"
+}
+
+# ---- the main output's tracks during a rate change
+#
+# Android 4.4's mixer frees the output's mix buffer at a rate change and allocates a new one
+# (PlaybackThread::readOutputParameters). A track whose audio session has an effect chain is
+# moved to the new buffer with its chain. Every other track keeps a pointer to the freed buffer,
+# and the mixer goes on writing it there: the track is silent and the audio server's memory is
+# overwritten, which can crash it. It mostly goes unseen because the new buffer usually lands at
+# the old address. 0.6.2 hit it on the car (the first start after the install: the tracks at
+# B801AAE0, the mix buffer at 0xb8034c88, Android Auto's music silent until an audio restart).
+# So each change is made with every session that has a track on the main output "held":
+# Hold.java (in the app's package, run as root with app_process) puts a disabled EQ Engine filter
+# on each, which gives the session a chain of its own; releasing the filters afterwards points the
+# session's tracks at the output's buffer as it is then. A disabled filter passes the sound
+# through unchanged. Without the hold there is no rate change.
+
+# 0xb8034c88 or B8034C88 -> B8034C88 (the dump prints buffers both ways)
+hexup() {
+    _h=${1#0x}
+    _o=""
+    while [ -n "$_h" ]; do
+        _c=${_h%"${_h#?}"}
+        _h=${_h#?}
+        case "$_c" in
+            a) _c=A ;; b) _c=B ;; c) _c=C ;; d) _c=D ;; e) _c=E ;; f) _c=F ;;
+        esac
+        [ -z "$_o" ] && [ "$_c" = 0 ] && continue
+        _o=$_o$_c
+    done
+    echo "${_o:-0}"
+}
+
+# af_scan <io>: that output's buffers in the audio server's dump, one per line:
+#   mix <buffer>               the output's mix buffer
+#   track <session> <buffer>   each of its tracks, and the buffer the mixer writes it into
+#   chain <session> <buffer>   each of its effect chains, and the chain's input buffer
+af_scan() {
+    _want=$1
+    dumpsys media.audio_flinger 2>/dev/null | {
+        set -f
+        _io=""; _sec=""; _mix=""; _cs=""
+        while IFS= read -r _l; do
+            set -- $_l
+            case "$1 $2" in
+                "Output thread")
+                    case "$4" in
+                        internals) _sec=int; _io=""; _mix="" ;;
+                        tracks) _sec=trk ;;
+                        *) _sec="" ;;
+                    esac
+                    continue ;;
+                "Input thread"|"Record thread") _sec=""; _io=""; continue ;;
+                "mix buffer") [ "$_sec" = int ] && _mix=$4; continue ;;
+                "io handle:")
+                    if [ "$_sec" = int ]; then
+                        _io=$3
+                        [ "$_io" = "$_want" ] && [ -n "$_mix" ] && echo "mix $(hexup $_mix)"
+                    fi
+                    continue ;;
+                "Effects for") _cs=${4%:}; _sec=chain; continue ;;
+            esac
+            [ -n "$_io" ] && [ "$_io" = "$_want" ] || continue
+            case "$_sec" in
+                trk)
+                    case "$1" in ''|*[!0-9]*) continue ;; esac
+                    [ $# -ge 14 ] && echo "track $6 $(hexup ${14})" ;;
+                chain)
+                    case "$2" in
+                        0x*) echo "chain $_cs $(hexup $2)"; _sec="" ;;
+                    esac ;;
+            esac
+        done
+    }
+}
+
+# the installed app's package (Hold.java is in it)
+hold_apk() {
+    _apk=""
+    for _f in $SYS/data/app/com.eqengine.app-*.apk; do
+        [ -f "$_f" ] && _apk=$_f
+    done
+    echo "$_apk"
+}
+
+hold_is_ours() {
+    _c=""
+    [ -f $PROC/$1/cmdline ] && read -r _c < $PROC/$1/cmdline
+    case "$_c" in
+        *app_process*) return 0 ;;
+    esac
+    return 1
+}
+
+# hold_start [wake] <session>...: Hold.java on those sessions (and with "wake" a silent track of
+# its own); waits for its answer (15 s at most). 0 = held (HOLD_STATE: "held <n> <sessions>
+# [silent <session>]"); 1 = not (HOLD_WHY), and nothing is left held
+hold_start() {
+    HOLD_WHY=""; HOLD_STATE=""
+    _apk=$(hold_apk)
+    [ -n "$_apk" ] || { HOLD_WHY="EQ Engine's app package was not found"; return 1; }
+    rm -rf $HOLD_D
+    mkdir -p $HOLD_D
+    CLASSPATH=$_apk $APP_PROCESS /system/bin com.eqengine.app.Hold $HOLD_D $HOLD_MAX "$@" < /dev/null > $HOLD_D/out.txt 2>&1 &
+    echo $! > $HOLD_D/pid
+    _i=0
+    while [ $_i -lt 15 ]; do
+        sleep 1
+        _i=$((_i + 1))
+        [ -f $HOLD_D/state ] || continue
+        _hs=""
+        read -r _hs < $HOLD_D/state
+        case "$_hs" in
+            held*) HOLD_STATE=$_hs; return 0 ;;
+        esac
+        HOLD_WHY=${_hs#failed }
+        break
+    done
+    [ -n "$HOLD_WHY" ] || HOLD_WHY="the helper did not answer within 15 s"
+    hold_end
+    return 1
+}
+
+# hold_end: Hold.java releases its filters and stops (or is stopped after 5 s: Android then
+# releases them itself)
+hold_end() {
+    [ -d $HOLD_D ] || return 0
+    : > $HOLD_D/release
+    _hp=""
+    [ -f $HOLD_D/pid ] && read _hp < $HOLD_D/pid
+    _i=0
+    while [ $_i -lt 5 ]; do
+        _hs=""
+        [ -f $HOLD_D/state ] && read -r _hs < $HOLD_D/state
+        case "$_hs" in
+            released*|failed*) break ;;
+        esac
+        [ -n "$_hp" ] && [ -d $PROC/$_hp ] || [ $_i -lt 1 ] || break
+        sleep 1
+        _i=$((_i + 1))
+    done
+    case "$_hs" in
+        released*|failed*) ;;
+        *) [ -n "$_hp" ] && hold_is_ours $_hp && kill $_hp 2>/dev/null ;;
+    esac
+    rm -rf $HOLD_D
+}
+
+# hold_begin [wake]: holds every session with a track on the main output (not session 0, nor one
+# that already has a chain), then checks in the dump that none of those tracks plays into the mix
+# buffer any more. A track that appeared in between (a new session) spoils that: the hold is made
+# again, 3 times at most. With "wake", Hold.java also plays silence, and the main link must be
+# running before this returns. 0 = ready for a rate change (HOLD_N sessions held, HOLD_SILENT the
+# silent track's session); 1 = not (HOLD_WHY; HOLD_NOFX when EQ Engine's filter is not in this
+# audio server, so trying again cannot help)
+hold_begin() {
+    _wake=$1
+    HOLD_N=0; HOLD_SESS=""; HOLD_SILENT=""; HOLD_WHY=""; HOLD_NOFX=""
+    hold_end
+    # the hold is made of EQ Engine filters: none if the audio server read its effects list
+    # before the boot step's overlay
+    if [ -n "$K_PID" ] && [ -f $PROC/$K_PID/maps ] && ! maps_has $K_PID libeqengine.so; then
+        HOLD_WHY="EQ Engine's filter is not loaded in this audio server"
+        HOLD_NOFX=1
+        return 1
+    fi
+    _att=0
+    while :; do
+        _att=$((_att + 1))
+        af_scan $K_IO > $S/af.txt
+        _mix=""; _chs=""; _ss=""
+        while read -r _k _a _b; do
+            case "$_k" in
+                mix) _mix=$_a ;;
+                chain) _chs="$_chs $_a" ;;
+            esac
+        done < $S/af.txt
+        if [ -z "$_mix" ]; then
+            HOLD_WHY="the audio server's dump does not show the main output's buffers"
+            return 1
+        fi
+        while read -r _k _a _b; do
+            [ "$_k" = track ] || continue
+            case "$_a" in
+                ''|*[!0-9]*|0) continue ;;
+            esac
+            case " $_chs $_ss " in
+                *" $_a "*) continue ;;
+            esac
+            _ss="$_ss $_a"
+        done < $S/af.txt
+        [ -n "$_ss$_wake" ] || return 0
+        hold_start $_wake $_ss || return 1
+        # "held <n> <sessions> [silent <session>]"
+        set -- $HOLD_STATE
+        shift 2
+        HOLD_SESS=""; HOLD_SILENT=""
+        while [ $# -gt 0 ]; do
+            if [ "$1" = silent ]; then
+                HOLD_SILENT=$2
+                break
+            fi
+            HOLD_SESS="${HOLD_SESS:+$HOLD_SESS }$1"
+            shift
+        done
+        if [ -n "$_wake" ]; then
+            # the silent track starts the main link within a fraction of a second
+            _i=0; _run=""
+            while [ $_i -lt 3 ]; do
+                set -- $(link_now $K_TID)
+                [ "$2" = RUNNING ] && { _run=1; break; }
+                sleep 1
+                _i=$((_i + 1))
+            done
+            if [ -z "$_run" ]; then
+                HOLD_WHY="the main output's link did not start with the silent track"
+                hold_end
+                return 1
+            fi
+        fi
+        af_scan $K_IO > $S/af.txt
+        _bad=""
+        while read -r _k _a _b; do
+            [ "$_k" = track ] && [ "$_b" = "$_mix" ] && _bad="$_bad $_a"
+        done < $S/af.txt
+        if [ -z "$_bad" ]; then
+            set -- $HOLD_SESS
+            HOLD_N=$#
+            return 0
+        fi
+        HOLD_WHY="tracks of session(s)$_bad still play into the mix buffer (new ones, or the hold did not reach them)"
+        hold_end
+        HOLD_SESS=""; HOLD_SILENT=""
+        [ $_att -lt 3 ] || return 1
+        out_log "a track came up during the hold (session(s)$_bad): holding again"
+    done
+}
+
+# buffers_check: 0 = each track on the main output plays into its mix buffer or its session's
+# chain (BUF_N tracks); 1 = some do not (STALE: their sessions); 2 = the dump does not show them
+buffers_check() {
+    STALE=""; BUF_N=0
+    af_scan $K_IO > $S/af.txt
+    _mix=""
+    while read -r _k _a _b; do
+        [ "$_k" = mix ] && _mix=$_a
+    done < $S/af.txt
+    [ -n "$_mix" ] || return 2
+    while read -r _k _a _b; do
+        [ "$_k" = track ] || continue
+        BUF_N=$((BUF_N + 1))
+        [ "$_b" = "$_mix" ] && continue
+        _okc=0
+        while read -r _k2 _a2 _b2; do
+            [ "$_k2" = chain ] && [ "$_a2" = "$_a" ] && [ "$_b2" = "$_b" ] && _okc=1
+        done < $S/af.txt
+        [ $_okc = 1 ] && continue
+        case " $STALE " in
+            *" $_a "*) ;;
+            *) STALE="$STALE $_a" ;;
+        esac
+    done < $S/af.txt
+    STALE=${STALE# }
+    [ -z "$STALE" ]
+}
+
+# Tracks found pointing at a buffer the main output no longer uses are moved back with a short
+# hold on their sessions. 0 = all fine (or the dump does not show it); 1 = some are left (K_UNSAFE)
+keep_buffers() {
+    buffers_check
+    [ $? = 1 ] || return 0
+    out_log "tracks of session(s) $STALE play into a buffer the main output no longer uses (Android lost them at a rate change); moving them back"
+    uptime_s > $SENT
+    chmod 644 $SENT
+    hold_start $STALE && hold_end
+    if buffers_check; then
+        out_log "moved back: all $BUF_N tracks on the main output play into its buffer"
+        return 0
+    fi
+    out_log "not moved back (${HOLD_WHY:-session(s) $STALE still elsewhere})"
+    K_UNSAFE="After a rate change some tracks play into a freed buffer. Restart Android audio (parked)"
+    keep_note unsafe "$K_UNSAFE"
+    return 1
+}
+
+# keep_change <rate> <why> [1] [wake]: switches the main output to <rate> with its check; if that
+# does not take, puts 44100 back and holds it, saying <why> (with 1: and what did not take). All of
+# it with the main output's tracks held; their buffers are checked afterwards. With "wake" (nothing
+# plays), Hold.java's silent track runs the main link during the change, and the frames/s are
+# counted when music next plays. 0 = <rate> in place (or checked when music plays); 1 = not
+# (K_HOLDFAIL: the tracks could not be held; tried again unless K_HELD says why not).
+keep_change() {
+    _to=$1; _why=$2; _add=$3; _kw=$4
+    K_HOLDFAIL=""
+    uptime_s > $SENT
+    chmod 644 $SENT
+    if ! hold_begin $_kw; then
+        K_TRIES=$((K_TRIES + 1))
+        K_HOLDFAIL=1
+        out_log "no rate change: the main output's tracks could not be held for it ($HOLD_WHY)"
+        # tried again (while music plays at the next check; after a silent try when music starts),
+        # unless the filter is missing or the tries are used up
+        _again=""
+        [ -z "$HOLD_NOFX" ] && { [ -n "$_kw" ] || [ $K_TRIES -lt $KEEP_TRIES ]; } && _again=1
+        if [ -n "$HOLD_NOFX" ]; then
+            K_HELD="48 kHz not used: EQ Engine's filter is not loaded in this audio server. Restart Android audio once (parked)"
+        elif [ -z "$_again" ]; then
+            K_HELD="48 kHz not used: the tracks could not be held for the switch (see the logs)"
+        fi
+        case "$K_OUT/$K_LR" in
+            48000/44100|44100/48000) keep_note mismatch "Android at $K_OUT Hz, link at $K_LR Hz: wrong speed. Restart Android audio (parked)" ;;
+            48000/48000) [ -n "$_again" ] || keep_note held "44.1 kHz not put back: the tracks could not be held (see the logs); 48 kHz until the next audio restart" ;;
+            *)
+                if [ -n "$_again" ]; then
+                    keep_note waiting "The tracks could not be held for the switch; trying again"
+                else
+                    keep_note held "$K_HELD"
+                fi ;;
+        esac
+        return 1
+    fi
+    # (no apostrophe inside ${...:+...}: bash takes it for a quote there, dash and mksh do not)
+    if [ -n "$HOLD_SILENT" ] && [ $HOLD_N -gt 0 ]; then
+        out_log "a silent track (session $HOLD_SILENT) runs the main link for the change; holding the main output's audio sessions ($HOLD_SESS)"
+    elif [ -n "$HOLD_SILENT" ]; then
+        out_log "a silent track (session $HOLD_SILENT) runs the main link for the change"
+    elif [ $HOLD_N -gt 0 ]; then
+        out_log "holding the main output's audio sessions ($HOLD_SESS) for the change"
+    fi
+    R48_QUICK=$_kw
+    _kc=0; _t0=""
+    if [ -z "$_to" ]; then
+        _kc=1
+        SR1=""; LR=""
+        keep_hold "$_why"
+    elif ! keep_switch $_to; then
+        _kc=1
+        _t0=$R48_T0
+        if [ -n "$K_PID" ] && [ -n "$_why" ]; then
+            [ "$_add" = 1 ] && _why="$_why: $(r48_why)"
+            keep_hold "$_why"
+        fi
+    else
+        _t0=$R48_T0
+        [ -n "$_kw" ] && K_IDLESW="$K_PID $_to"
+    fi
+    R48_QUICK=""
+    # the silence ends here; the driver's lines are read only now (logcat takes seconds on the car)
+    hold_end
+    if [ -n "$K_PID" ] && [ -n "$_t0" ]; then
+        if [ $_kc = 1 ]; then
+            _hl=$(hal_since "$_t0")
+            [ -n "$_hl" ] && out_log "the driver's lines about its rate since the switch: $_hl"
+        elif [ -n "$_kw" ]; then
+            _hl=$(hal_new "$_t0")
+            [ -n "$_hl" ] && out_log "the driver's line for that switch: $_hl"
+        fi
+    fi
+    [ -n "$K_PID" ] && keep_buffers
+    return $_kc
+}
+
+# Nothing plays on the main link: switch now, with a silent track running the link (the driver
+# ignores a rate sent to a stream in standby), so that the music starts at the rate wanted with
+# no gap. Once per audio server and setting, IDLE_AFTER s after the audio server appeared.
+keep_idle() {
+    [ -n "$K_PID" ] && [ -n "$K_IO" ] || return 0
+    [ "$K_IDLED" = "$K_PID $K_WANT" ] && return 0
+    [ -n "$K_HELD$K_NO48$K_UNSAFE" ] && return 0
+    [ $K_TRIES -lt $KEEP_TRIES ] || return 0
+    [ $(($(uptime_s) - K_SINCE)) -ge $IDLE_AFTER ] || return 0
+    set -- $(main_out)
+    [ "$2" = "$K_TID" ] || return 0
+    K_OUT=$3
+    K_IDLED="$K_PID $K_WANT"
+    if [ $K_WANT = 1 ] && [ "$K_OUT" = 44100 ]; then
+        out_log "nothing plays: switching the main output to 48 kHz now, so the music starts at it"
+        keep_change 48000 "48 kHz did not take" 1 wake
+    elif [ $K_WANT = 0 ] && [ "$K_OUT" = 48000 ]; then
+        out_log "nothing plays: putting 44.1 kHz back now"
+        keep_change 44100 "44.1 kHz did not come back at the first try" "" wake
+    fi
     return 0
 }
 
-rate48_stop() {
-    read _rp _rio < $R48
-    _b="back at 44.1 kHz"
-    rate48_back $_rio || _b="audio restarted to get 44.1 kHz back"
-    lab_write_active
-    lab_result "rate48 off: $_b"
+# The main link ($1) started playing or changed rate ($2). 0 = done; 1 = look again next time.
+keep_check() {
+    _pcm=$1
+    _lr=$2
+    set -- $(main_out)
+    [ -n "$3" ] || return 1
+    [ "$2" = "$K_TID" ] || { K_TID=$2; return 1; }
+    K_IO=$1; K_OUT=$3; K_LINK=$_pcm; K_LR=$_lr
+    # tracks left on a freed buffer first: no rate change while that is so
+    keep_buffers || return 0
+    if [ "$K_OUT" != "$_lr" ]; then
+        # said once per disagreement (a hold that failed is tried again at the next round)
+        [ "$K_MISSAID" = "$K_PID $K_OUT $_lr" ] || out_log "Android's output runs at $K_OUT Hz but link $_pcm at $_lr Hz"
+        K_MISSAID="$K_PID $K_OUT $_lr"
+        if [ $K_WANT = 1 ] && [ -z "$K_HELD" ] && [ -z "$K_NO48" ] && [ $K_TRIES -lt $KEEP_TRIES ]; then
+            keep_change 48000 "Android and the link disagreed ($K_OUT and $_lr Hz)"
+        else
+            keep_change "" "Android and the link disagreed ($K_OUT and $_lr Hz)"
+        fi
+        [ -n "$K_HOLDFAIL" ] && [ -z "$K_HELD" ] && return 1
+        return 0
+    fi
+    if [ $K_WANT = 1 ] && [ "$_lr" = 44100 ]; then
+        [ -n "$K_NO48" ] && K_HELD=$K_NO48
+        if [ -z "$K_HELD" ] && [ $K_TRIES -ge $KEEP_TRIES ]; then
+            K_HELD="$KEEP_TRIES switches already made in this audio server"
+        fi
+        if [ -n "$K_HELD" ]; then
+            keep_note held "$K_HELD; 44.1 kHz"
+            return 0
+        fi
+        keep_change 48000 "48 kHz did not take" 1
+        # the tracks could not be held: tried again next round, while the tries last
+        [ -n "$K_HOLDFAIL" ] && [ -z "$K_HELD" ] && return 1
+        return 0
+    fi
+    if [ $K_WANT = 0 ] && [ "$_lr" = 48000 ]; then
+        if [ $K_TRIES -ge $KEEP_TRIES ]; then
+            keep_note held "${K_HELD:-$KEEP_TRIES changes already made in this audio server}; stays at 48 kHz until the next audio restart or car start"
+            return 0
+        fi
+        keep_change 44100 "44.1 kHz did not come back at the first try"
+        [ -n "$K_HOLDFAIL" ] && [ -z "$K_HELD" ] && return 1
+        return 0
+    fi
+    # Android and the link agree on the rate wanted: count the link's frames once per audio
+    # server and rate
+    if [ "$K_MEASURED" != "$K_PID $_lr" ]; then
+        set -- $(link_of $K_TID 3000)
+        if [ -n "$3" ]; then
+            K_FPS=${3%%.*}
+            K_MEASURED="$K_PID $_lr"
+            if [ $K_FPS -lt $((_lr - _lr / 200)) ] || [ $K_FPS -gt $((_lr + _lr / 200)) ]; then
+                out_log "link $_pcm is set to $_lr Hz but took $K_FPS frames/s"
+                if [ "$_lr" != 44100 ]; then
+                    keep_hold "the link took $K_FPS frames/s at $_lr Hz"
+                    return 0
+                fi
+            else
+                if [ "$K_IDLESW" = "$K_PID $_lr" ]; then
+                    out_log "the music started at $_lr Hz (switched while nothing played); measured $K_FPS frames/s"
+                else
+                    out_log "Android and link $_pcm agree on $_lr Hz; measured $K_FPS frames/s"
+                fi
+            fi
+        fi
+    fi
+    if [ "$_lr" = 48000 ]; then
+        echo "$K_PID $K_IO" > $R48
+        chmod 644 $R48
+    fi
+    case "$_lr" in
+        48000) keep_note 48k "48 kHz: Android Auto's music is not converted" ;;
+        44100) if [ $K_WANT = 0 ]; then keep_note 44k "44.1 kHz (48 kHz output is off)"; else keep_note 44k "44.1 kHz"; fi ;;
+        *) keep_note 44k "$_lr Hz" ;;
+    esac
+    return 0
+}
+
+keep_loop() {
+    echo $$ > $KEEP_PID
+    chmod 644 $KEEP_PID
+    if [ -f $OUTLOG ]; then
+        set -- $(ls -l $OUTLOG)
+        [ "$(num $4)" -gt 32768 ] && mv $OUTLOG $S/output.old.log
+    fi
+    K_PID=""; K_IO=""; K_TID=""; K_OUT=""; K_LINK=""; K_LR=""; K_FPS=""; K_STATE=""; K_NOTED=""
+    K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_WANT=""; K_NO48=""
+    K_SINCE=0; K_IDLED=""; K_IDLESW=""; K_UNSAFE=""; K_MISSAID=""; K_HOLDFAIL=""
+    SR1=""; LR=""
+    # 0.6.3 marked "no switch while nothing plays" here; 0.6.4 switches with a silent track instead
+    rm -f $IDLE_BAD
+    hold_end
+    out_log "48 kHz keeper started (pid $$)"
+    _round=0
+    while :; do
+        _round=$((_round + 1))
+        # tests stop it after a number of rounds
+        [ -n "$EQE_KEEP_ROUNDS" ] && [ $_round -gt $EQE_KEEP_ROUNDS ] && exit 0
+        _kp=""
+        [ -f $KEEP_PID ] && read _kp < $KEEP_PID
+        [ "$_kp" = $$ ] || exit 0
+        _w=$(rate48_wanted)
+        if [ "$_w" != "$K_WANT" ]; then
+            if [ -n "$K_WANT" ]; then
+                if [ $_w = 1 ]; then out_log "48 kHz output turned on"; else out_log "48 kHz output turned off"; fi
+            fi
+            # turned (back) on: one more go, even after a refusal or a crash, and idle again
+            [ $_w = 1 ] && [ -n "$K_WANT" ] && { K_HELD=""; K_TRIES=0; K_NO48=""; }
+            K_WANT=$_w
+            K_LAST=""
+            K_NOTED=""
+        fi
+        # an audio restart (or a Lab action) is under way: wait for it
+        if [ -d $S/restart.lock ]; then
+            sleep $KEEP_POLL
+            continue
+        fi
+        if [ -z "$K_PID" ] || [ ! -d $PROC/$K_PID ]; then
+            K_PID=$(ms_pid)
+            K_IO=""; K_TID=""; K_OUT=""; K_LINK=""; K_LR=""; K_FPS=""
+            K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_NOTED=""
+            K_SINCE=$(uptime_s); K_IDLED=""; K_IDLESW=""; K_UNSAFE=""; K_MISSAID=""
+            hold_end
+            rm -f $R48
+            [ -n "$K_PID" ] && out_log "audio server $K_PID"
+        fi
+        if [ -n "$K_PID" ] && { [ -z "$K_TID" ] || [ ! -d $PROC/$K_PID/task/$K_TID ]; }; then
+            set -- $(main_out)
+            K_IO=$1; K_TID=$2; K_OUT=$3; K_LAST=""
+        fi
+        if [ -f $S/disabled ] && [ "$K_OUT" != 48000 ]; then
+            # EQ Engine is off and the main output is not left at 48 kHz: nothing more to do
+            out_log "EQ Engine is off; the keeper stops"
+            keep_note off "EQ Engine is off"
+            rm -f $KEEP_PID
+            exit 0
+        fi
+        if [ -z "$K_TID" ]; then
+            sleep $KEEP_POLL
+            continue
+        fi
+        set -- $(link_now $K_TID)
+        if [ "$2" != RUNNING ]; then
+            K_LAST=""
+            [ -z "$K_STATE" ] && keep_note waiting "Waiting for music"
+            keep_idle
+            sleep $KEEP_POLL
+            continue
+        fi
+        if [ "$1 $3" != "$K_LAST" ]; then
+            if keep_check $1 $3 && [ -n "$K_PID" ]; then
+                # remember the link as it is now, so only a new start or a new rate is checked again
+                set -- $(link_now $K_TID)
+                [ "$2" = RUNNING ] && K_LAST="$1 $3"
+            fi
+        fi
+        sleep $KEEP_POLL
+    done
+}
+
+# ------------------------------------------------------------------ car report
+#
+# One text file for sharing: what this car is, what EQ Engine finds on it and a short audio log.
+# It is meant to hold nothing personal: lines that could carry Bluetooth addresses or device
+# names, song details, a location, serial numbers or a VIN are dropped, and the kernel command
+# line is never read. Hyundai's files are not copied: only their checksums and the sample rates
+# their audio policy declares.
+
+# passes only lines that cannot carry personal data
+safe() {
+    while IFS= read -r _l; do
+        case "$_l" in
+            *"- name: "*) echo "$_l"; continue ;;
+            *[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:*) continue ;;
+            *[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-*) continue ;;
+            *[Nn]ame=*|*[Nn]ame:*|*[Nn]ame\ :*|*NAME*|*[Aa]ddr*|*ADDR*|*[Ss]erial*|*SERIAL*|*[Ii][Mm][Ee][Ii]*|*[Ii][Cc][Cc][Ii][Dd]*) continue ;;
+            *[Ss][Ss][Ii][Dd]*|*VIN*|*[Vv]in=*|*[Ss]ong*|*SONG*|*[Tt]itle*|*TITLE*|*[Aa]rtist*|*ARTIST*|*[Aa]lbum*|*ALBUM*) continue ;;
+            *[Ll]atitude*|*[Ll]ongitude*|*[Ll]ongtitude*|*[Ll]at=*|*[Ll]on=*|*GPS*|*[Gg]ps*|*[Nn]umber=*|*[Cc]ontact*|*[Ee]mail*|*@*.*) continue ;;
+            *[Cc]ommand\ line*|*androidboot*|*[Pp]assword*|*[Tt]oken*|*[Pp]airing*) continue ;;
+        esac
+        echo "$_l"
+    done
+}
+
+# the build and audio properties, by an allowlist of names (and never ones that could be personal)
+report_props() {
+    getprop 2>/dev/null | while read -r _l; do
+        _n=${_l%%]*}
+        _n=${_n#[}
+        case "$_n" in
+            *serial*|*vin*|*imei*|*iccid*|*mac*|*addr*|*ssid*|*bt.*|*bluetooth*|*wifi*|*wlan*|*phone*|*imsi*|*msisdn*) continue ;;
+            *key*|*token*|*pass*|*user*|*account*|*gps*|*location*|*name*|*host*|*cmdline*|*sim*|*number*|*boot.*) continue ;;
+        esac
+        case "$_n" in
+            ro.build.*|ro.product.*|ro.board.*|ro.hardware|ro.chipname|ro.daudio.*|ro.config.*|af.*|audio.*|tcc.audio.*) echo "$_l" ;;
+            persist.audio.*|persist.sys.audio*|*amp*|*sound*|*arkam*|*dsp*|*spdif*|*resampler*|*speaker*|*bose*|*premium*) echo "$_l" ;;
+            *vehicle*|*model*|*region*|*country*|*variant*|*nemesis*|*hmg*|sys.boot_completed) echo "$_l" ;;
+        esac
+    done | safe
+}
+
+# "<section>: <rates>" for each part of an audio policy file that declares sampling rates
+policy_rates() {
+    _sec=""
+    while read -r _k _v _r; do
+        [ "$_v" = "{" ] && _sec=$_k
+        [ "$_k" = sampling_rates ] && echo "  $_sec: $_v"
+    done < $1
+}
+
+# the audio lines of the kernel log (never its command line)
+dmesg_audio() {
+    dmesg 2>/dev/null | while read -r _l; do
+        case "$_l" in
+            *[Cc]ommand\ line*|*androidboot*) continue ;;
+            *I2S*|*AUDIO*|*[Aa]udio*|*ASoC*|*asoc*|*snd*|*SND*|*pcm*|*PCM*|*codec*|*CODEC*|*[Aa]mplifier*|*\ AMP*|*DSP*|*SPDIF*|*spdif*|*1288*|*tcc-snd*|*tcc_snd*) echo "$_l" ;;
+        esac
+    done | safe
+}
+
+# process names of the audio server's clients (which app plays what)
+client_names() {
+    _pids=""
+    for _p in $(dumpsys media.audio_flinger 2>/dev/null | {
+        while read _a _b _rest; do
+            [ "$_a" = "pid:" ] && echo "$_b"
+        done
+    }); do
+        case " $_pids " in
+            *" $_p "*) ;;
+            *) _pids="$_pids $_p" ;;
+        esac
+    done
+    for _p in $_pids; do
+        echo "  $_p $(proc_name $_p)"
+    done
+}
+
+# who plays on each hardware link: "pcm2p: RUNNING, played by thread 397 of /system/bin/mediaserver"
+link_owners() {
+    for _f in $PROC/asound/card*/pcm*p/sub0/status; do
+        [ -f $_f ] || continue
+        _st=""; _ow=""
+        while read -r _k _a _b _c; do
+            case "$_k" in
+                state:) _st=$_a ;;
+                owner_pid) _ow=$_b ;;
+            esac
+        done < $_f
+        _d=${_f%/sub0/status}
+        if [ -z "$_ow" ]; then
+            echo "  ${_d##*/}: closed"
+            continue
+        fi
+        _tg=""
+        if [ -f $PROC/$_ow/status ]; then
+            while read -r _k _a _rest; do
+                [ "$_k" = "Tgid:" ] && _tg=$_a
+            done < $PROC/$_ow/status
+        fi
+        echo "  ${_d##*/}: $_st, played by thread $_ow of $(proc_name ${_tg:-$_ow})"
+    done
+}
+
+# squeeze: a line already seen more than 3 times (apart from its time) is counted, not repeated.
+# Android 4.4 logs some warnings at every mix cycle (25 a second) and they would fill the report.
+squeeze() {
+    _m1=""; _c1=0; _m2=""; _c2=0; _m3=""; _c3=0; _next=1
+    while IFS= read -r _l; do
+        _m=${_l#* }
+        _m=${_m#* }
+        if [ "$_m" = "$_m1" ]; then _c1=$((_c1 + 1)); _n=$_c1
+        elif [ "$_m" = "$_m2" ]; then _c2=$((_c2 + 1)); _n=$_c2
+        elif [ "$_m" = "$_m3" ]; then _c3=$((_c3 + 1)); _n=$_c3
+        else
+            case $_next in
+                1) [ $_c1 -gt 3 ] && echo "(the line \"$_m1\" came $((_c1 - 3)) more times)"; _m1=$_m; _c1=1; _next=2 ;;
+                2) [ $_c2 -gt 3 ] && echo "(the line \"$_m2\" came $((_c2 - 3)) more times)"; _m2=$_m; _c2=1; _next=3 ;;
+                *) [ $_c3 -gt 3 ] && echo "(the line \"$_m3\" came $((_c3 - 3)) more times)"; _m3=$_m; _c3=1; _next=1 ;;
+            esac
+            _n=1
+        fi
+        [ $_n -le 3 ] && echo "$_l"
+        [ $_n = 3 ] && echo "(the same line again from here on is counted, not shown)"
+    done
+    [ $_c1 -gt 3 ] && echo "(the line \"$_m1\" came $((_c1 - 3)) more times)"
+    [ $_c2 -gt 3 ] && echo "(the line \"$_m2\" came $((_c2 - 3)) more times)"
+    [ $_c3 -gt 3 ] && echo "(the line \"$_m3\" came $((_c3 - 3)) more times)"
+    return 0
+}
+
+# check <ok|NO|?> <text>
+check() {
+    case "$1" in
+        ok) echo "  ok    $2" ;;
+        NO) echo "  NO    $2" ;;
+        *) echo "  ?     $2" ;;
+    esac
+}
+
+report_checks() {
+    _rel=$(getprop ro.build.version.release)
+    _sdk=$(getprop ro.build.version.sdk)
+    if [ "$_sdk" = 19 ]; then check ok "Android $_rel (API $_sdk)"; else check NO "Android $_rel (API $_sdk); EQ Engine is built for Android 4.4 (API 19)"; fi
+    _prod=$(getprop ro.build.product)
+    case "$_prod" in
+        NEEV.USA.*) check ok "head unit software $_prod (the package is marked for NEEV.USA.*)" ;;
+        *) check ? "head unit software $_prod: not the car EQ Engine was tested on (2022 Ioniq 5, USA)" ;;
+    esac
+    _st=$(state_now)
+    _why=""
+    if [ -f $S/status ]; then
+        while read -r _l; do
+            case "$_l" in
+                reason=*) _why=${_l#reason=} ;;
+            esac
+        done < $S/status
+    fi
+    case "$_st" in
+        applied) check ok "boot step: applied ($_why)" ;;
+        "") check NO "boot step: no status (it has not run)" ;;
+        *) check NO "boot step: $_st ($_why)" ;;
+    esac
+    [ -f $SYS/vendor/etc/audio_effects.conf ] && check NO "/vendor/etc/audio_effects.conf exists: Android reads it instead of the one EQ Engine lays over"
+    _m=$(md5of $EFX_T)
+    if [ ! -f $EFX_T ]; then
+        check NO "effects list: $EFX_T is missing"
+    elif mounted_at $EFX_T; then
+        check ok "effects list: EQ Engine's copy is laid over Android's (md5 $_m)"
+    elif [ "$_m" = $EFX_MD5 ]; then
+        check ok "effects list: the stock one EQ Engine was built for (md5 $_m), not laid over now"
+    else
+        check NO "effects list: md5 $_m, not the one EQ Engine was built for ($EFX_MD5)"
+    fi
+    _p=$(ms_pid)
+    if [ -z "$_p" ]; then
+        check NO "Android's audio server is not running"
+    else
+        if maps_has $_p libeqengine.so; then check ok "EQ Engine's filter is loaded in the audio server ($_p)"
+        else check NO "EQ Engine's filter is not loaded in the audio server ($_p)"; fi
+        if dumpsys media.audio_flinger 2>/dev/null | {
+            _f=1
+            while read -r _l; do
+                case "$_l" in
+                    *"name: EQ Engine"*) _f=0 ;;
+                esac
+            done
+            exit $_f
+        }; then check ok "the EQ is attached to the main output's mix (session 0)"
+        else check NO "the EQ is not attached to any output (the app attaches it once the filter is loaded)"; fi
+        _q=$(getprop af.resampler.quality)
+        if [ "$_q" = 4 ]; then
+            if maps_has $_p libaudio-resampler.so; then check ok "converter: very high quality with EQ Engine's tables (loaded)"
+            else check NO "converter: very high quality asked for, but EQ Engine's tables are not loaded"; fi
+        else
+            check ok "converter: af.resampler.quality=${_q:-unset}"
+        fi
+    fi
+    _drv=$HAL_T
+    mounted_at $HAL_T && _drv=$HAL_COPY
+    _hm=$(md5of $_drv)
+    if [ "$_hm" = $HAL_MD5 ]; then check ok "audio driver: the same one as on the tested car (md5 $_hm)"
+    else check ? "audio driver: md5 ${_hm:-missing}, not the tested car's; the driver watch will not start"; fi
+    [ -f $SYS/vendor/lib/hw/audio.primary.tcc803x.so ] && check NO "a vendor audio driver exists; Android loads it first"
+    if [ -x $LABBIN ]; then
+        _c=$($LABBIN check 2>&1)
+        case "$_c" in
+            *"symbols 4 of 4"*) check ok "the 48 kHz switch can reach Android's audio server (AudioSystem functions found)" ;;
+            *) check NO "the 48 kHz switch cannot reach the audio server: $(flat $_c)" ;;
+        esac
+    else
+        check NO "eqe_lab is not installed"
+    fi
+    if [ -n "$_p" ]; then
+        set -- $(main_out)
+        _io=$1; _tid=$2; _sr=$3
+        if [ -n "$_sr" ]; then
+            set -- $(link_of $_tid 3000)
+            if [ -n "$1" ]; then
+                check ok "main output: io $_io at $_sr Hz; link $1 set to $2 Hz, measured ${3%%.*} frames/s"
+            else
+                check ? "main output: io $_io at $_sr Hz; nothing was playing, so the link was not measured"
+            fi
+            K_IO=$_io
+            buffers_check
+            case $? in
+                0) check ok "track buffers: all $BUF_N tracks on the main output play into its mix buffer or their own effect chain" ;;
+                1) check NO "track buffers: tracks of session(s) $STALE play into a buffer the main output no longer uses (Android 4.4 loses them at a rate change): restart Android audio (parked)" ;;
+                *) check ? "track buffers: the audio server's dump does not show them" ;;
+            esac
+        else
+            check NO "main output: not found in the audio server's dump"
+        fi
+    fi
+    if [ -f $OUTST ]; then
+        _os=""; _on=""
+        while read -r _l; do
+            case "$_l" in
+                state=*) _os=${_l#state=} ;;
+                note=*) _on=${_l#note=} ;;
+            esac
+        done < $OUTST
+        case "$_os" in
+            48k) check ok "48 kHz output: $_on" ;;
+            44k|waiting|off) check ? "48 kHz output: $_on" ;;
+            *) check NO "48 kHz output: $_on" ;;
+        esac
+    else
+        check ? "48 kHz output: no report from the keeper yet"
+    fi
+}
+
+flat() {
+    set -- $*
+    echo "$*"
+}
+
+report_section() {
+    echo
+    echo "==================== $*"
+}
+
+report() {
+    U=$1
+    A=$2
+    N=$3
+    case "$N" in
+        ''|*[!0-9]*) N=30 ;;
+    esac
+    [ $N -gt 120 ] && N=120
+    [ -d "$U" ] || { echo "no USB stick at $U"; return 1; }
+    _prod=$(getprop ro.build.product)
+    case "$_prod" in
+        ''|*[!A-Za-z0-9._-]*) _prod=unknown ;;
+    esac
+    mkdir -p "$U/EQENGINE" || { echo "cannot write to the stick"; return 1; }
+    F="$U/EQENGINE/report_${_prod}_$(date +%Y%m%d_%H%M%S).txt"
+    TMPL=$S/report_log.txt
+    rm -f $TMPL
+    # the audio log while the report runs (plus whatever the log still holds from before)
+    logcat -v time -f $TMPL -s AudioFlinger:V AudioPolicyManagerBase:V AudioPolicyService:V AudioResampler:V \
+        AudioResamplerSinc:V audio_hw_primary:V audio_hw_fm1288:V EQEDrv:V AudioService:V MicomAudioService:V \
+        MicomAudioManager:V AudioTrack:V < /dev/null > /dev/null 2>&1 &
+    _lp=$!
+    {
+        echo "EQ Engine car report"
+        echo
+        echo "Made by EQ Engine $VER on $(date)."
+        echo "It is meant to hold nothing personal: lines that could carry Bluetooth addresses or device"
+        echo "names, song details, a location, serial numbers or a VIN are left out, and Hyundai's files"
+        echo "are not copied (only their checksums and declared sample rates). Please read it through"
+        echo "before you post it anywhere public."
+        report_section "Car"
+        for _k in ro.build.product ro.product.device ro.product.model ro.build.description ro.build.version.release; do
+            echo "  $_k = $(getprop $_k)"
+        done
+        report_section "Checks"
+        report_checks
+        report_section "Audio hardware at the start"
+        echo "-- who plays on each output link"
+        link_owners
+        for _f in $PROC/asound/cards $PROC/asound/pcm $PROC/asound/card*/pcm*/sub0/hw_params $PROC/asound/card*/pcm*/sub0/status; do
+            [ -f $_f ] && { echo "== $_f"; cat $_f; }
+        done
+        report_section "Hyundai's audio files (checksums only)"
+        for _f in $SYS/system/etc/audio_policy.conf $SYS/vendor/etc/audio_policy.conf $EFX_T $SYS/vendor/etc/audio_effects.conf \
+                  $SYS/system/lib/hw/audio.primary.*.so $SYS/vendor/lib/hw/audio.*.so $SYS/system/lib/libmedia.so; do
+            [ -f $_f ] || continue
+            set -- $(ls -l $_f)
+            echo "  $(md5of $_f) $4 bytes $_f"
+        done
+        mounted_at $HAL_T && echo "  (the driver watch is laid over the driver; Hyundai's copy: $(md5of $HAL_COPY))"
+        mounted_at $EFX_T && echo "  (EQ Engine's effects list is laid over Android's)"
+        for _f in $SYS/system/etc/audio_policy.conf $SYS/vendor/etc/audio_policy.conf; do
+            [ -f $_f ] && { echo "  sample rates declared in $_f:"; policy_rates $_f; }
+        done
+        echo "  driver folders:"
+        ls -l $SYS/system/lib/hw $SYS/vendor/lib/hw 2>&1 | safe
+        report_section "Properties (build and audio only)"
+        report_props
+        report_section "Apps playing through Android's audio server"
+        client_names
+        report_section "Android's audio server"
+        dumpsys media.audio_flinger 2>&1 | safe
+        report_section "Android's audio policy"
+        dumpsys media.audio_policy 2>&1 | safe
+        report_section "EQ Engine: boot step"
+        [ -f $S/status ] && cat $S/status
+        echo "-- events"
+        [ -f $S/events.log ] && safe < $S/events.log
+        report_section "EQ Engine: 48 kHz output"
+        [ -f $OUTST ] && cat $OUTST
+        echo "-- what the keeper did"
+        [ -f $S/output.prev.log ] && { echo "(the previous car start)"; safe < $S/output.prev.log; echo "(this car start)"; }
+        [ -f $OUTLOG ] && safe < $OUTLOG
+        report_section "EQ Engine: Lab"
+        cat $S/lab_active $S/lab_result 2>/dev/null
+        if [ -f $DRV/status ]; then
+            echo "-- driver watch"
+            cat $DRV/status
+            [ -f $DRV/drv.log ] && safe < $DRV/drv.log
+        fi
+        report_section "EQ Engine: app log"
+        [ -f "$A/eqengine.log" ] && safe < "$A/eqengine.log"
+        report_section "Kernel log: audio lines"
+        dmesg_audio
+    } > "$F.part" 2>&1
+    # let the audio log run for the time asked for
+    sleep $N
+    {
+        report_section "Audio hardware after $N s (link rate measured over 3 s)"
+        echo "-- who plays on each output link"
+        link_owners
+        for _f in $PROC/asound/card*/pcm*/sub0/hw_params $PROC/asound/card*/pcm*/sub0/status; do
+            [ -f $_f ] && { echo "== $_f"; cat $_f; }
+        done
+        [ -x $LABBIN ] && $LABBIN rate 3000 2>&1
+        report_section "Audio log (audio tags only, filtered)"
+        kill $_lp 2>/dev/null
+        safe < $TMPL | squeeze
+    } >> "$F.part" 2>&1
+    kill $_lp 2>/dev/null
+    rm -f $TMPL
+    mv "$F.part" "$F"
+    sync
+    echo "EQE_REPORT ${F##*/}"
+    echo "saved to $F"
+    return 0
 }
 
 # What the audio server's output threads run at ("44100 48000"), from its own dump.
@@ -495,70 +1584,56 @@ server_steady() {
 }
 
 lab_action() {
-    case "$1$2" in
-        00|01|10|11) ;;
-        *) echo "usage: act.sh lab <watch 0|1> <rate48 0|1>"; return 2 ;;
+    # act.sh lab <watch 0|1> (a second argument, from 0.6.1's app, is ignored)
+    case "$1" in
+        0|1) ;;
+        *) echo "usage: act.sh lab <watch 0|1>"; return 2 ;;
     esac
     [ -f $S/disabled ] && { echo "EQ Engine is off; turn it on first"; return 1; }
     WANT_W=$1
-    WANT_R=$2
     HAD_W=0
     mounted_at $HAL_T && HAD_W=1
-    HAD_R=0
-    if r48_live; then HAD_R=1; else rm -f $R48; fi
-    if [ $WANT_W = $HAD_W ] && [ $WANT_R = $HAD_R ]; then
+    if [ $WANT_W = $HAD_W ]; then
         lab_write_active
-        _on=""
-        [ $HAD_W = 1 ] && _on="$_on watch"
-        [ $HAD_R = 1 ] && _on="$_on rate48"
-        if [ -n "$_on" ]; then echo "already on:$_on"; else echo "no Lab test is on"; fi
+        if [ $HAD_W = 1 ]; then echo "already on: watch"; else echo "no Lab test is on"; fi
         return 0
     fi
     restart_lock || return 3
-    if [ $WANT_W != $HAD_W ]; then
-        # the driver watch is a file in place before the audio server starts: one restart, which
-        # also ends a 48 kHz switch (the new audio server starts at 44.1 kHz)
-        rm -f $R48
-        if [ $WANT_W = 0 ]; then
-            unmount_at $HAL_T || { echo "the driver watch could not be removed"; return 1; }
-        elif ! watch_on; then
-            lab_write_active
-            return 1
-        fi
+    # the driver watch is a file in place before the audio server starts: one restart (the 48 kHz
+    # keeper switches the new audio server's output again once music plays)
+    if [ $WANT_W = 0 ]; then
+        unmount_at $HAL_T || { echo "the driver watch could not be removed"; return 1; }
+    elif ! watch_on; then
         lab_write_active
-        restart_now "" || return 1
-        if [ $WANT_W = 1 ]; then
-            if ! server_steady $NP || [ -z "$(output_rates)" ]; then
-                # tells the boot step that the audio server restarts around now belong to the Lab test
-                uptime_s > $S/lab_ended
-                chmod 644 $S/lab_ended
-                lab_unmount_all
-                lab_result "failed: the audio server did not keep running with the driver watch; removed it and restarted audio"
-                sleep 2
-                restart_now "" || return 1
-                return 1
-            fi
-            if maps_has $NP eqe_hal_orig.so; then
-                _st=""
-                [ -f $DRV/status ] && while read _l; do
-                    case "$_l" in
-                        state=*) _st=${_l#state=} ;;
-                    esac
-                done < $DRV/status
-                lab_result "watch ${_st:-started}"
-            else
-                lab_result "watch not-loaded"
-            fi
-        fi
-        HAD_R=0
-    fi
-    if [ $WANT_R = 1 ] && [ $HAD_R = 0 ]; then
-        rate48_start || { lab_write_active; return 1; }
-    elif [ $WANT_R = 0 ] && [ $HAD_R = 1 ]; then
-        rate48_stop
+        return 1
     fi
     lab_write_active
-    [ $WANT_W = 0 ] && [ $WANT_R = 0 ] && lab_result "off: outputs $(output_rates)"
+    restart_now "" || return 1
+    if [ $WANT_W = 1 ]; then
+        if ! server_steady $NP || [ -z "$(output_rates)" ]; then
+            # tells the boot step that the audio server restarts around now belong to the Lab test
+            uptime_s > $S/lab_ended
+            chmod 644 $S/lab_ended
+            lab_unmount_all
+            lab_result "failed: the audio server did not keep running with the driver watch; removed it and restarted audio"
+            sleep 2
+            restart_now "" || return 1
+            return 1
+        fi
+        if maps_has $NP eqe_hal_orig.so; then
+            _st=""
+            [ -f $DRV/status ] && while read _l; do
+                case "$_l" in
+                    state=*) _st=${_l#state=} ;;
+                esac
+            done < $DRV/status
+            lab_result "watch ${_st:-started}"
+        else
+            lab_result "watch not-loaded"
+        fi
+    fi
+    lab_write_active
+    [ $WANT_W = 0 ] && lab_result "off: outputs $(output_rates)"
     logcat -d -v time -s audio_hw_primary:V EQEDrv:V AudioFlinger:V AudioPolicyManagerBase:V > $S/lab_now.log 2>/dev/null
     chmod 644 $S/lab_now.log 2>/dev/null
     return 0
@@ -782,8 +1857,17 @@ restart)
     restart_now "$2" || exit 1
     ;;
 lab)
-    # act.sh lab <watch 0|1> <rate48 0|1>: Lab tests, in memory until the next car start.
-    lab_action "$2" "$3" || exit $?
+    # act.sh lab <watch 0|1>: the driver watch, in memory until the next car start.
+    lab_action "$2" || exit $?
+    ;;
+keep)
+    # the 48 kHz output keeper (started by the boot step); runs until EQ Engine is turned off
+    keep_loop
+    exit 0
+    ;;
+report)
+    # act.sh report <usb root> <app files dir> <seconds>
+    report "$2" "$3" "$4" || exit 1
     ;;
 off)
     echo "turned off in the app" > $D/state/disabled
@@ -875,7 +1959,7 @@ conv)
     echo "converter $2 from the next audio server start"
     ;;
 *)
-    echo "usage: act.sh save|restart|conv|lab|off|on|open|trace"
+    echo "usage: act.sh save|restart|conv|lab|keep|report|off|on|open|trace"
     exit 2
     ;;
 esac

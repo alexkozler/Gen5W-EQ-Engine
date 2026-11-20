@@ -1,5 +1,5 @@
 /*
- * Driver watch 2 test: plays Android's part against the watch layer, with the fake driver behind
+ * Driver watch 3 test: plays Android's part against the watch layer, with the fake driver behind
  * it, through Hyundai's 19-entry device table (hy_audio.h), the way Hyundai's own audio server
  * calls it. Checks that every call reaches the driver unchanged, that output streams are left
  * untouched, that the layer writes down what it should (by Hyundai's positions), that it measures
@@ -126,7 +126,7 @@ int main(int argc, char **argv) {
     if (corrupt) {
         int untouched = 1;
         for (int i = 0; i < 18; i++)
-            if (lib_of(e[i]) != drv) untouched = 0;
+            if (e[i] && lib_of(e[i]) != drv) untouched = 0; /* (an empty entry stays empty) */
         CHECK(untouched, "unfamiliar table: every entry still goes straight to the driver");
         usleep(300000);
         snprintf(path, sizeof(path), "%s/drv.log", argv[3]);
@@ -154,7 +154,11 @@ int main(int argc, char **argv) {
     CHECK(dev->set_master_volume(dev, 0.75f) != 0 && fabsf(ff[0] - 0.75f) < 1e-6, "set_master_volume: the float arrives (%.3f)", ff[0]);
     CHECK(dev->set_voice_volume(dev, 0.5f) == 0 && fabsf(ff[0] - 0.5f) < 1e-6, "set_voice_volume: the float arrives (%.3f)", ff[0]);
     CHECK(dev->set_mode(dev, AUDIO_MODE_IN_CALL) == 0 && strstr(calls, "set_mode 2"), "set_mode forwarded");
-    CHECK(dev->hy_extra(dev, 5) == 7 && strstr(calls, "hy_extra 5"), "Hyundai's extra entry forwarded, result back");
+    CHECK(dev->set_mic_control(dev, 4, 9) == 0 && strstr(calls, "set_mic_control 4 9"), "set_mic_control (entry 8) forwarded");
+    CHECK(dev->set_mic_mute(dev, true) == 0 && strstr(calls, "set_mic_mute 1"), "entry 6 forwarded");
+    CHECK(dev->set_parameters(dev, "bt_headset_name=Someones Phone;bt_headset_nrec=on") == 0
+              && strstr(calls, "set_parameters bt_headset_name=Someones Phone;bt_headset_nrec=on"),
+          "a setting with a name is forwarded exactly");
     CHECK(dev->set_parameters(dev, "restarting=true") == 0 && strstr(calls, "set_parameters restarting=true"),
           "set_parameters (entry 9) forwarded exactly");
     CHECK(dev->set_parameters(dev, "routing=2;tcc_test=1") == 0 && strstr(calls, "set_parameters routing=2;tcc_test=1"),
@@ -199,7 +203,7 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof(path), "%s/drv.log", argv[3]);
     char *log = slurp(path);
     CHECK(strstr(log, "watching Hyundai's driver: module \"fake Telechips audio\"") &&
-              strstr(log, "19 of its 19 device entries forwarded (Hyundai's layout); output streams left untouched"),
+              strstr(log, "18 of its 19 device entries forwarded (Hyundai's layout); output streams left untouched"),
           "log: watching, with the driver's name and its layout");
     CHECK(strstr(log, "device set_parameters \"restarting=true\" -> 0") != NULL, "log: set_parameters named right (entry 9)");
     CHECK(strstr(log, "(unreadable 0x10)") != NULL, "log: the bad pointer is noted, not read");
@@ -209,7 +213,11 @@ int main(int argc, char **argv) {
     CHECK(strstr(log, "open_output_stream handle 21") && strstr(log, "-> -22, config now 44100 Hz") != NULL,
           "log: the refusal and the driver's suggestion");
     CHECK(strstr(log, "device set_master_volume 0.750") && strstr(log, "set_voice_volume 0.500"), "log: volumes (floats read right)");
-    CHECK(strstr(log, "device entry 7 (not named): 0x5 ") != NULL, "log: the unnamed entry, as numbers");
+    CHECK(strstr(log, "device entry 6 (not named): 0x1 ") != NULL, "log: an unnamed entry, as numbers");
+    CHECK(strstr(log, "device set_mic_control type 4 value 9 -> 0") != NULL, "log: set_mic_control named (entry 8)");
+    CHECK(strstr(log, "Someones") == NULL && strstr(log, "a setting with a name in it, not written down") != NULL,
+          "log: the name in a setting is not written down");
+    CHECK(strstr(log, "empty device entries (left as they are): 4 get_master_volume") != NULL, "log: the empty entry is named");
     CHECK(strstr(log, "device dump: 0x1e ") != NULL, "log: dump named right (entry 16), with its file descriptor");
     CHECK(strstr(log, "device close_output_stream: ") != NULL, "log: close named right (entry 13)");
     /* the notes come every window; the three set_parameters calls may fall into more than one */
@@ -218,7 +226,7 @@ int main(int argc, char **argv) {
         char *eol = strchr(p, '\n'), *q = strstr(p, " set_parameters ");
         if (q && (!eol || q < eol)) n_sp += atoi(q + strlen(" set_parameters "));
     }
-    CHECK(n_sp == 3, "log: the calls are counted (set_parameters %d times; it was called 3 times)", n_sp);
+    CHECK(n_sp == 4, "log: the calls are counted (set_parameters %d times; it was called 4 times)", n_sp);
     int n_q = 0;
     for (char *p = log; (p = strstr(p, "device get_parameters \"sampling_rate\"")) != NULL; p++) n_q++;
     CHECK(n_q == 1, "log: a repeated question is written once (%d)", n_q);

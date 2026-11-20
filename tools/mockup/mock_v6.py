@@ -79,14 +79,18 @@ def draw_card(g, x, y, w, h, title):
     return y + dp(14) + (dp(34) if title else 0)
 def row(g, x, y, w, title, sub, kind, on=True, label="Open"):
     f1, f2 = font(18), font(15)
-    right = dp(56) if kind == 'switch' else g.textlength(label, font=font(18, True)) + dp(40)
+    labels = label.split("|") if kind == 'button' else []
+    right = dp(56) if kind == 'switch' else sum(g.textlength(l, font=font(18, True)) + dp(40) for l in labels) + dp(8) * (len(labels) - 1)
     lines = wrap(g, sub, f2, w - right - dp(12)) if sub else []
     hh = max(dp(62 if kind == 'switch' else 56), dp(8) + f1.size*1.25 + dp(4) + len(lines) * f2.size * 1.3)
     ty = y + (hh - (f1.size*1.25 + dp(4) + len(lines)*f2.size*1.3)) / 2
     g.text((x, ty), title, font=f1, fill=C['ON'])
     for i, l in enumerate(lines): g.text((x, ty + f1.size*1.25 + dp(4) + i*f2.size*1.3), l, font=f2, fill=C['VAR'])
     if kind == 'switch': switch(g, x + w - dp(28), y + hh/2, on)
-    else: btn(g, x + w, y + hh/2 - dp(23), label, 'tonal', right=True)
+    else:
+        bx = x + w
+        for l in reversed(labels):
+            bx, bw = btn(g, bx, y + hh/2 - dp(23), l, 'tonal', right=True); bx -= dp(8)
     return y + hh, len(lines)
 def page_eq(resp, bands, preamp, preset):
     im, g = base(0)
@@ -159,11 +163,12 @@ def page_settings():
     top = Y0 + dp(52) + dp(10); cw = (X1 - X0 - dp(16)) / 2
     for ci, (title, rows) in enumerate([("Sound", [("Equalizer","Off passes the audio through untouched (bit-exact)",'switch',True),
                                                    ("Clip guard","Catches peaks that boosts push past full scale",'switch',True),
-                                                   ("Audio converter","Very high quality by default. Choose it, and try 48 kHz, in Lab",'button',"Lab")]),
+                                                   ("48 kHz output","Android Auto's music without conversion. Checked every time; falls back to 44.1 kHz",'switch',True),
+                                                   ("Audio converter","For voice prompts, and for music when the output is at 44.1 kHz",'button',"Lab")]),
                                          ("EQ Engine", [("EQ Engine","Loads at every start. Off = stock audio",'switch',True),
                                                         ("Detailed logging","Logs every change, for troubleshooting",'switch',False),
-                                                        ("Restart Android audio","About 2 seconds of silence",'button',"Restart"),
-                                                        ("Save logs to USB","Into the EQENGINE folder on the stick",'button',"Save")])]):
+                                                        ("Restart Android audio","A few seconds of silence. Parked only",'button',"Restart"),
+                                                        ("Save to USB","Report: for sharing. All logs: private",'button',"Report|All logs")])]):
         x = X0 + ci * (cw + dp(16))
         # measure
         tmp = Image.new("RGB", (10, 10)); tg = ImageDraw.Draw(tmp); y = 0
@@ -181,14 +186,16 @@ def page_status():
     th = (Y1 - top - dp(20)) / 3; tw = (gw - dp(10)) / 2
     tiles = [("Boot step","Applied, confirmed","Effects list in place · strikes 0\nUnexpected restarts 0 · service started"),
              ("EQ filter","On all music","Since 19:16:40\nRock, preamp -5 dB"),
-             ("Converter","48 kHz output (Lab)","Audio server confirmed at 19:16:43\nAndroid Auto plays unconverted"),
-             ("Processing","2.4% of real time","1.12 ms per 46 ms buffer (max 1.23 ms)\n44100 Hz stereo, audio flowing"),
+             ("Output","48 kHz, unconverted","Link pcm2p measured 48000 frames/s\nOther rates: very high quality"),
+             ("Processing","1.9% of real time","0.81 ms per 43 ms buffer (max 0.91 ms)\n48000 Hz stereo, audio flowing"),
              ("Levels","Average -11.8 dBFS","Peaks: in 0.0, out 0.0 dBFS\nArrived clipped 37 · guard -0.2 dB"),
-             ("App","Service running","EQ Engine 0.6.0 · log normal\nFilter 310 · processing")]
+             ("App","Service running","EQ Engine 0.6.4 · log normal\nFilter 310 · processing")]
     for i, (n, v, d) in enumerate(tiles):
         r, c = divmod(i, 2); x = X0 + c*(tw + dp(10)); y = top + r*(th + dp(10))
         g.rounded_rectangle([x, y, x+tw, y+th], dp(14), fill=C['SURFACE'])
         g.text((x+dp(14), y+dp(8)), n, font=font(15), fill=C['VAR']); g.text((x+dp(14), y+dp(8)+dp(22)), v, font=font(21, True), fill=C['ON'])
+        for alt in [v] + (["44.1 kHz, very high", "44.1 kHz, high", "44.1 kHz, stock"] if n == "Output" else []):
+            if g.textlength(alt, font=font(21, True)) > tw - dp(28): print("tile %s: value too wide: %r" % (n, alt))
         yy = y + dp(8) + dp(22) + dp(32); lines = []
         for part in d.split("\n"):
             w_ = wrap(g, part, font(14.5), tw - dp(28)); lines += [w_[0]]
@@ -235,17 +242,17 @@ def page_lab():
             cx += chip(gg, cx, y, lab, sel) + dp(8)
         if cx - dp(8) > x + cw - dp(18): print("chips overflow by %.0f" % (cx - dp(8) - (x + cw - dp(18))))
         y += dp(42) + dp(8)
-        for l in wrap(gg, "48 kHz output test: Android Auto's 48 kHz music is not converted. Tables ready (audio server, 19:16:43); no audio converted with them yet", font(15), cw - dp(36)):
+        for l in wrap(gg, "Main output at 48 kHz: Android Auto's music is not converted. This converter handles voice prompts and anything not at 48 kHz. In use: EQ Engine's tables, 40 taps a side (audio server, 17:59:53)", font(15), cw - dp(36)):
             gg.text((x+dp(18), y), l, font=font(15), fill=C['VAR']); y += dp(19)
         y += dp(8); gg.line([(x+dp(18), y), (x+cw-dp(18), y)], fill=C['OUTLINE'], width=2); y += dp(2)
-        y, _ = row(gg, x+dp(18), y, cw - dp(36), "48 kHz output (test)", "Accepted: outputs 48000 44100; hardware pcm2p=48000", 'switch', True)
-        y, _ = row(gg, x+dp(18), y, cw - dp(36), "Driver watch (test)", "Watching: main output 48000 Hz, taken at 47998 frames/s, peak -1.2 dBFS", 'switch', True)
+        y, _ = row(gg, x+dp(18), y, cw - dp(36), "48 kHz output", "48 kHz: link pcm2p, measured 48000 frames/s", 'button', True, "Settings")
+        y, _ = row(gg, x+dp(18), y, cw - dp(36), "Driver watch (test)", "Watching: link pcm2p 48000 Hz, measured 48000 frames/s", 'switch', True)
         return y
     hh = conv(tg, 0) + dp(14) + dp(34) + dp(12)
     yy = draw_card(g, x, top, cw, hh, "Converter and driver"); conv(g, yy); bottoms.append(top + hh)
     x, cw = xs[2], ws[2]
     d = ("Records 120 s of Android's system log and before/after snapshots of the audio system. Change sound settings, "
-         "volume or sources while it records. Settings > Save logs to USB copies it to the stick with everything else.")
+         "volume or sources while it records. Settings > Save to USB > All logs copies it to the stick with everything else.")
     dl = wrap(tg, d, font(15), cw - dp(36)); h2 = dp(14) + dp(34) + len(dl)*dp(20) + dp(14) + dp(46) + dp(6) + dp(26)*2 + dp(26) + dp(12)
     yy = draw_card(g, x, top, cw, h2, "Audio trace")
     for k, l in enumerate(dl): g.text((x+dp(18), yy + k*dp(20)), l, font=font(15), fill=C['VAR'])

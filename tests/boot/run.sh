@@ -81,11 +81,16 @@ done
 [ -n "$f" ] && echo "11-18 16:00:00.000 D/AudioResampler(  166): forcing AudioResampler quality to 3" > "$f"
 exit 0
 S
-    chmod +x $T/stubs/*; : > $T/stack; rm -f $T/setprop.log $T/am.log $T/logcat.log
+    # the 48 kHz keeper: notes that it was started and shows up as a process (in the simulated /proc)
+    cat > $T/stubs/keeper <<'S'
+#!/bin/sh
+mkdir -p /tmp/eqeboot/proc/$$; echo "keeper $$" >> /tmp/eqeboot/keeper.log
+S
+    chmod +x $T/stubs/*; : > $T/stack; rm -f $T/setprop.log $T/am.log $T/logcat.log $T/keeper.log
 }
 runboot() {  # runs until the script exits or ~$1 simulated seconds pass
     # exec: $BP is the boot step itself, so the kill below stops it (a leftover run would write into the next test)
-    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) &
+    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) &
     BP=$!
     # generous real-time budget: the scripts end by themselves (stop_here) in the tests that need it
     i=0; while kill -0 $BP 2>/dev/null && [ $i -lt $(( ${1:-300} * 4 )) ]; do /bin/sleep 0.05; i=$((i+1)); done
@@ -174,7 +179,7 @@ ok "no unexpected restarts, still confirmed good" "! grep -q unexpectedly $T/out
 echo "== 9. service restarted within the same start: no second mount"
 setup bootJ
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 130 ] && touch /tmp/eqeboot/stop' > $T/hook
-( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out1.txt 2>&1 ) & P1=$!
+( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out1.txt 2>&1 ) & P1=$!
 while [ ! -f $T/stop ]; do /bin/sleep 0.05; done; kill $P1; wait $P1 2>/dev/null
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 200 ] && echo x > /tmp/eqeboot/root/data/eqengine/state/disabled' > $T/hook
 runboot 400
@@ -207,7 +212,7 @@ H
 runboot 400
 ok "started exactly once" "[ \$(grep -c 'startservice -n com.eqengine.app/.EqService' $T/am.log) = 1 ]"
 ok "not before boot completed" "grep -q 'Android has started; starting the EQ service: Starting service' $T/out.txt && [ \$(sed -n 's/^\([0-9]*\) Android has started.*/\1/p' $T/root/data/eqengine/state/events.log) -ge 150 ]"
-setup bootO; echo x > $T/root/data/eqengine/state/disabled 2>/dev/null || { mkdir -p $T/root/data/eqengine/state; echo x > $T/root/data/eqengine/state/disabled; }
+setup bootO; mkdir -p $T/root/data/eqengine/state; echo x > $T/root/data/eqengine/state/disabled
 echo 1 > $T/props/sys.boot_completed
 runboot 50
 ok "turned off: service not started" "[ ! -f $T/am.log ]"
@@ -272,7 +277,10 @@ vhqsetup() {  # $1 = setting (empty = no file); $2 = good | bad (tables checksum
     md5sum < $T/root/data/eqengine/lib/libaudio-resampler.so | cut -c1-32 > $T/root/data/eqengine/conf/libaudio-resampler.md5
     [ "$2" = bad ] && echo "changed" >> $T/root/data/eqengine/lib/libaudio-resampler.so
     [ -n "$1" ] && echo $1 > $T/root/data/eqengine/settings/vhq
-    [ "$3" = map ] && echo "b6a00000-b6a2a000 r-xp 00000000 b3:19 4242   /data/eqengine/lib/libaudio-resampler.so" > $T/proc/$(cat $T/mspid)/maps
+    if [ "$3" = map ]; then
+        echo "b6c00000-b6c06000 r-xp 00000000 b3:19 4243   /data/eqengine/lib/libeqengine.so" > $T/proc/$(cat $T/mspid)/maps
+        echo "b6a00000-b6a2a000 r-xp 00000000 b3:19 4242   /data/eqengine/lib/libaudio-resampler.so" >> $T/proc/$(cat $T/mspid)/maps
+    fi
     return 0
 }
 VS=$T/root/data/eqengine/state; VSET=$T/root/data/eqengine/settings
@@ -284,25 +292,30 @@ ok "after 'confirmed good' it checks the tables are in the audio server" "grep -
 ok "turning off removes the marker and puts the converter back to 0" "[ ! -f $VS/vhq_load ] && [ \"\$(tail -n1 $T/setprop.log)\" = af.resampler.quality=0 ]"
 setup bootV1b; vhqsetup 1 good map
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 140 ] && touch /tmp/eqeboot/stop' > $T/hook
-( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
+( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
 while [ ! -f $T/stop ]; do /bin/sleep 0.05; done
 ok "while it runs, the marker for the filter is there (readable by the audio server)" "[ -f $VS/vhq_load ] && [ \"\$(stat -c %a $VS/vhq_load)\" = 644 ]"
 kill $P1; wait $P1 2>/dev/null
 
 setup bootV1c; vhqsetup 1 good nomap; mkdir -p $VS; echo 1 > $VS/vhq_load; ino0=$(stat -c %i $VS/vhq_load)
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 140 ] && touch /tmp/eqeboot/stop' > $T/hook
-( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
+( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
 while [ ! -f $T/stop ]; do /bin/sleep 0.05; done; kill $P1; wait $P1 2>/dev/null
 ok "a marker kept from the last start is rewritten in place, never removed (same file)" "[ -f $VS/vhq_load ] && [ \$(stat -c %i $VS/vhq_load) = $ino0 ]"
 setup bootV1d; vhqsetup 1 good nomap
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && echo x > /tmp/eqeboot/root/data/eqengine/state/disabled' > $T/hook
 runboot 400
 ok "tables not in the audio server at 'confirmed good': says so" "grep -q 'tables are not loaded in the audio server (167)' $T/out.txt"
+setup bootV1e; vhqsetup 1 good nomap
+echo "b6b00000-b6b20000 r-xp 00000000 b3:19 99   /system/lib/libaudioflinger.so" > $T/proc/167/maps
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && echo x > /tmp/eqeboot/root/data/eqengine/state/disabled' > $T/hook
+runboot 400
+ok "the audio server read its effects list before the overlay (0.6.3's middle car start): says EQ Engine is not active, restart audio (parked)" "grep -q 'confirmed good' $T/out.txt && grep -q \"EQ Engine's filter is not loaded in the audio server (167): it read its effects list before the overlay. Restart Android audio once (parked)\" $T/out.txt && ! grep -q 'tables are' $T/out.txt"
 
 echo "== 17. very high quality: tables fail their check -> high quality, no marker"
 setup bootV2; vhqsetup 1 bad map
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 140 ] && touch /tmp/eqeboot/stop' > $T/hook
-( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
+( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
 while [ ! -f $T/stop ]; do /bin/sleep 0.05; done; kill $P1; wait $P1 2>/dev/null
 ok "falls back to 3, says why, no marker" "grep -q 'af.resampler.quality=3' $T/setprop.log && ! grep -q 'quality=4' $T/setprop.log && grep -q 'failed their check' $T/out.txt && [ ! -f $VS/vhq_load ]"
 
@@ -310,7 +323,7 @@ echo "== 18. very high quality switched off (or never on): high quality, nothing
 setup bootV3; vhqsetup 0 good map
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 140 ] && touch /tmp/eqeboot/stop' > $T/hook
 mkdir -p $VS; echo 1 > $VS/vhq_load
-( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
+( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
 while [ ! -f $T/stop ]; do /bin/sleep 0.05; done; kill $P1; wait $P1 2>/dev/null
 ok "setting 0: 3, a leftover marker is removed" "grep -q 'af.resampler.quality=3' $T/setprop.log && ! grep -q 'quality=4' $T/setprop.log && [ ! -f $VS/vhq_load ]"
 
@@ -322,7 +335,7 @@ crashhook() {  # $1 $2 ... = uptimes of unexpected audio server restarts; stop a
       echo "[ \$u -ge ${STOPAT:-260} ] && touch /tmp/eqeboot/stop"; } > $T/hook
 }
 rununtilstop() {
-    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
+    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
     while [ ! -f $T/stop ]; do /bin/sleep 0.05; done; kill $P1; wait $P1 2>/dev/null
 }
 
@@ -412,5 +425,46 @@ echo "   the marker only covers the run right after the install:"
 setup bootI3; mkdir -p $VS; echo installed > $VS/fresh_install; echo "turned off in the app" > $VS/disabled
 runboot 50
 ok "used up even when EQ Engine is off" "[ ! -f $VS/fresh_install ] && [ \"\$(st state)\" = off ]"
+
+echo "== 26. the 48 kHz keeper: started once Android has started, and again if it stops"
+setup bootK1; touch $T/app_running
+cat > $T/hook <<'H'
+read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}
+[ $u -ge 110 ] && echo 1 > /tmp/eqeboot/props/sys.boot_completed
+if [ $u -ge 200 ] && [ ! -f /tmp/eqeboot/killed ]; then rm -rf /tmp/eqeboot/proc/$(head -n1 /tmp/eqeboot/keeper.log | cut -d' ' -f2); touch /tmp/eqeboot/killed; fi
+[ $u -ge 330 ] && touch /tmp/eqeboot/stop
+H
+rununtilstop
+ok "started with the EQ service, its pid recorded" "grep -q '48 kHz output keeper started' $T/out.txt && [ \"\$(cat $VS/keep.pid)\" -gt 0 ] && [ \$(sed -n 's/^\([0-9]*\) 48 kHz output keeper started.*/\1/p' $VS/events.log) -ge 110 ]"
+ok "started again after it stopped, and only then" "[ \$(wc -l < $T/keeper.log) = 2 ] && grep -q 'keeper was not running; started it again' $T/out.txt && [ \$(sed -n 's/^\([0-9]*\) the 48 kHz output keeper was not running.*/\1/p' $VS/events.log) -ge 200 ]"
+setup bootK2; mkdir -p $VS; echo "off in the app" > $VS/disabled; echo 1 > $T/props/sys.boot_completed
+runboot 50
+ok "EQ Engine off: no keeper" "[ ! -f $T/keeper.log ]"
+
+echo "== 27. an audio server crash right after a 48 kHz switch: 48 kHz output turned off, nothing else counts"
+setup bootK3; vhqsetup 1 good map
+STOPAT=260 crashhook 150
+cat >> $T/hook <<'H'
+[ $u -ge 146 ] && [ ! -f /tmp/eqeboot/sent ] && { echo $u > /tmp/eqeboot/root/data/eqengine/state/rate48_sent; touch /tmp/eqeboot/sent; }
+H
+rununtilstop
+ok "48 kHz output turned off in the settings, with the reason for the app" "[ \"\$(cat $VSET/rate48)\" = 0 ] && grep -q 'right after a switch to 48 kHz' $VS/rate48_cut && grep -q 'right after a 48 kHz switch' $T/out.txt"
+ok "no converter step-down, not counted as an unexpected restart" "[ ! -f $VSET/converter ] && [ -f $VS/vhq_load ] && ! grep -q 'unexpectedly (1' $T/out.txt && [ \"\$(st unexpected_restarts)\" = 0 ]"
+setup bootK4; vhqsetup 1 good map
+STOPAT=260 crashhook 180
+cat >> $T/hook <<'H'
+[ $u -ge 146 ] && [ ! -f /tmp/eqeboot/sent ] && { echo $u > /tmp/eqeboot/root/data/eqengine/state/rate48_sent; touch /tmp/eqeboot/sent; }
+H
+rununtilstop
+ok "a crash 30 s after a switch counts as usual (stepped down, 48 kHz left on)" "[ \"\$(cat $VSET/converter)\" = 3 ] && grep -q 'unexpectedly (1' $T/out.txt && [ ! -f $VSET/rate48 ]"
+
+echo "== 28. a new start: the previous start's 48 kHz state is cleared, its keeper log kept as the previous one"
+setup bootK5; mkdir -p $VS; echo "167 101" > $VS/rate48; echo 90 > $VS/rate48_sent; echo "state=48k" > $VS/output; echo 4444 > $VS/keep.pid
+mkdir -p $VS/hold; echo "held 2 13 21" > $VS/hold/state; echo 4445 > $VS/hold/pid
+echo "80 switched to 48000 Hz" > $VS/output.log; echo bootK0 > $VS/runboot
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "rate48, rate48_sent, output and keep.pid cleared; output.log moved" "[ ! -f $VS/rate48 ] && [ ! -f $VS/rate48_sent ] && [ ! -f $VS/output ] && [ ! -f $VS/keep.pid ] && [ ! -f $VS/output.log ] && grep -q 'switched to 48000' $VS/output.prev.log"
+ok "the 48 kHz helper's folder from the last start is gone" "[ ! -d $VS/hold ]"
 
 echo "$SH: $pass passed, $fail failed"

@@ -109,7 +109,6 @@ static int d_set_master_volume(struct hy_dev *d, float v) {
     rec("set_master_volume %.3f", v);
     return -ENOSYS;
 }
-static int d_get_master_volume(struct hy_dev *d, float *v) { (void)d; (void)v; return -ENOSYS; }
 static int d_set_mode(struct hy_dev *d, audio_mode_t m) { (void)d; rec("set_mode %d", m); return 0; }
 static int d_set_mic_mute(struct hy_dev *d, bool m) { (void)d; rec("set_mic_mute %d", m); return 0; }
 static int d_get_mic_mute(const struct hy_dev *d, bool *m) { (void)d; *m = false; return 0; }
@@ -186,7 +185,7 @@ static void d_close_input_stream(struct hy_dev *d, struct audio_stream_in *s) { 
 static int d_dump(const struct hy_dev *d, int fd) { (void)d; (void)fd; return 0; }
 static int d_set_master_mute(struct hy_dev *d, bool m) { (void)d; rec("set_master_mute %d", m); return -ENOSYS; }
 static int d_get_master_mute(struct hy_dev *d, bool *m) { (void)d; (void)m; return -ENOSYS; }
-static int d_hy_extra(struct hy_dev *d, int v) { (void)d; rec("hy_extra %d", v); return 7; }
+static int d_set_mic_control(struct hy_dev *d, int type, int value) { (void)d; rec("set_mic_control %d %d", type, value); return 0; }
 static int d_close(hw_device_t *d) { free(d); return 0; }
 
 struct fake_dev {
@@ -208,11 +207,11 @@ static int d_open(const hw_module_t *mod, const char *name, hw_device_t **device
     d->init_check = d_init_check;
     d->set_voice_volume = d_set_voice_volume;
     d->set_master_volume = d_set_master_volume;
-    d->get_master_volume = d_get_master_volume;
+    d->get_master_volume = NULL; /* an empty entry, as 4 of the car driver's are */
     d->set_mode = d_set_mode;
     d->set_mic_mute = d_set_mic_mute;
-    d->hy_extra = d_hy_extra;
     d->get_mic_mute = d_get_mic_mute;
+    d->set_mic_control = d_set_mic_control;
     d->set_parameters = d_set_parameters;
     d->get_parameters = d_get_parameters;
     d->get_input_buffer_size = d_get_input_buffer_size;

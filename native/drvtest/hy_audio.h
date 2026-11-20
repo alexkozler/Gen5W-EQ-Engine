@@ -1,8 +1,8 @@
 /*
- * Test-only: Hyundai's audio_hw_device as the 0.6.0 car logs showed it. It has 19 function
- * entries after "common", where Android 4.4 has 18. Entries 0 to 5 are where Android 4.4 has them;
- * from set_parameters on, everything sits one further. Entries 6 to 8 hold the microphone mute pair
- * and Hyundai's extra entry, in an order that is not known: here the extra one is put at 7.
+ * Test-only: Hyundai's audio_hw_device as the car logs showed it. It has 19 function entries after
+ * "common", where Android 4.4 has 18. Entries 0 to 5 are where Android 4.4 has them; from
+ * set_parameters on, everything sits one further. Entry 8 is Hyundai's extra one,
+ * set_mic_control(type, value) (0.6.1 logs); 6 and 7 are presumably the microphone mute pair.
  */
 #pragma once
 #include <stdbool.h>
@@ -17,8 +17,8 @@ struct hy_dev {
     int (*get_master_volume)(struct hy_dev *d, float *v);
     int (*set_mode)(struct hy_dev *d, audio_mode_t m);
     int (*set_mic_mute)(struct hy_dev *d, bool m);
-    int (*hy_extra)(struct hy_dev *d, int v); /* stand-in for Hyundai's extra entry */
     int (*get_mic_mute)(const struct hy_dev *d, bool *m);
+    int (*set_mic_control)(struct hy_dev *d, int type, int value); /* Hyundai's extra entry */
     int (*set_parameters)(struct hy_dev *d, const char *kv);
     char *(*get_parameters)(const struct hy_dev *d, const char *keys);
     size_t (*get_input_buffer_size)(const struct hy_dev *d, const struct audio_config *c);

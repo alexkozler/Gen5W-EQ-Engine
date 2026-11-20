@@ -30,19 +30,23 @@
 #    can play, so before it converts any audio), then loads those tables into the audio server
 #    (only there). Without the marker nothing is loaded and 4 behaves like 3. The marker stays
 #    between starts, so it is already there when the next start's audio server comes up.
-#  - Lab tests (act.sh lab): the driver watch is an in-memory bind mount and the 48 kHz output a
-#    run-time switch in the running audio server; both are gone at the next car start (this step
-#    then clears state/lab_active), and the switch with any audio restart. An unexpected audio
-#    server restart while one is on removes them at once; such restarts (and those in the next
-#    60 s) are put down to the test: they neither step the converter down nor count towards
-#    "kept restarting".
+#  - 48 kHz output: once Android has started, this step starts "act.sh keep" in the background
+#    (and again if it stops). The keeper switches the main output to 48 kHz while music plays and
+#    checks it every time (see act.sh). An unexpected audio server restart within 20 s of one of
+#    its switches (state/rate48_sent) is put down to the switch: 48 kHz output is turned off in
+#    the settings (state/rate48_cut says why), and the restart neither steps the converter down
+#    nor counts towards "kept restarting".
+#  - Lab driver watch (act.sh lab): an in-memory bind mount, gone at the next car start (this step
+#    then clears state/lab_active). An unexpected audio server restart while it is on removes it
+#    at once; such restarts (and those in the next 60 s) are put down to it: they neither step the
+#    converter down nor count towards "kept restarting".
 #  - Once Android has finished starting, it starts the EQ Engine app's background service,
 #    which attaches the EQ to all music and re-attaches it after an audio restart. A watchdog
 #    checks every 60 s that the app's process is there and starts the service again if not.
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.6.1
+VER=0.6.4
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -55,6 +59,7 @@ SET=$D/settings
 HAL_T=/system/lib/hw/audio.primary.tcc803x.so
 POL_T=/system/etc/audio_policy.conf
 SVC=com.eqengine.app/.EqService
+KEEP_CMD="sh $D/bin/act.sh keep"
 EXPECT_ORIG=4d98c1b38bd1d9eaf929d9b616c0d118
 EXPECT_OURS=69613834029b0e891c927e5843077c0d
 GOOD_AFTER=45
@@ -65,6 +70,7 @@ GOOD_AFTER=45
     HAL_T=$EQE_TEST_ROOT/system/lib/hw/audio.primary.tcc803x.so; POL_T=$EQE_TEST_ROOT/system/etc/audio_policy.conf
     TARGET=$EQE_TEST_ROOT/system/etc/audio_effects.conf; VENDOR=$EQE_TEST_ROOT/vendor/etc/audio_effects.conf
     [ -n "$EQE_GOOD_AFTER" ] && GOOD_AFTER=$EQE_GOOD_AFTER
+    [ -n "$EQE_KEEP_CMD" ] && KEEP_CMD=$EQE_KEEP_CMD
 }
 PROC=${EQE_PROC:-/proc}
 
@@ -198,8 +204,29 @@ lab_recent() {
     [ $((NOW - _le)) -ge 0 ] && [ $((NOW - _le)) -le 60 ]
 }
 
+rate48_recent() {
+    # the 48 kHz keeper switched the main output less than 20 s ago
+    [ -f $S/rate48_sent ] || return 1
+    read _rs < $S/rate48_sent
+    _rs=$(num "${_rs%%.*}")
+    [ $((NOW - _rs)) -ge 0 ] && [ $((NOW - _rs)) -le 20 ]
+}
+
+keep_alive() {
+    [ -f $S/keep.pid ] || return 1
+    read _kp < $S/keep.pid
+    _kp=$(num "$_kp")
+    [ $_kp -gt 0 ] && [ -d $PROC/$_kp ]
+}
+
+keep_start() {
+    $KEEP_CMD < /dev/null > /dev/null 2>&1 &
+    echo $! > $S/keep.pid
+    chmod 644 $S/keep.pid
+}
+
 lab_off() {
-    # removes both Lab overlays (driver watch, 48 kHz policy); 0 when none is left
+    # removes both Lab overlays (driver watch, 0.6.0's 48 kHz policy); 0 when none is left
     for _t in $HAL_T $POL_T; do
         _i=0
         while [ $_i -lt 5 ]; do
@@ -212,8 +239,7 @@ lab_off() {
             _i=$((_i + 1))
         done
     done
-    # the 48 kHz test (0.6.1) is a run-time switch: a new audio server starts at 44.1 kHz anyway
-    rm -f $S/lab_active $S/rate48
+    rm -f $S/lab_active
     ! lab_mounted
 }
 
@@ -339,8 +365,11 @@ _rb=""
 if [ "$_rb" != "$BID" ]; then
     rm -f $S/resampler.log $S/resampler.log.1 $S/resampler_now.log $S/last_restart $S/expected_restart
     rm -rf $S/restart.lock
-    # Lab tests are in-memory: a new start has none
-    rm -f $S/lab_active $S/lab_ended $S/rate48
+    # Lab tests and the 48 kHz switch are in memory: a new start has neither
+    rm -f $S/lab_active $S/lab_ended $S/rate48 $S/rate48_sent $S/output $S/keep.pid $S/af.txt
+    # Hold.java (48 kHz switches) does not outlive a car start
+    rm -rf $S/hold
+    [ -f $S/output.log ] && mv $S/output.log $S/output.prev.log
     [ -f $S/lab_result ] && mv $S/lab_result $S/lab_result.prev
     echo "$BID" > $S/runboot
 fi
@@ -472,6 +501,17 @@ while :; do
         NEW=$(ms_pid)
         if [ $EXP = 1 ]; then
             event "audio server restarted on request (pid $MSPID -> ${NEW:-?})"
+        elif rate48_recent; then
+            # right after a 48 kHz switch: turn 48 kHz output off and put the restart down to it
+            rm -f $S/rate48_sent $S/rate48
+            echo "the audio server restarted right after a switch to 48 kHz" > $S/rate48_cut
+            chmod 644 $S/rate48_cut
+            if [ -d $SET ]; then
+                echo 0 > $SET/rate48
+                chmod 644 $SET/rate48
+            fi
+            LAB_GRACE=$((NOW + 60))
+            event "audio server restarted unexpectedly right after a 48 kHz switch (pid $MSPID -> ${NEW:-?}); 48 kHz output turned off"
         elif [ -f $S/lab_active ] || [ $NOW -lt $LAB_GRACE ] || lab_recent; then
             # a Lab test was on: take it off at once and put this (and the next 60 s) down to it
             _la=""
@@ -504,7 +544,13 @@ while :; do
         set_lastboot good
         REASON="effects list overlay applied and confirmed"
         event "confirmed good"
-        if [ "$CONV" = 4 ] && [ -n "$MSPID" ]; then
+        if [ -n "$MSPID" ] && [ -f $PROC/$MSPID/maps ] && ! maps_has $MSPID libeqengine.so; then
+            # The audio server read its effects list before the overlay was in place (0.6.3, one car
+            # start in three): no EQ, no converter tables, no 48 kHz output in it. No restart from
+            # here: the rear camera runs in the same process.
+            REASON="effects list overlay applied, but the audio server read its effects list before it: EQ Engine is not active until Android's audio is restarted (parked)"
+            event "EQ Engine's filter is not loaded in the audio server ($MSPID): it read its effects list before the overlay. Restart Android audio once (parked)"
+        elif [ "$CONV" = 4 ] && [ -n "$MSPID" ]; then
             if maps_has $MSPID libaudio-resampler.so; then
                 event "very high quality converter: EQ Engine's tables are loaded in the audio server ($MSPID)"
             else
@@ -522,11 +568,17 @@ while :; do
         SVC_STARTED=1
         LASTWD=$NOW
         event "Android has started; starting the EQ service: $(flat $(am startservice -n $SVC 2>&1))"
+        keep_start
+        event "48 kHz output keeper started"
         write_status
     elif [ $SVC_STARTED = 1 ] && [ $((NOW - LASTWD)) -ge 60 ]; then
         LASTWD=$NOW
         if [ -z "$(app_running)" ]; then
             event "the EQ service was not running; starting it again: $(flat $(am startservice -n $SVC 2>&1))"
+        fi
+        if ! keep_alive; then
+            keep_start
+            event "the 48 kHz output keeper was not running; started it again"
         fi
     fi
     if [ $GOOD = 1 ]; then sleep 5; else sleep 2; fi

@@ -33,7 +33,7 @@ if [ -n "$U" ] && mkdir -p "$U/EQENGINE" 2>/dev/null; then
     read up rest < /proc/uptime
     T="${up%%.*}"
     {
-        echo "EQ Engine 0.6.1 preinstall"
+        echo "EQ Engine 0.6.4 preinstall"
         date
         id
         echo "product=$(getprop ro.build.product) sdk=$(getprop ro.build.version.sdk) boot_completed=$(getprop sys.boot_completed)"

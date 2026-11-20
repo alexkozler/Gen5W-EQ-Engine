@@ -68,5 +68,21 @@ ok "a missing Android function: says which, does nothing" "[ $rc = 2 ] && echo \
 out=$(EQE_MEDIA_LIB=$O/nothing.so $O/eqe_lab set 101 sampling_rate=48000); rc=$?
 ok "Android's library missing: error, nothing sent" "[ $rc = 2 ] && echo \"\$out\" | grep -q 'EQE_LAB_ERR could not load' && [ ! -s $O/calls.log ]"
 
+echo "== 5. check (for the car report): looks the functions up, calls nothing"
+: > $O/calls.log
+out=$($O/eqe_lab check); rc=$?
+ok "all four found" "[ $rc = 0 ] && [ \"\$out\" = 'symbols 4 of 4' ] && [ ! -s $O/calls.log ]"
+out=$(EQE_MEDIA_LIB=$O/libmedia_noget.so $O/eqe_lab check); rc=$?
+ok "one missing: named, 3 of 4" "[ $rc = 2 ] && echo \"\$out\" | grep -q 'missing _ZN7android11AudioSystem13getParameters' && echo \"\$out\" | grep -q 'symbols 3 of 4'"
+
+echo "== 6. umount (the driver watch while the audio server still has it open)"
+$O/eqe_lab umount /data/local/tmp/x > $O/u.txt 2>&1; rc=$?
+ok "a path that is not one of EQ Engine's mounts is refused" "[ $rc = 2 ]"
+$O/eqe_lab umount $O/../x/system/lib/hw/audio.primary.tcc803x.so > $O/u.txt 2>&1; rc=$?
+ok "a path with .. is refused" "[ $rc = 2 ]"
+mkdir -p $O/root/system/lib/hw; touch $O/root/system/lib/hw/audio.primary.tcc803x.so
+out=$($O/eqe_lab umount $O/root/system/lib/hw/audio.primary.tcc803x.so); rc=$?
+ok "the driver file, not mounted here: tried, the error comes back" "[ $rc = 1 ] && echo \"\$out\" | grep -q '^failed: '"
+
 echo "lab helper: $pass passed, $fail failed"
 [ $fail = 0 ]

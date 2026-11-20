@@ -8,13 +8,16 @@
  * down what Android asks of the driver. It changes nothing in the audio.
  *
  * Hyundai's device table: Android 4.4's audio_hw_device has 18 function entries after "common";
- * Hyundai's has 19. The 0.6.0 car logs (2026-11-19) placed the extra one: entries 0 to 5 are where
- * Android 4.4 has them (init_check, set_voice_volume, set_master_volume and set_mode were seen
- * there), and from set_parameters on everything sits one further (set_parameters was seen at 9,
- * open_output_stream at 12, dump at 16). Entries 6 to 8 hold the two microphone mute functions
- * and Hyundai's extra one, in an order that is not known: they are forwarded and written down as
- * numbers only. Version 1 used Android's own positions, so it misnamed every call from
- * set_parameters on and never saw an output stream open.
+ * Hyundai's has 19. The 0.6.0 car logs (2026-11-19) showed where they differ: entries 0 to 5 are
+ * where Android 4.4 has them (init_check, set_voice_volume, set_master_volume and set_mode were
+ * seen there), and from set_parameters on everything sits one further (set_parameters was seen at
+ * 9, open_output_stream at 12, dump at 16). The 0.6.1 car logs showed entry 8 is Hyundai's extra
+ * one, adev_set_mic_control(type, value), called once per volume step. Entries 6 and 7 are then
+ * presumably the two microphone mute functions; they have not been seen called and are written
+ * down as numbers only. Version 1 used Android's own positions, so it misnamed every call from
+ * set_parameters on and never saw an output stream open. Version 3 (0.6.2) names entry 8, logs
+ * which entries are empty, and does not write down settings that carry a name (the hands-free
+ * phone's name comes this way).
  *
  * Safety:
  *  - Only the 19 device entries are replaced, in Hyundai's own device object, before Android gets
@@ -70,7 +73,7 @@
 #define DRV_WINDOW_MS 30000
 #endif
 #define DRV_LINK_MS (DRV_WINDOW_MS / 3) /* how often the status file's link rates are measured */
-#define DRV_VERSION 2
+#define DRV_VERSION 3
 #define LOG_CAP (512 * 1024)
 #define EXPORT __attribute__((visibility("default")))
 
@@ -476,11 +479,13 @@ static void links_poll(int64_t now) {
 enum {
     S_SUPPORTED = 0, S_INIT = 1, S_VOICE = 2, S_MASTER = 3, S_GET_MASTER = 4, S_MODE = 5,
     S_SETP = 9, S_GETP = 10, S_INBUF = 11, S_OPEN_OUT = 12, S_CLOSE_OUT = 13, S_OPEN_IN = 14,
-    S_CLOSE_IN = 15, S_DUMP = 16, S_SET_MUTE = 17, S_GET_MUTE = 18
+    S_CLOSE_IN = 15, S_DUMP = 16, S_SET_MUTE = 17, S_GET_MUTE = 18, S_MIC_CONTROL = 8
 };
 static const char *const k_name[NSLOT] = {
     "get_supported_devices", "init_check", "set_voice_volume", "set_master_volume", "get_master_volume", "set_mode",
-    NULL, NULL, NULL, /* the microphone mute pair and Hyundai's extra entry, order not known */
+    /* 6 and 7: presumably the microphone mute pair (not seen called yet); 8: Hyundai's extra entry,
+     * adev_set_mic_control(type, value), seen once per volume step (0.6.1 car logs) */
+    NULL, NULL, "set_mic_control",
     "set_parameters", "get_parameters", "get_input_buffer_size", "open_output_stream", "close_output_stream",
     "open_input_stream", "close_input_stream", "dump", "set_master_mute", "get_master_mute"};
 
@@ -601,8 +606,17 @@ static W slot_call(int i, W a0, W a1, W a2, W a3, W a4, W a5, W a6, W a7) {
         write_status();
         break;
     case S_SETP:
-        snprintf(line, sizeof(line), "device set_parameters \"%s\" -> %d", text, (int)r);
+        /* Android passes the hands-free phone's name this way (bt_headset_name=...): not written down */
+        if (strstr(text, "name=") != NULL)
+            snprintf(line, sizeof(line), "device set_parameters (a setting with a name in it, not written down) -> %d", (int)r);
+        else
+            snprintf(line, sizeof(line), "device set_parameters \"%s\" -> %d", text, (int)r);
         log_param(line);
+        break;
+    case S_MIC_CONTROL:
+        if (__atomic_fetch_add(&g_raw_logged[i], 1, __ATOMIC_RELAXED) < 3)
+            wlog(0, "device set_mic_control type %d value %d -> %d%s", (int)a1, (int)a2, (int)r,
+                 g_raw_logged[i] >= 3 ? " (from now on only counted)" : "");
         break;
     case S_GETP: {
         char ans[512];
@@ -759,8 +773,17 @@ static void hook_device(struct audio_hw_device *d) {
     }
     W *table = (W *)&d->get_supported_devices;
     int n = 0;
+    char empty[96];
+    int ne = 0;
+    empty[0] = 0;
     for (int i = 0; i < NSLOT; i++) {
-        if (slots[i] == 0) continue;
+        if (slots[i] == 0) {
+            char lab[40];
+            slot_label(i, lab, sizeof(lab));
+            ne += snprintf(empty + ne, ne < (int)sizeof(empty) ? sizeof(empty) - ne : 0, "%s%d %s", ne ? ", " : "", i, lab);
+            if (ne >= (int)sizeof(empty)) ne = sizeof(empty) - 1;
+            continue;
+        }
         g_orig[i] = slots[i];
         W f = (W)k_slot_fn[i];
 #if !defined(__arm__)
@@ -777,6 +800,7 @@ static void hook_device(struct audio_hw_device *d) {
             "device entries forwarded (Hyundai's layout); output streams left untouched",
          g_orig_mod->name ? g_orig_mod->name : "?", g_orig_mod->author ? g_orig_mod->author : "?",
          g_orig_mod->module_api_version, d->common.version, n, NSLOT);
+    if (empty[0]) wlog(1, "empty device entries (left as they are): %s", empty);
     write_status();
 }
 

@@ -1,5 +1,8 @@
 /*
- * eqe_lab: root helper for the Lab's 48 kHz test (act.sh), 0.6.1.
+ * eqe_lab: root helper for the 48 kHz output (act.sh keep), the car report and the Lab, 0.6.3.
+ *
+ *   eqe_lab check              are Android's AudioSystem functions there? Looks them up and calls
+ *                              nothing: "symbols 4 of 4"
  *
  *   eqe_lab rate [ms]          the hardware links that are playing, from the kernel's own counters:
  *                              "link pcm2p state=RUNNING owner=4258 rate=44100 fps=44100.0"
@@ -7,6 +10,10 @@
  *                              from the link's start). "link none" if nothing plays.
  *   eqe_lab get <io> <keys>    Android's AudioSystem::getParameters(io, keys): prints the answer
  *   eqe_lab set <io> <kv>      Android's AudioSystem::setParameters(io, kv): prints "status <n>"
+ *   eqe_lab umount <path>      detaches one of EQ Engine's bind mounts (the driver watch, or the
+ *                              effects list) even while the audio server still has the file open:
+ *                              a plain umount says "busy" then. The running audio server keeps the
+ *                              copy it has loaded; the next one opens the file underneath.
  *
  * The rate comes from /proc/asound/cardN/pcmMp/sub0/status: hw_ptr is the number of frames the
  * hardware has taken since the link started and tstamp is when the kernel last updated it, so the
@@ -26,7 +33,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/mount.h>
 #include <unistd.h>
+
+#ifndef MNT_DETACH
+#define MNT_DETACH 2
+#endif
 
 #ifndef EQE_ASOUND
 #define EQE_ASOUND "/proc/asound"
@@ -186,12 +198,53 @@ static int cmd_param(int set, int io, const char *text) {
     return 0;
 }
 
+/* "check": are Android's audio functions there? Loads the libraries and looks them up; calls nothing. */
+static int cmd_check(void) {
+    const char *ml = getenv("EQE_MEDIA_LIB"), *ul = getenv("EQE_UTILS_LIB");
+    void *utils = dlopen(ul && *ul ? ul : EQE_UTILS_LIB, RTLD_NOW);
+    void *media = dlopen(ml && *ml ? ml : EQE_MEDIA_LIB, RTLD_NOW);
+    if (utils == NULL || media == NULL) {
+        const char *e = dlerror();
+        printf("EQE_LAB_ERR could not load Android's audio library: %s\n", e ? e : "?");
+        return 2;
+    }
+    int n = 0;
+    n += sym(utils, "_ZN7android7String8C1EPKc") != NULL;
+    n += sym(utils, "_ZN7android7String8D1Ev") != NULL;
+    n += sym(media, "_ZN7android11AudioSystem13setParametersEiRKNS_7String8E") != NULL;
+    n += sym(media, "_ZN7android11AudioSystem13getParametersEiRKNS_7String8E") != NULL;
+    printf("symbols %d of 4\n", n);
+    return n == 4 ? 0 : 2;
+}
+
 static int usage(void) {
-    fprintf(stderr, "usage: eqe_lab rate [ms] | get <io> <keys> | set <io> <key=value>\n");
+    fprintf(stderr, "usage: eqe_lab rate [ms] | get <io> <keys> | set <io> <key=value> | check | umount <path>\n");
     return 2;
 }
 
+/* "umount <path>": only the files EQ Engine lays bind mounts over (tests put them under a root). */
+static int cmd_umount(const char *path) {
+    static const char *const kOurs[] = {"/system/lib/hw/audio.primary.tcc803x.so",
+                                        "/system/etc/audio_effects.conf", "/system/etc/audio_policy.conf"};
+    size_t n = strlen(path), i;
+    int ours = 0;
+    if (path[0] != '/' || strstr(path, "..") != NULL) return usage();
+    for (i = 0; i < sizeof kOurs / sizeof kOurs[0]; i++) {
+        size_t m = strlen(kOurs[i]);
+        if (n >= m && strcmp(path + n - m, kOurs[i]) == 0) ours = 1;
+    }
+    if (!ours) return usage();
+    if (umount2(path, MNT_DETACH) != 0) {
+        printf("failed: %s\n", strerror(errno));
+        return 1;
+    }
+    printf("detached %s\n", path);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "check") == 0) return cmd_check();
+    if (argc == 3 && strcmp(argv[1], "umount") == 0) return cmd_umount(argv[2]);
     if (argc >= 2 && strcmp(argv[1], "rate") == 0) {
         int ms = argc >= 3 ? atoi(argv[2]) : 3000;
         if (ms < 0 || ms > 60000) return usage();

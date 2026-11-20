@@ -200,6 +200,20 @@ final class EqSettings {
         return new File(dir(ctx), "converter");
     }
 
+    /** 48 kHz output (act.sh keep reads settings/rate48): on unless the file says 0. */
+    static boolean readRate48(Context ctx) {
+        String v = Root.readFirstLine(rate48File(ctx));
+        return v == null || !v.trim().equals("0");
+    }
+
+    static boolean writeRate48(Context ctx, boolean on) {
+        return writeAtomic(rate48File(ctx), (on ? "1" : "0") + "\n");
+    }
+
+    static File rate48File(Context ctx) {
+        return new File(dir(ctx), "rate48");
+    }
+
     static File vhqFile(Context ctx) {
         return new File(dir(ctx), "vhq");
     }
