@@ -18,8 +18,8 @@ final class NavRail extends View {
         void onRail(int item);
     }
 
-    static final int EQ = 0, POSITION = 1, SETTINGS = 2, STATUS = 3, LAB = 4;
-    private static final String[] LABELS = {"EQ", "Position", "Settings", "Status", "Lab"};
+    static final int EQ = 0, POSITION = 1, SETTINGS = 2, STATUS = 3;
+    private static final String[] LABELS = {"EQ", "Position", "Settings", "Status"};
 
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint t = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -173,27 +173,6 @@ final class NavRail extends View {
             path.lineTo(cx + 4 * d, cy + 1 * d);
             path.lineTo(cx + 8 * d, cy + 1 * d);
             stroke(color, 2.2f * d);
-            c.drawPath(path, p);
-            break;
-        }
-        case LAB: {
-            // flask with liquid
-            path.reset();
-            path.moveTo(cx - 3.5f * d, cy - 10 * d);
-            path.lineTo(cx - 3.5f * d, cy - 3 * d);
-            path.lineTo(cx - 9.5f * d, cy + 9 * d);
-            path.lineTo(cx + 9.5f * d, cy + 9 * d);
-            path.lineTo(cx + 3.5f * d, cy - 3 * d);
-            path.lineTo(cx + 3.5f * d, cy - 10 * d);
-            c.drawPath(path, p);
-            c.drawLine(cx - 6 * d, cy - 10 * d, cx + 6 * d, cy - 10 * d, p);
-            path.reset();
-            path.moveTo(cx - 6.6f * d, cy + 3.5f * d);
-            path.lineTo(cx + 6.6f * d, cy + 3.5f * d);
-            path.lineTo(cx + 8.6f * d, cy + 8 * d);
-            path.lineTo(cx - 8.6f * d, cy + 8 * d);
-            path.close();
-            fill(color);
             c.drawPath(path, p);
             break;
         }

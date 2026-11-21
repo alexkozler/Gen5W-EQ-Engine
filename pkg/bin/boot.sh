@@ -46,7 +46,7 @@
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.6.4
+VER=0.6.6
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -473,6 +473,9 @@ else
     event "audio converter: Android default requested (af.resampler.quality=0)"
 fi
 MSPID=$(ms_pid)
+# right after an install: the audio server running now (it started before the install)
+FRESH_MS=""
+[ $FRESH = 1 ] && FRESH_MS=$MSPID
 event "audio server pid ${MSPID:-not found yet}"
 LASTR=0
 LASTWD=0
@@ -544,7 +547,13 @@ while :; do
         set_lastboot good
         REASON="effects list overlay applied and confirmed"
         event "confirmed good"
-        if [ -n "$MSPID" ] && [ -f $PROC/$MSPID/maps ] && ! maps_has $MSPID libeqengine.so; then
+        if [ -n "$MSPID" ] && [ -f $PROC/$MSPID/maps ] && ! maps_has $MSPID libeqengine.so && \
+           [ $FRESH = 1 ] && [ "$MSPID" = "$FRESH_MS" ]; then
+            # Right after an install, the audio server that was already running started before EQ
+            # Engine existed: expected, and the install's instructions say to restart the car.
+            REASON="effects list overlay applied; just installed: the running audio server started before EQ Engine was installed and loads it at the next car start or audio restart (parked)"
+            event "just installed: the running audio server ($MSPID) started before EQ Engine was installed; it loads EQ Engine at the next car start or audio restart (parked)"
+        elif [ -n "$MSPID" ] && [ -f $PROC/$MSPID/maps ] && ! maps_has $MSPID libeqengine.so; then
             # The audio server read its effects list before the overlay was in place (0.6.3, one car
             # start in three): no EQ, no converter tables, no 48 kHz output in it. No restart from
             # here: the rear camera runs in the same process.

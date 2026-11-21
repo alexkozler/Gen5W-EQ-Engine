@@ -6,14 +6,21 @@ import java.io.FileReader;
 import java.util.HashMap;
 import java.util.Map;
 
-/** What the NEMESIS boot step reported (/data/eqengine/state/status). */
+/** What the NEMESIS boot step reported (/data/eqengine/state/status). Everything is read in read(). */
 final class BootStatus {
     static final String STATE_DIR = "/data/eqengine/state";
 
     final Map<String, String> v;
+    private final boolean disabled;
 
-    private BootStatus(Map<String, String> v) {
+    private BootStatus(Map<String, String> v, boolean disabled) {
         this.v = v;
+        this.disabled = disabled;
+    }
+
+    /** Nothing known yet (before the screen's first status read). */
+    static BootStatus empty() {
+        return new BootStatus(new HashMap<String, String>(), false);
     }
 
     static BootStatus read() {
@@ -31,7 +38,7 @@ final class BootStatus {
         } finally {
             Root.close(r);
         }
-        return new BootStatus(m);
+        return new BootStatus(m, new File(STATE_DIR + "/disabled").exists());
     }
 
     String get(String k) {
@@ -44,7 +51,7 @@ final class BootStatus {
     }
 
     boolean disabledFlag() {
-        return new File(STATE_DIR + "/disabled").exists();
+        return disabled;
     }
 
     /** The EQ may be attached: the effects list overlay is in place and nothing turned it off. */

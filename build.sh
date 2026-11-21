@@ -15,6 +15,22 @@ D8="java -cp $T/r8-8.13.25.jar com.android.tools.r8.D8"
 AAPT2=$T/aapt2/aapt2
 APKSIG="$T/apksig-8.13.2.jar:$HERE/build/apktool"
 KEYS=$HERE/keys
+# The version, from the package. Every other place that carries it must say the same, or the build
+# stops before it deletes anything. The stick zips are named with it.
+VER=$(sed -n 's/^package-version=//p' "$HERE/pkg/NEMESIS.data")
+[ -n "$VER" ] || { echo "no package-version in pkg/NEMESIS.data"; exit 1; }
+for chk in \
+    "app/src/com/eqengine/app/MainActivity.java:static final String VERSION = \"$VER\";" \
+    "app/AndroidManifest.xml:android:versionName=\"$VER\"" \
+    "pkg/bin/act.sh:VER=$VER" \
+    "pkg/bin/boot.sh:VER=$VER" \
+    "pkg/scripts/pre.sh:EQ Engine $VER preinstall" \
+    "pkg/scripts/post.sh:EQ Engine $VER installed" \
+    "stick/README-EQENGINE.txt:EQ Engine $VER (NEMESIS package"; do
+    f=${chk%%:*}
+    want=${chk#*:}
+    grep -qF "$want" "$HERE/$f" || { echo "version mismatch: $f does not have '$want' (pkg/NEMESIS.data says $VER)"; exit 1; }
+done
 B=$HERE/build
 rm -rf "$B"
 mkdir -p "$B/classes" "$B/dex" "$B/res" "$B/apktool"
@@ -74,7 +90,7 @@ cp -r "$HERE/app" "$HERE/pkg" "$HERE/rescue" "$HERE/tests" "$HERE/vhq" "$HERE/th
     "$HERE/build.sh" "$S/EQENGINE-source/"
 rm -f "$S/EQENGINE-source/tests/host_test" "$S/EQENGINE-source/tests/conf/parse"
 rm -f "$S/EQENGINE-source/vhq/neon/"*.o "$S/EQENGINE-source/vhq/neon/"*.elf "$S/EQENGINE-source/vhq/neon/"*.bin
-rm -f "$HERE/eqengine-stick.zip" "$HERE/eqengine-rescue-stick.zip"
-(cd "$S" && zip -q -X -D -r "$HERE/eqengine-stick.zip" NEMESIS.data README-EQENGINE.txt packages EQENGINE-source)
-(cd "$HERE/rescue" && zip -q -X -D -r "$HERE/eqengine-rescue-stick.zip" NEMESIS.data NEMESIS.emergency eqengine-off.sh README-RESCUE.txt)
-echo "built $HERE/eqengine-stick.zip and $HERE/eqengine-rescue-stick.zip"
+rm -f "$HERE"/eqengine-stick*.zip "$HERE"/eqengine-rescue-stick*.zip
+(cd "$S" && zip -q -X -D -r "$HERE/eqengine-stick-$VER.zip" NEMESIS.data README-EQENGINE.txt packages EQENGINE-source)
+(cd "$HERE/rescue" && zip -q -X -D -r "$HERE/eqengine-rescue-stick-$VER.zip" NEMESIS.data NEMESIS.emergency eqengine-off.sh README-RESCUE.txt)
+echo "built $HERE/eqengine-stick-$VER.zip and $HERE/eqengine-rescue-stick-$VER.zip"

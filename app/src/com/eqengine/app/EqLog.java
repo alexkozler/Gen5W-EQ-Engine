@@ -10,9 +10,11 @@ import java.util.LinkedList;
 import java.util.Locale;
 
 /**
- * A small log: logcat (tag EQEngineApp), a file in the app's own folder (256 KB, one old copy),
- * and the last lines for the screen. Normal level keeps events, warnings and errors; detailed
- * level (Settings > Detailed logging) adds every slider move, root command and 30 s audio summaries.
+ * A small log: logcat (tag EQEngineApp), a file in the app's own folder, and the last lines for
+ * the screen. Normal level keeps events, warnings and errors; detailed level (Status > Diagnostics
+ * > Detailed logging) adds every slider release, root command and 30 s audio summaries.
+ * The file is written on the background thread (Bg) and rolls over at 256 KB while it runs,
+ * keeping one old copy, so it never takes more than about 512 KB.
  */
 final class EqLog {
     static final String TAG = "EQEngineApp";
@@ -22,21 +24,24 @@ final class EqLog {
     private static final LinkedList<String> tail = new LinkedList<String>();
     private static final SimpleDateFormat FMT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US);
     private static File file;
+    private static int version;
+    /** size of the file; touched on the background thread only */
+    private static long fileBytes = -1;
 
     private EqLog() {}
 
     static synchronized void init(File dir) {
         if (file != null) return;
         file = new File(dir, "eqengine.log");
-        if (file.length() > MAX_BYTES) {
-            File old = new File(dir, "eqengine.old.log");
-            old.delete();
-            file.renameTo(old);
-        }
     }
 
     static synchronized File file() {
         return file;
+    }
+
+    /** Changes with every line, so the screen redraws the log only when there is something new. */
+    static synchronized int version() {
+        return version;
     }
 
     static void i(String msg) {
@@ -64,28 +69,52 @@ final class EqLog {
         return sb.toString();
     }
 
-    private static synchronized void line(String level, String msg) {
-        String s = FMT.format(new Date()) + " " + level + " " + msg;
+    /** Waits until the lines logged so far are in the file (before copying it, or in the crash handler). */
+    static void flush(long timeoutMs) {
+        Bg.flush(timeoutMs);
+    }
+
+    private static void line(String level, String msg) {
+        final String s;
+        final File f;
+        synchronized (EqLog.class) {
+            s = FMT.format(new Date()) + " " + level + " " + msg;
+            tail.add(s.length() > 600 ? s.substring(0, 600) + " ..." : s);
+            while (tail.size() > TAIL_LINES) tail.removeFirst();
+            version++;
+            f = file;
+        }
         if ("E".equals(level)) android.util.Log.e(TAG, msg);
         else if ("W".equals(level)) android.util.Log.w(TAG, msg);
         else if ("D".equals(level)) android.util.Log.d(TAG, msg);
         else android.util.Log.i(TAG, msg);
-        tail.add(s.length() > 600 ? s.substring(0, 600) + " ..." : s);
-        while (tail.size() > TAIL_LINES) tail.removeFirst();
-        if (file == null) return;
+        if (f == null) return;
+        Bg.run(new Runnable() {
+            public void run() {
+                append(f, s + "\n");
+            }
+        });
+    }
+
+    /** On the background thread only. */
+    private static void append(File f, String text) {
         FileOutputStream out = null;
         try {
-            out = new FileOutputStream(file, true);
-            out.write((s + "\n").getBytes("UTF-8"));
+            if (fileBytes < 0) fileBytes = f.length();
+            if (fileBytes > MAX_BYTES) {
+                File old = new File(f.getParentFile(), "eqengine.old.log");
+                old.delete();
+                f.renameTo(old);
+                fileBytes = 0;
+            }
+            byte[] b = text.getBytes("UTF-8");
+            out = new FileOutputStream(f, true);
+            out.write(b);
+            fileBytes += b.length;
         } catch (Throwable ignored) {
             // logging must never take the app down
         } finally {
-            if (out != null) {
-                try {
-                    out.close();
-                } catch (Throwable ignored) {
-                }
-            }
+            Root.close(out);
         }
     }
 }

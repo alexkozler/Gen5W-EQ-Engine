@@ -50,6 +50,7 @@ echo "USER     PID   PPID  VSIZE  RSS     WCHAN    PC         NAME"
 echo "root      1     0     1000   500   ffffffff 00000000 S /init"
 p=$(cat /tmp/eqeact/mspid); [ -d /tmp/eqeact/proc/$p ] && echo "media     $p   1     33148  9784  ffffffff b6ea0870 S /system/bin/mediaserver"
 echo "system    987   165   979824 114648 ffffffff 4010fa40 S com.google.android.projection.sink"
+echo "u0_a41    2290  165   612000 80000 ffffffff 4010fa40 S com.daudio.app.dipo"
 i=0; while [ $i -lt 40 ]; do echo "u0_a$i     $((3000 + i))  165   1000 100 ffffffff 4010fa40 S app.number.$i"; i=$((i+1)); done
 exit 0
 S
@@ -90,6 +91,18 @@ T=/tmp/eqeact
 if [ -f $T/start_in ]; then
     n=$(($(cat $T/start_in) - 1))
     if [ $n -le 0 ]; then rm -f $T/start_in; touch $T/playing; $T/stubs/asound; else echo $n > $T/start_in; fi
+fi
+# another process (the factory CarPlay app, thread 2291) has the main link from <from> to <until>
+# (other_at: "<from> <until>"); other_stops_music: Android's music stops when it takes the link;
+# other_then_play: Android's music plays again when it lets go
+if [ -f $T/other_at ]; then
+    read f2 u2 < $T/other_at; now=$((u + $1))
+    if [ ! -f $T/other ] && [ $now -ge $f2 ] && [ $now -lt $u2 ]; then
+        echo 2291 > $T/other; [ -f $T/other_stops_music ] && rm -f $T/playing; $T/stubs/asound
+    fi
+    if [ $now -ge $u2 ]; then
+        rm -f $T/other $T/other_at; [ -f $T/other_then_play ] && { rm -f $T/other_then_play; touch $T/playing; }; $T/stubs/asound
+    fi
 fi
 if [ -f $T/crash_at ] && [ $((u + $1)) -ge $(cat $T/crash_at) ]; then
     rm -f $T/crash_at
@@ -267,6 +280,22 @@ labsetup() {  # a unit with Hyundai's driver, EQ Engine's watch layer and Lab he
     printf 'Name:\tmediaserver\nTgid:\t5056\n' > $T/proc/4258/status
     echo "b6c00000-b6c06000 r-xp 00000000 b3:19 4243   /data/eqengine/lib/libeqengine.so" > $T/proc/5056/maps
     rm -f $T/waking $T/wake_fail $T/newtrack $T/hold_fail_once $T/start_in
+    rm -f $T/other $T/other_at $T/other_stops_music $T/other_then_play $T/other_on_wake $T/imports.log
+    # the factory CarPlay app (pid 2290; thread 2291 plays to the main link when "other" is set),
+    # with the libraries it has mapped
+    mkdir -p $T/proc/2290 $T/proc/2291 $T/system/lib
+    printf 'com.daudio.app.dipo\0\0\0\0' > $T/proc/2290/cmdline
+    printf 'Name:\tAudioTrack\nTgid:\t2290\n' > $T/proc/2291/status
+    cat > $T/proc/2290/maps <<'M'
+b6f00000-b6f40000 r-xp 00000000 b3:19 100        /system/lib/libc.so
+b6f40000-b6f41000 rw-p 00040000 b3:19 100        /system/lib/libc.so
+b5000000-b5040000 r-xp 00000000 b3:19 200        /system/lib/libCarPlayAudio.so
+b4000000-b4010000 r-xp 00000000 b3:19 300        /data/hmgapi/lib/libleafiaaac.so
+b3000000-b3010000 r-xp 00000000 b3:19 400        /system/lib/libbroken.so
+b2000000-b2001000 rw-p 00000000 00:00 0          [anon:libc_malloc]
+b1000000-b1100000 r--p 00000000 b3:19 500        /system/framework/framework.jar
+M
+    echo "factory tinyalsa" > $T/system/lib/libtinyalsa.so
     # the system log's clock (the driver's lines are read from the time of a switch on)
     cat > $T/stubs/date <<'S'
 #!/bin/sh
@@ -284,7 +313,11 @@ S
 #!/bin/sh
 T=/tmp/eqeact; d=$T/proc/asound/card0/pcm2p/sub0; mkdir -p $d $T/proc/asound/card0/pcm0p/sub0
 echo closed > $T/proc/asound/card0/pcm0p/sub0/status
-if [ -f $T/playing ] || [ -f $T/waking ]; then
+if [ -f $T/other ]; then
+    # the factory CarPlay app has the link (TinyALSA, 44.1 kHz, 1024-frame periods)
+    printf 'state: RUNNING\nowner_pid   : %s\ntrigger_time: 300.000000000\ntstamp      : 310.000000000\n-----\nhw_ptr      : 441000\n' "$(cat $T/other)" > $d/status
+    printf 'access: RW_INTERLEAVED\nformat: S16_LE\nchannels: 2\nrate: 44100 (44100/1)\nperiod_size: 1024\n' > $d/hw_params
+elif [ -f $T/playing ] || [ -f $T/waking ]; then
     printf 'state: RUNNING\nowner_pid   : %s\ntrigger_time: 230.252515234\ntstamp      : 278.920789965\n-----\nhw_ptr      : 2336064\n' "$(cat $T/owner 2>/dev/null || echo 4258)" > $d/status
     printf 'access: RW_INTERLEAVED\nformat: S16_LE\nchannels: 2\nrate: %s (%s/1)\nperiod_size: 2048\n' $(cat $T/link_rate) $(cat $T/link_rate) > $d/hw_params
 else
@@ -319,9 +352,21 @@ umount)
     grep -v " $2 " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
     echo "detached $2" ;;
 rate)
-    if [ -f $T/playing ] || [ -f $T/waking ]; then
+    if [ -f $T/other ]; then
+        echo "link pcm2p card0 state=RUNNING owner=$(cat $T/other) rate=44100 fps=44100.0"
+    elif [ -f $T/playing ] || [ -f $T/waking ]; then
         echo "link pcm2p card0 state=RUNNING owner=$(cat $T/owner 2>/dev/null || echo 4258) rate=$(cat $T/link_rate) fps=$(cat $T/link_fps).0"
     else echo "link none"; fi ;;
+imports)
+    # stand-ins for the CarPlay app's libraries (the real reader is tested in tests/lab)
+    echo "imports $2" >> $T/imports.log
+    case "$2" in
+        */libCarPlayAudio.so) printf 'needed libc.so\nneeded libtinyalsa.so\nneeded libCarPlayUtils.so\nimport malloc\nimport pcm_open\nimport pcm_writei\nimport mixer_open\nimport mixer_get_ctl_by_name\nexport CarPlayAudioStart\n' ;;
+        */libtinyalsa.so) printf 'needed libc.so\nimport ioctl\nexport pcm_open\nexport pcm_writei\nexport mixer_open\nexport mixer_ctl_get_name\n' ;;
+        */libbroken.so) echo "EQE_LAB_ERR imports: unexpected program header size"; exit 1 ;;
+        */libc.so) printf 'import __stack_chk_guard\nexport malloc\nexport pcm_fake_export\n' ;;
+        *) printf 'needed libc.so\nimport memcpy\n' ;;
+    esac ;;
 set)
     echo "set $2 $3" >> $T/lab_calls.log
     echo "$(cut -d. -f1 $T/proc/uptime) $3" >> $T/set_times.log
@@ -473,6 +518,8 @@ if [ -n "$w" ]; then
     sess="$sess 990"
     echo "9 0 990 $(cat $A/mix)" >> $A/tracks
     [ -f $T/wake_fail ] || touch $T/waking
+    # the factory CarPlay app takes the main link just as the silent track starts
+    [ -f $T/other_on_wake ] && { rm -f $T/other_on_wake; echo 2291 > $T/other; }
 fi
 $T/stubs/afsim hold $sess
 # a track that comes up while the others are held (newtrack): not held, on the mix buffer
@@ -499,7 +546,7 @@ HALT=$T/system/lib/hw/audio.primary.tcc803x.so
 nkills() { [ -f $T/kill.log ] && wc -l < $T/kill.log || echo 0; }
 later() { echo "$(( $(cut -d. -f1 $T/proc/uptime) + ${1:-11} )).00 50.00" > $T/proc/uptime; }
 nsets() { [ -f $T/lab_calls.log ] && wc -l < $T/lab_calls.log || echo 0; }
-keep() { ( cd /; EQE_TEST_ROOT=$T EQE_KEEP_ROUNDS=${1:-4} EQE_IDLE_AFTER=${IDLE:-8} EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 60 $SH $ACT keep > $T/out.txt 2>&1; echo $? > $T/rc ); }
+keep() { ( cd /; EQE_TEST_ROOT=$T EQE_KEEP_ROUNDS=${1:-4} EQE_IDLE_AFTER=${IDLE:-8} EQE_OTHER_QUIET=${QUIET:-60} EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 60 $SH $ACT keep > $T/out.txt 2>&1; echo $? > $T/rc ); }
 keepi() { IDLE=2 keep "$@"; }
 tracks_on_mix() { [ "$(cut -d' ' -f4 $T/af/tracks | sort -u)" = "$(cat $T/af/mix)" ]; }
 ost() { sed -n "s/^$1=//p" $LS/output; }
@@ -564,7 +611,29 @@ keep 3
 ok "keeper: nothing playing: nothing sent, waiting for music" "[ $(nsets) = 0 ] && [ \"\$(ost state)\" = waiting ]"
 labsetup; echo 9999 > $T/owner; $T/stubs/asound
 keep 3
-ok "keeper: the link is played by another thread: not the main output's, nothing sent" "[ $(nsets) = 0 ]"
+ok "keeper: the link is played by a thread that is not the audio server's: nothing sent, state other" "[ $(nsets) = 0 ] && [ \"\$(ost state)\" = other ] && [ \"\$(ost owner)\" = 'pid 9999' ]"
+
+# --- another process plays to the main link itself (wired CarPlay, 0.6.4 on the car: the factory
+# CarPlay app opens pcm2p through TinyALSA, and the audio server's own opens fail meanwhile)
+labsetup; rm -f $T/playing; echo 2291 > $T/other; $T/stubs/asound
+keepi 9
+ok "other: the factory CarPlay app has the main link and nothing plays in Android: no switch, no hold, no silent track" "[ $(nsets) = 0 ] && [ ! -f $T/hold.log ] && [ ! -f $T/standby_sets.log ] && ! grep -q 'nothing plays: switching' $LS/output.log && ! grep -q 'no rate change' $LS/output.log"
+ok "other: state other, the owner's name, the link with its rate and frames/s, a plain note" "[ \"\$(ost state)\" = other ] && [ \"\$(ost owner)\" = com.daudio.app.dipo ] && [ \"\$(ost link)\" = pcm2p ] && [ \"\$(ost link_rate)\" = 44100 ] && [ \"\$(ost fps)\" = 44100 ] && [ \"\$(ost server)\" = 5056 ] && [ \"\$(ost note)\" = \"the main speaker link is in use by com.daudio.app.dipo, which plays to it directly, not through Android's audio server; EQ Engine cannot process that sound\" ]"
+ok "other: one log line when it appears, none after that" "[ \$(grep -c 'is in use by com.daudio.app.dipo (thread 2291, RUNNING at 44100 Hz)' $LS/output.log) = 1 ] && [ \$(wc -l < $LS/output.log) -le 3 ]"
+labsetup; rm -f $T/playing; echo 2291 > $T/other; echo "0 704" > $T/other_at; $T/stubs/asound
+QUIET=3 keepi 14
+REL=$(sed -n 's/^\([0-9]*\) the main link (pcm2p) is no longer in use by com.daudio.app.dipo.*/\1/p' $LS/output.log)
+SW=$(sed -n 's/^\([0-9]*\) nothing plays: switching the main output to 48 kHz now.*/\1/p' $LS/output.log)
+ok "other: it lets go and nothing plays: one line, then (once the link has been free a while) the switch while nothing plays as usual" "[ -n \"\$REL\" ] && [ -n \"\$SW\" ] && [ \$((SW - REL)) -ge 3 ] && [ \"\$(cat $T/lab_calls.log)\" = 'set 101 sampling_rate=48000' ] && [ \"\$(ost state)\" = 48k ] && ! grep -q '^owner=' $LS/output && [ \$(grep -c 'no longer in use' $LS/output.log) = 1 ] && tracks_on_mix"
+labsetup; rm -f $T/playing; echo 2291 > $T/other; echo "0 703" > $T/other_at; touch $T/other_then_play; $T/stubs/asound
+keep 8
+ok "other: it lets go and Android's music starts on the link: checked as usual, switched with the music playing" "[ \"\$(cat $T/lab_calls.log)\" = 'set 101 sampling_rate=48000' ] && [ \"\$(ost state)\" = 48k ] && grep -q 'no longer in use by com.daudio.app.dipo' $LS/output.log && grep -q \"holding the main output's audio sessions (13 107 21 111) for the change\" $LS/output.log && tracks_on_mix && ! grep -q '^owner=' $LS/output"
+labsetup; echo "716 721" > $T/other_at; touch $T/other_stops_music $T/other_then_play
+keep 26
+ok "other: music at 48 kHz, then the CarPlay app has the link for a while: nothing sent meanwhile, 48 kHz shown again after it" "[ $(nsets) = 1 ] && [ \"\$(ost state)\" = 48k ] && grep -q 'is in use by com.daudio.app.dipo' $LS/output.log && grep -q 'no longer in use by com.daudio.app.dipo' $LS/output.log && [ \$(grep -c 'switching the main output' $LS/output.log) = 1 ] && [ \"\$(ost link_rate)\" = 48000 ]"
+labsetup; rm -f $T/playing; touch $T/other_on_wake; $T/stubs/asound
+keepi 7
+ok "other: it takes the link just as the silent track starts: nothing sent, no try spent, the hold released, then state other" "[ $(nsets) = 0 ] && grep -q 'no rate change: the main link was taken by com.daudio.app.dipo' $LS/output.log && ! grep -q 'did not start with the silent track' $LS/output.log && ! grep -q 'could not be held' $LS/output.log && [ \"\$(ost state)\" = other ] && [ ! -s $T/af/chains ] && [ ! -d $LS/hold ] && ! grep -q ' 990 ' $T/af/tracks"
 
 labsetup; echo keep > $T/driver48
 keep 5
@@ -673,6 +742,9 @@ cat <<'P'
 [tcc.audio.sampling_rate]: [4]
 [ro.daudio.vin]: [KM8KRDAF1NU000000]
 [wifi.interface]: [wlan0]
+[ro.debuggable]: [1]
+[ro.secure]: [1]
+[ro.some.other]: [x]
 P
 exit 0
 fi
@@ -681,6 +753,7 @@ ro.build.product) echo NEEV.USA.0000.V015.012.260507 ;;
 ro.build.version.sdk) echo 19 ;;
 ro.build.version.release) echo 4.4.2 ;;
 af.resampler.quality) cat /tmp/eqeact/prop ;;
+ro.debuggable|ro.secure) echo 1 ;;
 esac
 S
 cat > $T/stubs/dmesg <<'S'
@@ -718,13 +791,66 @@ ok "report: one text file on the stick, named after the car's software" "[ $(rc)
 ok "report: the checks are there (Android, driver, 48 kHz switch, main output)" "grep -q 'ok    Android 4.4.2 (API 19)' \"$RF\" && grep -q 'audio driver: the same one as on the tested car' \"$RF\" && grep -q 'the 48 kHz switch can reach' \"$RF\" && grep -q 'main output: io 101 at 44100 Hz; link pcm2p set to 44100 Hz' \"$RF\""
 ok "report: the audio lines and the kernel's audio line are kept" "grep -q 'keyvalue sampling_rate=48000' \"$RF\" && grep -q 'samplerate(48000)' \"$RF\" && grep -q 'tcc_i2s_hw_params - sample_rate : 48000' \"$RF\" && grep -q 'tcc.audio.sampling_rate' \"$RF\""
 ok "report: no serial number, VIN, Bluetooth address, phone name or song" "! grep -q -i -e ABC123SERIAL -e KM8KRDAF -e '22:22:aa' -e '00:1A:7D' -e 'Someones' -e 'Some Song' -e 'command line' \"$RF\""
-ok "report: Hyundai's files are not copied (checksums only)" "grep -q 'checksums only' \"$RF\" && ! grep -q 'snd-soc\\|ELF' \"$RF\""
+ok "report: factory files are not copied (checksums only)" "grep -q 'checksums only' \"$RF\" && ! grep -q 'snd-soc\\|ELF' \"$RF\""
 ok "report: the filter and converter checks name the audio server and find the tables" "grep -q 'filter is loaded in the audio server (5056)' \"$RF\" && grep -q \"converter: very high quality with EQ Engine's tables (loaded)\" \"$RF\""
 ok "report: the tracks' buffers are checked" "grep -q 'ok    track buffers: all 4 tracks on the main output' \"$RF\""
 ok "report: who plays on each link" "grep -q 'pcm2p: RUNNING, played by thread 4258 of /system/bin/mediaserver' \"$RF\" && grep -q 'pcm0p: closed' \"$RF\""
 ok "report: a line repeated at every mix cycle shows 3 times, then is counted" "[ \$(grep -c 'no chain found on session 21' \"$RF\") = 4 ] && grep -q 'came 7 more times' \"$RF\""
+ok "report: no maker's name in its own text (Gen5W units are in other HMG cars too)" "! grep -q Hyundai \"$RF\" && grep -q '^==================== Factory audio files (checksums only)' \"$RF\" && grep -q \"the car maker's\" \"$RF\""
+TAMD5=$(md5sum < $T/system/lib/libtinyalsa.so | cut -c1-32)
+sed -n '/^-- CarPlay app.s audio code (symbol tables only)$/,/^====/p' "$RF" > $T/probe.txt
+ok "report: CarPlay probe: the app found by its command line, its distinct libraries counted, HMG-API's decoder found" "grep -qx '  the factory CarPlay app (com.daudio.app.dipo) runs as pid 2290, with 4 libraries mapped' $T/probe.txt && grep -qx \"  HMG-API's AAC decoder libleafiaaac.so is mapped: /data/hmgapi/lib/libleafiaaac.so\" $T/probe.txt"
+ok "report: CarPlay probe: each library with what it needs and only its pcm_ and mixer_ imports" "grep -A6 -x '  library /system/lib/libCarPlayAudio.so' $T/probe.txt | grep -qx '    needs: libc.so libtinyalsa.so libCarPlayUtils.so' && grep -qx '    imports pcm_open' $T/probe.txt && grep -qx '    imports pcm_writei' $T/probe.txt && grep -qx '    imports mixer_get_ctl_by_name' $T/probe.txt && ! grep -q 'imports malloc' $T/probe.txt && ! grep -q 'CarPlayAudioStart' $T/probe.txt && ! grep -q 'pcm_fake_export' $T/probe.txt && grep -A1 -x '  library /system/lib/libc.so' $T/probe.txt | grep -qx '    needs: nothing'"
+ok "report: CarPlay probe: a library that cannot be read says why; libraries are read under the unit's root" "grep -A1 -x '  library /system/lib/libbroken.so' $T/probe.txt | grep -qx '    not read (unexpected program header size)' && grep -qx \"imports $T/system/lib/libCarPlayAudio.so\" $T/imports.log && ! grep -q 'framework.jar' $T/imports.log"
+ok "report: CarPlay probe: libtinyalsa.so by md5 and exported names only, and the three properties" "grep -qx \"  /system/lib/libtinyalsa.so (factory file, not copied): md5 $TAMD5\" $T/probe.txt && grep -qx '    exports pcm_open' $T/probe.txt && grep -qx '    exports mixer_ctl_get_name' $T/probe.txt && ! grep -q 'import ioctl' $T/probe.txt && ! grep -q 'factory tinyalsa' \"$RF\" && grep -qx '  ro.debuggable = \[1\]' $T/probe.txt && grep -qx '  ro.secure = \[1\]' $T/probe.txt && grep -qx '  wrap.com.daudio.app.dipo = \[\]' $T/probe.txt"
+ok "report: the properties section lists ro.debuggable and ro.secure (allowlist), not others" "grep -q '^\[ro.debuggable\]: \[1\]' \"$RF\" && grep -q '^\[ro.secure\]: \[1\]' \"$RF\" && ! grep -q 'ro.some.other' \"$RF\""
+rm -rf $T/proc/2290; mkdir -p $T/usb2
+run report $T/usb2 $T/app 1
+RF2=$(ls $T/usb2/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+sed -n '/^-- CarPlay app.s audio code (symbol tables only)$/,/^====/p' "$RF2" > $T/probe2.txt
+ok "report: CarPlay probe: the app not running is one line; libtinyalsa.so and the properties still there" "[ \$(grep -c 'CarPlay app' $T/probe2.txt) = 2 ] && grep -qx '  the factory CarPlay app (com.daudio.app.dipo) is not running' $T/probe2.txt && ! grep -q '^  library ' $T/probe2.txt && grep -q 'libtinyalsa.so (factory file, not copied)' $T/probe2.txt && grep -q 'ro.secure' $T/probe2.txt"
 run report $T/nousb $T/app 1
 ok "report: no stick: refused" "[ $(rc) = 1 ] && grep -q 'no USB stick' $T/out.txt"
+
+echo "== All logs (save) and the Lab trace under $SH"
+labsetup
+mkdir -p $T/usb3 $T/app $T/data/tombstones
+for n in 00 01 02 03; do echo "tombstone $n" > $T/data/tombstones/tombstone_$n; done
+touch -d '2026-11-01 10:00' $T/data/tombstones/tombstone_00 $T/data/tombstones/tombstone_01
+echo "act.sh as installed" > $T/data/eqengine/bin/act.sh; touch -d '2026-11-10 10:00' $T/data/eqengine/bin/act.sh
+touch -d '2026-11-15 10:00' $T/data/tombstones/tombstone_02; touch -d '2026-11-16 10:00' $T/data/tombstones/tombstone_03
+run save $T/usb3 $T/app 1
+SD=$(ls -d $T/usb3/EQENGINE/*/ 2>/dev/null | head -n1)
+ok "save: only the tombstones written since the install are copied" "[ $(rc) = 0 ] && [ -f ${SD}tombstone_02.txt ] && [ -f ${SD}tombstone_03.txt ] && [ ! -f ${SD}tombstone_00.txt ] && [ ! -f ${SD}tombstone_01.txt ]"
+ok "save: tombstones_list.txt lists all of them, and which were copied" "[ \$(grep -c '^-.* tombstone_0[0-3]\$' ${SD}tombstones_list.txt) = 4 ] && grep -qx 'copied here (written since this install of EQ Engine): tombstone_02 tombstone_03' ${SD}tombstones_list.txt"
+ok "save: carplay_probe.txt has the plain list of mapped libraries and the filtered imports" "grep -q 'runs as pid 2290, with 4 libraries mapped' ${SD}carplay_probe.txt && grep -qx '    /system/lib/libc.so' ${SD}carplay_probe.txt && grep -qx '    /data/hmgapi/lib/libleafiaaac.so' ${SD}carplay_probe.txt && grep -qx '    imports pcm_open' ${SD}carplay_probe.txt && ! grep -q 'imports malloc' ${SD}carplay_probe.txt && [ ! -d $LS/cp_probe ]"
+labsetup
+mkdir -p $T/usb4 $T/data/tombstones; echo t > $T/data/tombstones/tombstone_05
+run save $T/usb4 $T/app 0
+SD=$(ls -d $T/usb4/EQENGINE/*/ 2>/dev/null | head -n1)
+ok "save without the Android dumps (the app's crash handler): no tombstones, no probe" "[ $(rc) = 0 ] && [ -n \"$SD\" ] && [ ! -f ${SD}tombstone_05.txt ] && [ ! -f ${SD}carplay_probe.txt ] && grep -q tombstone_05 ${SD}tombstones_list.txt"
+labsetup
+mkdir -p $T/data/eqengine/lab/trace_20260101_000000 $T/data/eqengine/lab/trace_20260102_000000 $T/data/eqengine/lab/trace_20260103_000000
+run trace 1
+ok "trace: the newest 2 traces are kept" "[ $(rc) = 0 ] && [ \$(ls -d $T/data/eqengine/lab/trace_* | wc -l) = 2 ] && [ -d $T/data/eqengine/lab/trace_20260103_000000 ] && grep -q 'trace saved to' $T/out.txt"
+
+echo "== screenshot to USB (shot) under $SH"
+labsetup
+mkdir -p $T/usb5 $T/system/bin
+printf '#!/bin/sh\n[ "$1" = -p ] && printf "PNGDATA" > "$2"\n' > $T/system/bin/screencap; chmod 755 $T/system/bin/screencap
+run shot $T/usb5 0
+SF=$(ls $T/usb5/EQENGINE/screen_*.png 2>/dev/null | head -n1)
+ok "shot: written straight to the stick, and the app is told its name" "[ $(rc) = 0 ] && [ -s \"$SF\" ] && grep -q '^EQE_SHOT EQENGINE/screen_[0-9_]*\.png\$' $T/out.txt && grep -q EQE_OK $T/out.txt"
+ok "shot: nothing is kept on the head unit" "[ -z \"\$(find $T/data -name '*.png' 2>/dev/null)\" ]"
+run shot $T/nousb 0
+ok "shot: no stick: refused before waiting" "[ $(rc) = 1 ] && grep -q 'no USB stick' $T/out.txt"
+printf '#!/bin/sh\nexit 1\n' > $T/system/bin/screencap
+rm -rf $T/usb5/EQENGINE
+run shot $T/usb5 0
+ok "shot: screencap failing leaves no empty file and says so" "[ $(rc) = 1 ] && grep -q 'screenshot failed' $T/out.txt && [ -z \"\$(ls $T/usb5/EQENGINE 2>/dev/null)\" ]"
+rm -f $T/system/bin/screencap
+run shot $T/usb5 0
+ok "shot: no screencap on the unit: says so" "[ $(rc) = 1 ] && grep -q 'no screencap' $T/out.txt"
 
 echo "== converter choice without a restart (conv) under $SH"
 setup; vhqsetup good map

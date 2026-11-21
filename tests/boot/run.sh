@@ -421,6 +421,25 @@ rm -f $T/stop; echo bootI2 > $T/proc/sys/kernel/random/boot_id
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 240 ] && touch /tmp/eqeboot/stop' > $T/hook
 rununtilstop
 ok "the next start counts no strike and is confirmed good" "grep -q \"install's\" $T/out.txt && ! grep -q 'strike 1' $T/out.txt && [ \"\$(cat $VS/strikes)\" = 0 ] && grep -q 'bootI2 good' $VS/lastboot"
+echo "   right after an install the running audio server cannot have the filter yet: said so, not as a fault"
+setup bootI4; mkdir -p $VS; echo installed > $VS/fresh_install
+echo "b6b00000-b6b20000 r-xp 00000000 b3:19 99   /system/lib/libaudioflinger.so" > $T/proc/167/maps
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "just installed: confirmed good, and the audio server is said to load EQ Engine at the next car start or audio restart" "grep -q 'confirmed good' $T/out.txt && grep -q 'just installed: the running audio server (167) started before EQ Engine was installed; it loads EQ Engine at the next car start or audio restart (parked)' $T/out.txt && ! grep -q 'read its effects list before the overlay' $T/out.txt && grep -q 'just installed' $VS/status"
+setup bootI5; mkdir -p $VS; echo installed > $VS/fresh_install
+echo "b6b00000-b6b20000 r-xp 00000000 b3:19 99   /system/lib/libaudioflinger.so" > $T/proc/167/maps
+cat > $T/hook <<'H'
+read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}
+if [ $u -ge 120 ] && [ ! -f /tmp/eqeboot/done_r ]; then
+  echo $u > /tmp/eqeboot/root/data/eqengine/state/expected_restart
+  rm -rf /tmp/eqeboot/proc/167; mkdir -p /tmp/eqeboot/proc/168; echo 168 > /tmp/eqeboot/mspid; touch /tmp/eqeboot/done_r
+  echo "b6b00000-b6b20000 r-xp 00000000 b3:19 99   /system/lib/libaudioflinger.so" > /tmp/eqeboot/proc/168/maps
+fi
+[ $u -ge 200 ] && touch /tmp/eqeboot/stop
+H
+rununtilstop
+ok "just installed, but a later audio server (restarted after the install) has no filter either: the usual message" "grep -q 'restarted on request' $T/out.txt && grep -q \"EQ Engine's filter is not loaded in the audio server (168): it read its effects list before the overlay\" $T/out.txt && ! grep -q 'just installed' $T/out.txt"
 echo "   the marker only covers the run right after the install:"
 setup bootI3; mkdir -p $VS; echo installed > $VS/fresh_install; echo "turned off in the app" > $VS/disabled
 runboot 50

@@ -67,7 +67,7 @@ if [ -n "$OWNER" ]; then
     chmod 700 $SET
 fi
 read up rest < /proc/uptime
-echo "${up%%.*} installed EQ Engine 0.6.4 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
+echo "${up%%.*} installed EQ Engine 0.6.6 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
 chmod 644 $D/state/events.log
 
 # Note the result on the install stick, if it is still plugged in.
@@ -75,7 +75,7 @@ for d in /mnt/media_rw/usb0 /mnt/media_rw/usb1 /mnt/media_rw/usb2 /mnt/media_rw/
          /storage/usb0 /storage/usb1 /storage/usb2 /storage/usb3; do
     if [ -f "$d/README-EQENGINE.txt" ]; then
         mkdir -p "$d/EQENGINE" && {
-            echo "EQ Engine 0.6.4 installed"
+            echo "EQ Engine 0.6.6 installed"
             date
             pm path com.eqengine.app
             echo "settings folder owner: ${OWNER:-unknown}; kept settings restored: $RESTORED"

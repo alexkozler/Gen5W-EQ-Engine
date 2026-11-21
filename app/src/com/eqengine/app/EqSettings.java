@@ -10,8 +10,8 @@ import java.io.FileReader;
 /**
  * EQ settings and presets. Stored in /data/eqengine/settings (a folder the installer gives to
  * this app, kept across EQ Engine updates), or in the app's own folder if that is not writable.
- * The high-quality audio converter always runs (the boot step sets it at every start); "hq" here
- * only reflects a temporary comparison from the Lab page and is not saved.
+ * Files are read on whichever thread asks (the screen reads them on the background thread, Bg)
+ * and written on the background thread. "hq" is a leftover from 0.4 and is not saved.
  */
 final class EqSettings {
     static final int NB = 10;
@@ -49,9 +49,12 @@ final class EqSettings {
     int[] bands = new int[NB];
     boolean hq = true;
     String preset = "Flat";       // name shown on the EQ page; "Custom" after a manual change
-    boolean detailedLog = false;  // troubleshooting log level
+    boolean detailedLog = false;  // troubleshooting log level; off again after every install or update
     int position = 0;             // listening position: -100 driver's seat .. 0 centre .. +100 passenger's seat
     int seatDelayUs = 1700;       // delay at a full seat offset (about 58 cm of path difference)
+    boolean lowShelf, highShelf;  // 0.6.6: the 31 Hz / 16 kHz band as a shelf (one setting, not part of presets)
+    /** Loaded from settings another app version saved (or from none): detailed logging was reset. */
+    boolean fromOtherVersion;
     static final int SEAT_DELAY_MIN = 500, SEAT_DELAY_MAX = 3000, SEAT_DELAY_STEP = 100;
     static final double SPEED_OF_SOUND = 343.0; // m/s at 20 C
 
@@ -66,19 +69,30 @@ final class EqSettings {
         s.detailedLog = detailedLog;
         s.position = position;
         s.seatDelayUs = seatDelayUs;
+        s.lowShelf = lowShelf;
+        s.highShelf = highShelf;
         return s;
     }
 
-    /** The engine's settings parameter: int32[16], little-endian. */
-    byte[] toParam() {
-        int[] v = new int[16];
-        v[0] = 1;
+    /** The filter's end-band types: 1 = 31 Hz shelf, 2 = 16 kHz shelf. */
+    int ends() {
+        return (lowShelf ? 1 : 0) | (highShelf ? 2 : 0);
+    }
+
+    /**
+     * The engine's settings parameter, little-endian: layout 2 (int32[17], with the end-band
+     * types) for the 0.6.6 filter, layout 1 (int32[16]) for an older one still in the audio server.
+     */
+    byte[] toParam(boolean layout2) {
+        int[] v = new int[layout2 ? 17 : 16];
+        v[0] = layout2 ? 2 : 1;
         v[1] = eqOn ? 1 : 0;
         v[2] = clamp(preamp, PRE_MIN, PRE_MAX);
         v[3] = guard ? 1 : 0;
         for (int i = 0; i < NB; i++) v[4 + i] = clamp(bands[i], BAND_MIN, BAND_MAX);
         v[14] = delayUs(true);
         v[15] = delayUs(false);
+        if (layout2) v[16] = ends();
         return Engine.intsToBytes(v);
     }
 
@@ -103,6 +117,7 @@ final class EqSettings {
                 .append(guard ? "on" : "off").append(", position ").append(position).append(" (L ").append(delayUs(true))
                 .append(" us, R ").append(delayUs(false)).append(" us)").append(", bands");
         for (int i = 0; i < NB; i++) sb.append(' ').append(LABELS[i]).append('=').append(db(bands[i]));
+        sb.append(", 31 Hz ").append(lowShelf ? "shelf" : "peak").append(", 16 kHz ").append(highShelf ? "shelf" : "peak");
         return sb.toString();
     }
 
@@ -131,6 +146,7 @@ final class EqSettings {
         EqSettings s = new EqSettings();
         File d = dir(ctx);
         boolean presetSeen = false;
+        String savedBy = null;
         BufferedReader r = null;
         try {
             r = new BufferedReader(new FileReader(new File(d, "current.txt")));
@@ -146,6 +162,12 @@ final class EqSettings {
                         presetSeen = true;
                     }
                     else if (k.equals("log")) s.detailedLog = "1".equals(v);
+                    else if (k.equals("app")) savedBy = v;
+                    else if (k.equals("ends")) {
+                        int e = Integer.parseInt(v);
+                        s.lowShelf = (e & 1) != 0;
+                        s.highShelf = (e & 2) != 0;
+                    }
                     else if (k.equals("position")) s.position = clamp(Integer.parseInt(v), -100, 100);
                     else if (k.equals("seat_delay")) s.seatDelayUs = clamp(Integer.parseInt(v), SEAT_DELAY_MIN, SEAT_DELAY_MAX);
                     else if (k.equals("preamp")) s.preamp = clamp(Integer.parseInt(v), PRE_MIN, PRE_MAX);
@@ -168,12 +190,17 @@ final class EqSettings {
         if (!presetSeen) {
             for (int v : s.bands) if (v != 0) s.preset = "Custom";
         }
+        // detailed logging starts off after every install and update (settings are kept across them)
+        if (!MainActivity.VERSION.equals(savedBy)) {
+            s.detailedLog = false;
+            s.fromOtherVersion = true;
+        }
         s.hq = true;
         return s;
     }
 
     /**
-     * The Lab's converter choice, in its own file ("converter": 4 very high quality, the default;
+     * The converter choice (Settings), in its own file ("converter": 4 very high quality, the default;
      * 3 high; 0 Android's default), read by the boot step at every start. Written only when the
      * choice is changed in the app, so the boot step's step-down after an unexpected audio restart
      * (which writes the file too) is never overwritten by a later save. 0.5's "vhq" file is read
@@ -190,10 +217,20 @@ final class EqSettings {
         return "4";
     }
 
-    static boolean writeConverter(Context ctx, String q) {
-        boolean ok = writeAtomic(converterFile(ctx), q + "\n");
-        if (ok) vhqFile(ctx).delete();
-        return ok;
+    /** On the background thread; done (may be null) runs on the screen's thread. */
+    static void writeConverter(Context ctx, final String q, final Saved done) {
+        final File f = converterFile(ctx), old = vhqFile(ctx);
+        Bg.run(new Runnable() {
+            public void run() {
+                final boolean ok = writeAtomic(f, q + "\n");
+                if (ok) old.delete();
+                if (done != null) Bg.main(new Runnable() {
+                    public void run() {
+                        done.saved(ok);
+                    }
+                });
+            }
+        });
     }
 
     static File converterFile(Context ctx) {
@@ -206,8 +243,8 @@ final class EqSettings {
         return v == null || !v.trim().equals("0");
     }
 
-    static boolean writeRate48(Context ctx, boolean on) {
-        return writeAtomic(rate48File(ctx), (on ? "1" : "0") + "\n");
+    static void writeRate48(Context ctx, boolean on, Saved done) {
+        writeAsync(rate48File(ctx), (on ? "1" : "0") + "\n", done);
     }
 
     static File rate48File(Context ctx) {
@@ -218,8 +255,7 @@ final class EqSettings {
         return new File(dir(ctx), "vhq");
     }
 
-    void save(Context ctx) {
-        File d = dir(ctx);
+    private String text() {
         StringBuilder sb = new StringBuilder();
         sb.append("eq_on=").append(eqOn ? 1 : 0).append('\n');
         sb.append("preamp=").append(preamp).append('\n');
@@ -228,10 +264,42 @@ final class EqSettings {
         sb.append("log=").append(detailedLog ? 1 : 0).append('\n');
         sb.append("position=").append(position).append('\n');
         sb.append("seat_delay=").append(seatDelayUs).append('\n');
+        sb.append("ends=").append(ends()).append('\n');
+        sb.append("app=").append(MainActivity.VERSION).append('\n');
         sb.append("bands=");
         for (int i = 0; i < NB; i++) sb.append(i == 0 ? "" : ",").append(bands[i]);
         sb.append('\n');
-        writeAtomic(new File(d, "current.txt"), sb.toString());
+        return sb.toString();
+    }
+
+    /** Saves on the background thread (the write is synced to storage); saves keep their order. */
+    void saveAsync(Context ctx) {
+        final File f = new File(dir(ctx), "current.txt");
+        final String t = text();
+        Bg.run(new Runnable() {
+            public void run() {
+                writeAtomic(f, t);
+            }
+        });
+    }
+
+    interface Saved {
+        /** On the screen's thread. */
+        void saved(boolean ok);
+    }
+
+    /** Writes text to f on the background thread, then calls back on the screen's thread. */
+    static void writeAsync(final File f, final String text, final Saved done) {
+        Bg.run(new Runnable() {
+            public void run() {
+                final boolean ok = writeAtomic(f, text);
+                if (done != null) Bg.main(new Runnable() {
+                    public void run() {
+                        done.saved(ok);
+                    }
+                });
+            }
+        });
     }
 
     /** User preset: preamp + bands, or null if the slot is empty. */
@@ -251,10 +319,10 @@ final class EqSettings {
         return v;
     }
 
-    static boolean saveUser(Context ctx, int slot, EqSettings s) {
+    static void saveUser(Context ctx, int slot, EqSettings s, Saved done) {
         StringBuilder sb = new StringBuilder().append(s.preamp);
         for (int i = 0; i < NB; i++) sb.append(',').append(s.bands[i]);
-        return writeAtomic(new File(dir(ctx), "preset" + slot + ".txt"), sb.append('\n').toString());
+        writeAsync(new File(dir(ctx), "preset" + slot + ".txt"), sb.append('\n').toString(), done);
     }
 
     private static boolean writeAtomic(File f, String text) {

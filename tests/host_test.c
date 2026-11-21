@@ -1,4 +1,4 @@
-/* Host tests for eqengine.c 0.4, driven the way AudioFlinger 4.4 drives an insert effect.
+/* Host tests for eqengine.c (0.6.6), driven the way AudioFlinger 4.4 drives an insert effect.
  * The source is included directly so internal functions (design, response) can be checked. */
 /* the very high quality loader: a marker file and the PC build of the library (see vhq/host/run.sh) */
 #define VHQ_MARK "/tmp/eqe_host_vhq_load"
@@ -51,7 +51,7 @@ static int32_t get_param(effect_handle_t h, int32_t id, void *value, uint32_t vs
 static eqe_settings mk(int eq_on, int pre, int guard, const int *bands) {
     eqe_settings s;
     memset(&s, 0, sizeof(s));
-    s.layout = 1;
+    s.layout = 2;
     s.eq_on = eq_on;
     s.preamp_cdb = pre;
     s.guard_on = guard;
@@ -59,7 +59,20 @@ static eqe_settings mk(int eq_on, int pre, int guard, const int *bands) {
     return s;
 }
 
+static eqe_settings mk_ends(int eq_on, int pre, int guard, const int *bands, int ends) {
+    eqe_settings s = mk(eq_on, pre, guard, bands);
+    s.ends = ends;
+    return s;
+}
+
 static int32_t apply(effect_handle_t h, eqe_settings s) { return set_param_raw(h, EQE_PARAM_SETTINGS, &s, sizeof(s)); }
+
+/* the designed response at f, dB */
+static double resp_at(eqe_ctx *c, double f) {
+    double r = 0.0;
+    for (int j = 0; j < EQE_NB; j++) r += coefs_db(&c->band[j].tgt, f, c->rate);
+    return r;
+}
 
 static effect_handle_t make(double rate, int16_t *inbuf, int16_t *outbuf, int frames, int accumulate) {
     effect_handle_t h = NULL;
@@ -169,7 +182,7 @@ int main(void) {
 
     /* ---- parameter checks */
     int32_t ver = 0;
-    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x310);
+    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x320);
     {
         /* very high quality loader: the marker was there at the first call, so the PC build of
            libaudio-resampler.so is loaded and its status is readable */
@@ -180,8 +193,23 @@ int main(void) {
         CHECK(dlopen("libaudio-resampler.so", RTLD_NOW | RTLD_NOLOAD) != NULL);
     }
     eqe_settings bad = mk(1, 0, 1, NULL);
-    bad.layout = 2;
+    bad.layout = 1; /* layout 1 is 16 values, not 17 */
     CHECK(apply(h, bad) == -EINVAL);
+    bad.layout = 3;
+    CHECK(apply(h, bad) == -EINVAL);
+    bad = mk(1, 0, 1, NULL);
+    bad.ends = 4;
+    CHECK(apply(h, bad) == -EINVAL);
+    bad = mk(1, 0, 1, NULL); /* layout 2 sent as 16 values */
+    CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &bad, EQE_SET1_BYTES) == -EINVAL);
+    {
+        /* an app from before 0.6.6 sends layout 1 (16 values): accepted, both ends peaks */
+        eqe_settings old = mk(1, 0, 1, NULL);
+        old.layout = 1;
+        old.band_cdb[0] = 300;
+        CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &old, EQE_SET1_BYTES) == 0);
+        CHECK(((eqe_ctx *)h)->set.layout == 2 && ((eqe_ctx *)h)->set.ends == 0 && ((eqe_ctx *)h)->set.band_cdb[0] == 300);
+    }
     bad = mk(1, 0, 1, NULL);
     bad.band_cdb[3] = 1501;
     CHECK(apply(h, bad) == -EINVAL);
@@ -190,7 +218,7 @@ int main(void) {
     bad = mk(2, 0, 1, NULL);
     CHECK(apply(h, bad) == -EINVAL);
     bad = mk(1, 0, 1, NULL);
-    CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &bad, sizeof(bad) - 4) == -EINVAL);
+    CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &bad, sizeof(bad) - 8) == -EINVAL);
     CHECK(set_param_raw(h, 99, &bad, sizeof(bad)) == -EINVAL);
     int32_t small[4];
     CHECK(get_param(h, EQE_PARAM_STATS, small, sizeof(small), &got) == -EINVAL);
@@ -325,7 +353,7 @@ int main(void) {
         CHECK(c->clipped > 0);
         int32_t st[EQE_STATS_COUNT];
         CHECK(get_param(h, EQE_PARAM_STATS, st, sizeof(st), &got) == 0 && got == sizeof(st));
-        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x310 && st[6] == 70 && st[16] > 0 && st[23] == 1);
+        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x320 && st[6] == 70 && st[16] > 0 && st[23] == 1);
         AELI.release_effect(h);
     }
 
@@ -572,21 +600,211 @@ int main(void) {
         free(out);
     }
 
-    /* ---- cost on this PC (the car's CPU is slower; the car app measures it there) */
+    /* ---- end bands as shelves (0.6.6) and the one-octave bells */
+    {
+        double rates[] = {44100, 48000};
+        for (int ri = 0; ri < 2; ri++) {
+            double fs = rates[ri];
+            h = make(fs, mix, mix, N, 0);
+            c = (eqe_ctx *)h;
+            double ws = 0, wr = 0;
+            for (int ends = 0; ends < 4; ends++) {
+                for (int k = 0; k < EQE_NB; k++) {
+                    int bands[EQE_NB] = {0};
+                    bands[k] = 1200;
+                    CHECK(apply(h, mk_ends(1, 0, 1, bands, ends)) == 0);
+                    if (centre_error(c) > ws) ws = centre_error(c);
+                    bands[k] = -1200;
+                    apply(h, mk_ends(1, 0, 1, bands, ends));
+                    if (centre_error(c) > ws) ws = centre_error(c);
+                }
+                for (int t = 0; t < 100; t++) {
+                    int bands[EQE_NB];
+                    for (int i = 0; i < EQE_NB; i++) bands[i] = (int)floor((rnd() * 24.0 - 12.0) * 2.0 + 0.5) * 50;
+                    apply(h, mk_ends(1, 0, 1, bands, ends));
+                    if (centre_error(c) > wr) wr = centre_error(c);
+                }
+            }
+            printf("%.0f Hz, all four end-band combinations: worst centre error single band %.3f dB, random (400) %.3f dB\n", fs,
+                   ws, wr);
+            CHECK(ws < 0.1 && wr < 0.25);
+            /* all ten at +4: peaks fall away past the ends; shelves hold the level */
+            int all4[EQE_NB];
+            for (int i = 0; i < EQE_NB; i++) all4[i] = 400;
+            apply(h, mk_ends(1, 0, 1, all4, 0));
+            double p15 = resp_at(c, 15), p20 = resp_at(c, 20), p11 = resp_at(c, 11300), p12 = resp_at(c, 12500);
+            double p18 = resp_at(c, 18000), p20k = resp_at(c, 20000);
+            apply(h, mk_ends(1, 0, 1, all4, EQE_ENDS_LOW | EQE_ENDS_HIGH));
+            double s15 = resp_at(c, 15), s20 = resp_at(c, 20), s11 = resp_at(c, 11300), s12 = resp_at(c, 12500);
+            double s18 = resp_at(c, 18000), s20k = resp_at(c, 20000);
+            printf("%.0f Hz, all ten +4 dB, peaks: 15 Hz %.1f, 20 Hz %.1f, 11.3k %.1f, 12.5k %.1f, 18k %.1f, 20k %.1f\n", fs, p15,
+                   p20, p11, p12, p18, p20k);
+            printf("%.0f Hz, all ten +4 dB, shelves: 15 Hz %.1f, 20 Hz %.1f, 11.3k %.1f, 12.5k %.1f, 18k %.1f, 20k %.1f\n", fs, s15,
+                   s20, s11, s12, s18, s20k);
+            CHECK(p15 < 1.5 && p20 < 2.5);           /* the bell falls away below 31 Hz */
+            CHECK(p11 > 3.2 && p12 > 3.2);           /* one-octave bells: no dip between 8 and 16 kHz */
+            CHECK(fabs(s15 - 4) < 0.6 && fabs(s20 - 4) < 0.6 && fabs(s18 - 4) < 0.6 && fabs(s20k - 4) < 0.8);
+            CHECK(s11 > 3.2 && s12 > 3.2);
+            /* one end band alone, +6 dB: the shelf's overshoot past the end stays small */
+            int lo6[EQE_NB] = {600, 0, 0, 0, 0, 0, 0, 0, 0, 0}, hi6[EQE_NB] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 600};
+            apply(h, mk_ends(1, 0, 1, lo6, EQE_ENDS_LOW));
+            double lmax = 0, lmin = 99;
+            for (double f = 15; f <= 25; f += 1) { double v = resp_at(c, f); if (v > lmax) lmax = v; if (v < lmin) lmin = v; }
+            apply(h, mk_ends(1, 0, 1, hi6, EQE_ENDS_HIGH));
+            double hmax = 0, hmin = 99;
+            for (double f = 16000; f <= 0.45 * fs; f += 250) { double v = resp_at(c, f); if (v > hmax) hmax = v; if (v < hmin) hmin = v; }
+            printf("%.0f Hz, one end band at +6 dB as a shelf: 15-25 Hz %.1f..%.1f dB, 16 kHz up %.1f..%.1f dB\n", fs, lmin, lmax,
+                   hmin, hmax);
+            CHECK(lmin > 5.0 && lmax < 7.6 && hmin > 5.0 && hmax < 7.6);
+            AELI.release_effect(h);
+        }
+        /* switching an end band between peak and shelf while a tone plays: no click */
+        h = make(48000, mix, mix, N, 0);
+        cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+        int bands[EQE_NB] = {900, 300, 0, 0, 0, 0, 0, 200, 500, 900};
+        apply(h, mk_ends(1, -900, 1, bands, 0));
+        double ph = 0;
+        int prev = 0, worst_change = 0, worst_steady = 0, finite = 1;
+        for (int blk = 0; blk < 40; blk++) {
+            int changing = blk >= 8 && blk % 4 == 0;
+            if (changing) apply(h, mk_ends(1, -900, 1, bands, (blk / 4) & 3));
+            for (int i = 0; i < N; i++) {
+                double v = 0.2 * sin(ph) + 0.1 * sin(ph * 0.031);
+                ph += 2.0 * EQE_PI * 700 / 48000;
+                mix[2 * i] = mix[2 * i + 1] = (int16_t)floor(v * 32767 + 0.5);
+            }
+            (*h)->process(h, &b, &b);
+            c = (eqe_ctx *)h;
+            for (int j = 0; j < EQE_NB; j++)
+                if (!isfinite(c->band[j].z1[0]) || !isfinite(c->band[j].z2[0])) finite = 0;
+            for (int i = 0; i < N; i++) {
+                int st = abs(mix[2 * i] - prev);
+                prev = mix[2 * i];
+                if (blk < 6) continue;
+                if (changing) { if (st > worst_change) worst_change = st; }
+                else if (st > worst_steady) worst_steady = st;
+            }
+        }
+        printf("end bands switched between peak and shelf on a tone: largest step while changing %d, steady %d, finite %s\n",
+               worst_change, worst_steady, finite ? "yes" : "NO");
+        CHECK(finite && worst_change <= worst_steady + 12);
+        AELI.release_effect(h);
+    }
+
+    /* ---- the guard's sliding minimum equals a scan of the look-ahead window */
     {
         h = make(44100, mix, mix, N, 0);
-        cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
-        int bands[EQE_NB] = {300, 200, 100, -100, -200, 100, 200, 300, 400, 500};
-        apply(h, mk(1, -500, 1, bands));
-        int64_t t0 = now_ns();
-        for (int blk = 0; blk < 200; blk++) {
-            for (int i = 0; i < N * 2; i++) mix[i] = (int16_t)floor((rnd() * 2.0 - 1.0) * 20000.0);
-            (*h)->process(h, &b, &b);
+        c = (eqe_ctx *)h;
+        double win[LA];
+        for (int i = 0; i < LA; i++) win[i] = 1.0;
+        int same = 1;
+        for (int t = 0; t < 200000; t++) {
+            double req = rnd() < 0.7 ? 1.0 : 0.3 + 0.7 * rnd();
+            if (t % 5000 < 300) req = 0.5 + 0.0001 * (t % 300); /* rising runs */
+            win[t % LA] = req;
+            double scan = 1.0;
+            for (int i = 0; i < LA; i++) if (win[i] < scan) scan = win[i];
+            if (guard_min_push(c, req) != scan) same = 0;
         }
-        double per = (now_ns() - t0) / 200.0 / 1000.0;
-        printf("cost on this PC (sanitizers on): %.0f us per 2048-frame buffer = %.2f%% of real time\n", per,
-               per / (N / 44100.0 * 1e6) * 100.0);
+        printf("guard minimum over the look-ahead: queue matches a full scan for 200000 samples: %s\n", same ? "yes" : "NO");
+        CHECK(same);
         AELI.release_effect(h);
+    }
+
+    /* ---- live view and buffer level (0.6.6) */
+    {
+        double rates[] = {44100, 48000};
+        for (int ri = 0; ri < 2; ri++) {
+            double fs = rates[ri];
+            h = make(fs, mix, mix, N, 0);
+            c = (eqe_ctx *)h;
+            cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+            apply(h, mk(1, 0, 1, NULL));
+            int32_t sv[4 + EQE_NSPEC], lv[6];
+            /* nothing is allocated before the first read */
+            double ph = 0;
+            for (int blk = 0; blk < 3; blk++) {
+                for (int f = 0; f < N; f++, ph += 2 * EQE_PI * 1000.0 / fs) mix[2 * f] = mix[2 * f + 1] = (int16_t)lrint(0.1 * 32768.0 * sin(ph));
+                (*h)->process(h, &b, &b);
+            }
+            CHECK(c->spec == NULL);
+            CHECK(get_param(h, EQE_PARAM_SPECTRUM, sv, sizeof(sv), &got) == 0 && got == sizeof(sv));
+            CHECK(c->spec != NULL && sv[0] == 0 && sv[1] == -1 && sv[2] == EQE_NSPEC && sv[3] == (int)fs && sv[4] == EQE_RESP_NONE);
+            for (int blk = 0; blk < 8; blk++) {
+                for (int f = 0; f < N; f++, ph += 2 * EQE_PI * 1000.0 / fs) mix[2 * f] = mix[2 * f + 1] = (int16_t)lrint(0.1 * 32768.0 * sin(ph));
+                (*h)->process(h, &b, &b);
+            }
+            get_param(h, EQE_PARAM_SPECTRUM, sv, sizeof(sv), &got);
+            int b1k = -1;
+            for (int k = 0; k < EQE_NSPEC; k++) {
+                double f = eqe_spec_hz(k), half = sqrt(pow(1000.0, 1.0 / (EQE_NSPEC - 1)));
+                if (1000.0 >= f / half && 1000.0 < f * half) b1k = k;
+            }
+            int b100 = 0, b10k = 0;
+            for (int k = 0; k < EQE_NSPEC; k++) {
+                if (fabs(eqe_spec_hz(k) - 100) < fabs(eqe_spec_hz(b100) - 100)) b100 = k;
+                if (fabs(eqe_spec_hz(k) - 10000) < fabs(eqe_spec_hz(b10k) - 10000)) b10k = k;
+            }
+            printf("%.0f Hz live view, 1 kHz sine at -20 dBFS peak: %u analyses, band at %.0f Hz %.2f dB (expect -23.01), "
+                   "100 Hz %.1f dB, 10 kHz %.1f dB, 20 kHz band %s\n",
+                   fs, (unsigned)sv[0], eqe_spec_hz(b1k), sv[4 + b1k] / 100.0, sv[4 + b100] / 100.0, sv[4 + b10k] / 100.0,
+                   sv[4 + EQE_NSPEC - 1] == EQE_RESP_NONE ? "none" : "has a level");
+            CHECK(sv[0] >= 5 && sv[1] >= 0 && sv[1] < 1000);
+            CHECK(b1k >= 0 && abs(sv[4 + b1k] + 2301) <= 40);
+            CHECK(sv[4 + b100] < -7000 && sv[4 + b10k] < -7000);
+            /* white noise at -20 dBFS RMS: the band powers add up to the total */
+            double tot = 0;
+            for (int blk = 0; blk < 6; blk++) {
+                for (int i = 0; i < N * 2; i += 2) {
+                    double v = (rnd() + rnd() + rnd() - 1.5) * 2.0 * 0.1;
+                    mix[i] = mix[i + 1] = (int16_t)lrint(v * 32768.0);
+                }
+                (*h)->process(h, &b, &b);
+            }
+            get_param(h, EQE_PARAM_SPECTRUM, sv, sizeof(sv), &got);
+            for (int k = 0; k < EQE_NSPEC; k++) if (sv[4 + k] != EQE_RESP_NONE) tot += pow(10.0, sv[4 + k] / 1000.0);
+            CHECK(get_param(h, EQE_PARAM_LEVEL, lv, sizeof(lv), &got) == 0 && got == sizeof(lv));
+            printf("%.0f Hz live view, white noise: bands add up to %.2f dB, the buffer's average level %.2f dB, peak %d, "
+                   "%d frames\n", fs, 10 * log10(tot), lv[3] / 100.0, lv[2], lv[4]);
+            CHECK(fabs(10 * log10(tot) - lv[3] / 100.0) < 1.0);
+            CHECK(lv[0] > 0 && lv[1] >= 0 && lv[2] > 0 && lv[4] == N && lv[5] == (int)fs);
+            /* not read for longer than SPEC_KEEP_NS: the analysis stops */
+            uint32_t seq = c->spec->seq;
+            c->spec_wanted_ns -= SPEC_KEEP_NS + 1;
+            for (int blk = 0; blk < 3; blk++) (*h)->process(h, &b, &b);
+            CHECK(c->spec->seq == seq);
+            AELI.release_effect(h);
+        }
+    }
+
+    /* ---- cost on this PC (the car's CPU is slower; the car app measures it there) */
+    {
+        const char *names[] = {"flat EQ (passes through)", "EQ with 10 bands, guard idle", "10 bands, guard limiting",
+                               "10 bands and the live view"};
+        for (int mode = 0; mode < 4; mode++) {
+            h = make(44100, mix, mix, N, 0);
+            cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+            int bands[EQE_NB] = {300, 200, 100, -100, -200, 100, 200, 300, 400, 500};
+            int loud[EQE_NB] = {1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200};
+            if (mode == 0) apply(h, mk(1, 0, 1, NULL));
+            else if (mode == 2) apply(h, mk(1, 0, 1, loud));
+            else apply(h, mk(1, -500, 1, bands));
+            int32_t sv[4 + EQE_NSPEC];
+            if (mode == 3) get_param(h, EQE_PARAM_SPECTRUM, sv, sizeof(sv), &got);
+            for (int blk = 0; blk < 3; blk++) (*h)->process(h, &b, &b); /* past the fade-in */
+            int64_t t0 = now_ns(), spent = 0;
+            for (int blk = 0; blk < 200; blk++) {
+                for (int i = 0; i < N * 2; i++) mix[i] = (int16_t)floor((rnd() * 2.0 - 1.0) * (mode == 2 ? 30000.0 : 20000.0));
+                int64_t a = now_ns();
+                (*h)->process(h, &b, &b);
+                spent += now_ns() - a;
+            }
+            (void)t0;
+            double per = spent / 200.0 / 1000.0;
+            printf("cost on this PC (sanitizers on), %s: %.0f us per 2048-frame buffer = %.2f%% of real time\n", names[mode], per,
+                   per / (N / 44100.0 * 1e6) * 100.0);
+            AELI.release_effect(h);
+        }
     }
 
     CHECK(AELI.release_effect(NULL) == -EINVAL);

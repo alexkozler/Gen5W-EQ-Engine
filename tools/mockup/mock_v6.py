@@ -1,4 +1,4 @@
-# Mockups of EQ Engine 0.3 pages at the car's 1920x720 (density 1.5), following the app's dp sizes.
+# Mockups of EQ Engine 0.6.6 pages at the car's 1920x720 (density 1.5), following the app's dp sizes.
 import sys, math
 from PIL import Image, ImageDraw, ImageFont
 D = 1.5; W, H = 1920, 720; SB = 90
@@ -12,7 +12,7 @@ def base(sel):
     im = Image.new("RGB", (W, H), C['BG']); g = ImageDraw.Draw(im)
     g.rectangle([0,0,W,SB], fill=(0,0,0)); g.text((40,28), "<     ⌂      ≡                    6:03 PM     Wed, Nov. 18", font=font(19), fill=(210,210,210))
     g.rectangle([0,SB,dp(116),H], fill=C['RAIL'])
-    labels = ["EQ","Position","Settings","Status","Lab"]; cx = dp(58); step = min(dp(104), (H - SB - dp(12)) / 5)
+    labels = ["EQ","Position","Settings","Status"]; cx = dp(58); step = min(dp(104), (H - SB - dp(12)) / 4)
     lab = min(dp(17), step*0.21); pillH = min(dp(44), step*0.52)
     for i,l in enumerate(labels):
         top = SB + dp(6) + i*step + (step - (pillH + lab*1.9))/2
@@ -52,6 +52,13 @@ def icon(g, i, cx, cy, sc, col):
 X0 = dp(116) + dp(20); X1 = W - dp(20); Y0 = SB + dp(10); Y1 = H - dp(10)
 def header(g, title, sub, y=Y0):
     g.text((X0, y + dp(2)), title, font=font(24, True), fill=C['ON']); g.text((X0, y + dp(33)), sub, font=font(16), fill=C['VAR'])
+HDR = dp(44)  # one-line header (title and description side by side), all pages but the EQ page
+def header_line(g, title, sub, y=Y0):
+    ft, fs = font(24, True), font(16); at, _ = ft.getmetrics(); as_, _ = fs.getmetrics()
+    ty = y + (HDR - (ft.size * 1.17)) / 2
+    g.text((X0, ty), title, font=ft, fill=C['ON'])
+    g.text((X0 + g.textlength(title, font=ft) + dp(16), ty + at - as_), sub, font=fs, fill=C['VAR'])
+    return X0 + g.textlength(title, font=ft) + dp(16) + g.textlength(sub, font=fs)
 def btn(g, x, y, label, style, h=46, right=False):
     f = font(18, True); w = g.textlength(label, font=f) + dp(40)
     if right: x = x - w
@@ -82,7 +89,7 @@ def row(g, x, y, w, title, sub, kind, on=True, label="Open"):
     labels = label.split("|") if kind == 'button' else []
     right = dp(56) if kind == 'switch' else sum(g.textlength(l, font=font(18, True)) + dp(40) for l in labels) + dp(8) * (len(labels) - 1)
     lines = wrap(g, sub, f2, w - right - dp(12)) if sub else []
-    hh = max(dp(62 if kind == 'switch' else 56), dp(8) + f1.size*1.25 + dp(4) + len(lines) * f2.size * 1.3)
+    hh = max(dp(62 if kind == 'switch' else 56), dp(8 if kind == 'switch' else 12) + f1.size*1.25 + dp(4) + len(lines) * f2.size * 1.3)
     ty = y + (hh - (f1.size*1.25 + dp(4) + len(lines)*f2.size*1.3)) / 2
     g.text((x, ty), title, font=f1, fill=C['ON'])
     for i, l in enumerate(lines): g.text((x, ty + f1.size*1.25 + dp(4) + i*f2.size*1.3), l, font=f2, fill=C['VAR'])
@@ -92,11 +99,18 @@ def row(g, x, y, w, title, sub, kind, on=True, label="Open"):
         for l in reversed(labels):
             bx, bw = btn(g, bx, y + hh/2 - dp(23), l, 'tonal', right=True); bx -= dp(8)
     return y + hh, len(lines)
-def page_eq(resp, bands, preamp, preset):
+def mix(a, b, t): return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+def page_eq(resp, bands, preamp, preset, live=False, ends=(False, False), spec=None):
     im, g = base(0)
     header(g, "Equalizer", preset + "  ·  Preamp " + ("%+g" % (preamp/100)).replace("+0","0") + " dB")
-    switch(g, X1 - dp(34), Y0 + dp(26), True); f = font(18, True); g.text((X1 - dp(68) - g.textlength("EQ", font=f), Y0 + dp(26) - f.size*0.55), "EQ", font=f, fill=C['ON'])
-    btn(g, X1 - dp(68) - dp(24) - g.textlength("EQ", font=f), Y0 + dp(2), "Auto preamp", 'outlined', right=True)
+    # header, right to left: EQ, Clip guard, Live (label + switch each), then Auto preamp
+    x = X1; f = font(18, True)
+    for lab, on in (("EQ", True), ("Clip guard", True), ("Live", live)):
+        switch(g, x - dp(34), Y0 + dp(26), on); lw = g.textlength(lab, font=f)
+        g.text((x - dp(68) - lw, Y0 + dp(26) - f.size*0.55), lab, font=f, fill=C['ON']); x = x - dp(68) - lw - dp(20)
+    bx, bw = btn(g, x, Y0 + dp(2), "Auto preamp", 'outlined', right=True)
+    tw_ = max(g.textlength("Equalizer", font=font(24, True)), g.textlength(preset + "  ·  Preamp -5 dB", font=font(16)))
+    if X0 + tw_ > bx - dp(8): print("eq header: title block overlaps the buttons by %.0f px" % (X0 + tw_ - bx + dp(8)))
     px0, py0 = X0, Y0 + dp(52) + dp(8); pw = X1 - X0; ph = (Y1 - dp(46) - dp(10)) - py0
     g.rounded_rectangle([px0, py0, px0 + pw, py0 + ph], dp(16), fill=C['SURFACE'])
     pad = dp(12); gap = max(dp(16), pw * 0.02); colW = (pw - 2*pad - 2*gap) / 12
@@ -110,6 +124,16 @@ def page_eq(resp, bands, preamp, preset):
         return trackTop + thumbH/2 + (hi - v)/(hi - lo)*(trackBottom - trackTop - thumbH)
     P = lambda x, y: (px0 + x, py0 + y)
     fT, fS, fV = ImageFont.truetype(F, int(ts)), ImageFont.truetype(F, int(sub)), ImageFont.truetype(FB, int(ts*1.1))
+    if spec is not None:
+        # the live view (LiveLayer): band levels -78..-12 dBFS from the track bottom to the top, behind everything
+        xs = [cx(1) + math.log2((20*1000**(b/47))/31.25)*colW for b in range(48)]
+        ys = [trackBottom - (max(-72, min(-6, v)) + 72)/66*(trackBottom - trackTop) for v in spec]
+        poly = [P(xs[0], trackBottom)] + [P(x_, y_) for x_, y_ in zip(xs, ys)] + [P(xs[-1], trackBottom)]
+        layer = im.copy(); lg = ImageDraw.Draw(layer); lg.polygon(poly, fill=C['PRIMARY'])
+        clip = Image.new("L", im.size, 0)
+        ImageDraw.Draw(clip).rectangle([P(cl(1)-gap*0.4, trackTop), P(cl(10)+colW+gap*0.4, trackBottom)], fill=46)
+        im.paste(layer, (0, 0), clip); g = ImageDraw.Draw(im)
+        g.line([P(x_, y_) for x_, y_ in zip(xs, ys)], fill=mix(C['SURFACE'], C['PRIMARY'], 150/255), width=int(dp(1.5)), joint="curve")
     def tc(xc, yb, s, f, fill): w = g.textlength(s, font=f); g.text((px0 + xc - w/2, py0 + yb - f.size*0.8), s, font=f, fill=fill)
     for db in range(-12, 13, 6):
         yy = yF(1, db*100); g.line([P(cl(1)-gap*0.4, yy), P(cl(10)+colW+gap*0.4, yy)], fill=C['OUTLINE'] if db == 0 else (36,42,51), width=2)
@@ -127,7 +151,16 @@ def page_eq(resp, bands, preamp, preset):
         g.rounded_rectangle([P(c0-tw/2, yv-thumbH/2), P(c0+tw/2, yv+thumbH/2)], thumbH/2, fill=C['ON'])
         g.line([P(c0-tw*0.22, yv), P(c0+tw*0.22, yv)], fill=C['OUTLINE'], width=2)
         s = ("+" if v > 0 else "-" if v < 0 else "") + (str(abs(v)//100) + ("" if abs(v)%100 == 0 else "." + str(abs(v)%100//10)))
-        tc(c0, valueY, s, fV, C['ON']); tc(c0, labelY + ts, "Preamp" if col == 0 else names[col-1], fT, C['ON']); tc(c0, sub2Y, "-18..+6" if col == 0 else "Hz", fS, C['VAR'])
+        tc(c0, valueY, s, fV, C['ON']); tc(c0, labelY + ts, "Preamp" if col == 0 else names[col-1], fT, C['ON'])
+        if col in (1, 10):
+            # the Peak/Shelf chip (EqPanel.drawChip)
+            shelf = ends[0] if col == 1 else ends[1]; lab = "Shelf" if shelf else "Peak"
+            fc = ImageFont.truetype(FB, int(ts*0.78)); cw_ = min(colW*0.92, g.textlength(lab, font=fc) + dp(20)); ch = ts*0.78*1.55
+            cy = sub2Y - sub*0.33
+            if shelf: g.rounded_rectangle([P(c0-cw_/2, cy-ch/2), P(c0+cw_/2, cy+ch/2)], ch/2, fill=C['PC'])
+            else: g.rounded_rectangle([P(c0-cw_/2, cy-ch/2), P(c0+cw_/2, cy+ch/2)], ch/2, outline=C['OUTLINE'], width=2)
+            w_ = g.textlength(lab, font=fc); g.text((px0 + c0 - w_/2, py0 + cy + ts*0.78*0.36 - fc.size*0.8), lab, font=fc, fill=C['ONPC'] if shelf else C['ON'])
+        else: tc(c0, sub2Y, "-18..+6" if col == 0 else "Hz", fS, C['VAR'])
     c0 = cx(11); mw = colW*0.34
     g.rounded_rectangle([P(c0-mw/2, trackTop), P(c0+mw/2, trackBottom)], mw/2, fill=C['SURFACE_TOP'])
     yy = trackBottom - (-11.8+36)/36*(trackBottom-trackTop); g.rounded_rectangle([P(c0-mw/2, yy), P(c0+mw/2, trackBottom)], mw/2, fill=C['SEC'])
@@ -159,37 +192,48 @@ def page_eq(resp, bands, preamp, preset):
     return im
 def page_settings():
     im, g = base(2)
-    header(g, "Settings", "Sound processing and EQ Engine itself")
-    top = Y0 + dp(52) + dp(10); cw = (X1 - X0 - dp(16)) / 2
-    for ci, (title, rows) in enumerate([("Sound", [("Equalizer","Off passes the audio through untouched (bit-exact)",'switch',True),
-                                                   ("Clip guard","Catches peaks that boosts push past full scale",'switch',True),
-                                                   ("48 kHz output","Android Auto's music without conversion. Checked every time; falls back to 44.1 kHz",'switch',True),
-                                                   ("Audio converter","For voice prompts, and for music when the output is at 44.1 kHz",'button',"Lab")]),
-                                         ("EQ Engine", [("EQ Engine","Loads at every start. Off = stock audio",'switch',True),
-                                                        ("Detailed logging","Logs every change, for troubleshooting",'switch',False),
-                                                        ("Restart Android audio","A few seconds of silence. Parked only",'button',"Restart"),
-                                                        ("Save to USB","Report: for sharing. All logs: private",'button',"Report|All logs")])]):
-        x = X0 + ci * (cw + dp(16))
-        # measure
-        tmp = Image.new("RGB", (10, 10)); tg = ImageDraw.Draw(tmp); y = 0
-        for r in rows: y, _ = row(tg, 0, y, cw - dp(36), r[0], r[1], r[2], r[3] if r[2] == 'switch' else True, r[3] if r[2] != 'switch' else "")
-        h = dp(14) + dp(30) + y + dp(12)
-        yy = draw_card(g, x, top, cw, h, title)
-        for r in rows: yy, _ = row(g, x + dp(18), yy, cw - dp(36), r[0], r[1], r[2], r[3] if r[2] == 'switch' else True, r[3] if r[2] != 'switch' else "")
-        bottom = top + h
-    f = font(15); g.text((X0 + dp(4), bottom + dp(10)), "Tip: set the car's own Bass, Midrange and Treble to Center (Sound Settings > Tone) so EQ Engine is the only tone control.", font=f, fill=C['VAR'])
-    return im, bottom + dp(10) + f.size*1.3
-def page_status():
+    header_line(g, "Settings", "Sound processing and EQ Engine itself")
+    top = Y0 + HDR + dp(10); avail = X1 - X0 - dp(16); cws = [avail*1.1/2.1, avail*1.0/2.1]
+    tmp = Image.new("RGB", (10, 10)); tg = ImageDraw.Draw(tmp)
+    def sound(gg, x, y, cw):
+        for r in [("Equalizer","Off passes the audio through untouched (bit-exact)"), ("Clip guard","Catches peaks that boosts push past full scale"),
+                  ("48 kHz output","48 kHz: link pcm2p, measured 48000 frames/s")]:
+            y, _ = row(gg, x, y, cw, r[0], r[1], 'switch', True)
+        # Audio converter: title left, three chips right, then the status line
+        hh = dp(56); f1 = font(18); gg.text((x, y + hh/2 - f1.size*0.6), "Audio converter", font=f1, fill=C['ON'])
+        ws_ = [g.textlength(l, font=font(17, l == "Very high")) + dp(32) for l in ("Stock","High","Very high")]
+        cx_ = x + cw - sum(ws_) - dp(16)
+        if cx_ < x + g.textlength("Audio converter", font=f1) + dp(12): print("settings: converter chips overlap the title")
+        for l, w_ in zip(("Stock","High","Very high"), ws_): chip(gg, cx_, y + hh/2 - dp(21), l, l == "Very high"); cx_ += w_ + dp(8)
+        y += hh
+        lines = wrap(gg, "In use: EQ Engine's tables, 40 taps a side (audio server, 16:22:37)", font(15), cw)
+        if len(lines) > 3: print("settings: converter line cut to 3 lines from %d" % len(lines))
+        for l in lines[:3]: gg.text((x, y), l, font=font(15), fill=C['VAR']); y += font(15).size*1.1*1.3
+        return y + dp(4)
+    def eng(gg, x, y, cw):
+        y, _ = row(gg, x, y, cw, "EQ Engine", "Loads at every start. Off = stock audio", 'switch', True)
+        y, _ = row(gg, x, y, cw, "Restart Android audio", "A few seconds of silence. Parked only", 'button', True, "Restart")
+        y, n = row(gg, x, y, cw, "Factory sound settings", "The car's own tone, fader and balance. Set Bass, Midrange and Treble to Center so EQ Engine is the only tone control", 'button', True, "Open")
+        return y
+    bottom = 0; x = X0
+    for fn, title, cw in ((sound, "Sound", cws[0]), (eng, "EQ Engine", cws[1])):
+        h = dp(14) + dp(34) + fn(tg, 0, 0, cw - dp(36)) + dp(12)
+        yy = draw_card(g, x, top, cw, h, title); fn(g, x + dp(18), yy, cw - dp(36)); bottom = max(bottom, top + h); x += cw + dp(16)
+    return im, bottom
+def page_status(carplay=False):
     im, g = base(3)
-    header(g, "Status", "What the boot step and the filter report")
-    top = Y0 + dp(52) + dp(10); total_w = X1 - X0 - dp(12); gw = total_w * 1.25/2.25; lw = total_w - gw
+    end_ = header_line(g, "Status", "What the boot step and the filter report")
+    bx, _ = btn(g, X1, Y0 + (HDR - dp(40)) / 2, "Diagnostics", 'tonal', h=40, right=True)
+    if end_ > bx - dp(12): print("status header: description runs into the button")
+    top = Y0 + HDR + dp(10); total_w = X1 - X0 - dp(12); gw = total_w * 1.25/2.25; lw = total_w - gw
     th = (Y1 - top - dp(20)) / 3; tw = (gw - dp(10)) / 2
     tiles = [("Boot step","Applied, confirmed","Effects list in place · strikes 0\nUnexpected restarts 0 · service started"),
              ("EQ filter","On all music","Since 19:16:40\nRock, preamp -5 dB"),
+             ("Output","CarPlay has the link","It plays to the speakers directly,\nso EQ Engine can't process it") if carplay else
              ("Output","48 kHz, unconverted","Link pcm2p measured 48000 frames/s\nOther rates: very high quality"),
              ("Processing","1.9% of real time","0.81 ms per 43 ms buffer (max 0.91 ms)\n48000 Hz stereo, audio flowing"),
              ("Levels","Average -11.8 dBFS","Peaks: in 0.0, out 0.0 dBFS\nArrived clipped 37 · guard -0.2 dB"),
-             ("App","Service running","EQ Engine 0.6.4 · log normal\nFilter 310 · processing")]
+             ("App","Service running","EQ Engine 0.6.6 · log normal\nFilter 320 · processing")]
     for i, (n, v, d) in enumerate(tiles):
         r, c = divmod(i, 2); x = X0 + c*(tw + dp(10)); y = top + r*(th + dp(10))
         g.rounded_rectangle([x, y, x+tw, y+th], dp(14), fill=C['SURFACE'])
@@ -215,65 +259,53 @@ def chip(g, x, y, label, sel):
     if sel: g.rounded_rectangle([x, y, x+w, y+dp(42)], dp(10), fill=C['PC'])
     else: g.rounded_rectangle([x, y, x+w, y+dp(42)], dp(10), outline=C['OUTLINE'], width=2)
     g.text((x+dp(16), y+dp(21)-f.size*0.6), label, font=f, fill=C['ONPC'] if sel else C['ON']); return w
-def page_lab():
-    im, g = base(4)
-    header(g, "Lab", "Experiments: Hyundai's hidden sound pages, the converter, driver tests and an audio trace")
-    top = Y0 + dp(52) + dp(10); gap = dp(16); avail = X1 - X0 - 2*gap
-    wts = [1.0, 1.1, 1.0]; ws = [avail*w/sum(wts) for w in wts]; xs = [X0, X0 + ws[0] + gap, X0 + ws[0] + ws[1] + 2*gap]
+def page_diag():
+    im, g = base(3)
+    end_ = header_line(g, "Diagnostics", "Logs, reports and tests for troubleshooting")
+    bx, _ = btn(g, X1, Y0 + (HDR - dp(40)) / 2, "Back to Status", 'outlined', h=40, right=True)
+    if end_ > bx - dp(12): print("diagnostics header: description runs into the button")
+    top = Y0 + HDR + dp(10); gap = dp(16); avail = X1 - X0 - 2*gap
+    wts = [1.4, 1.0, 1.0]; ws = [avail*w/sum(wts) for w in wts]; xs = [X0, X0 + ws[0] + gap, X0 + ws[0] + ws[1] + 2*gap]
     tmp = Image.new("RGB", (10, 10)); tg = ImageDraw.Draw(tmp)
-    bottoms = []
-    x, cw = xs[0], ws[0]
-    rows = [("Premium Sound","What the amplifier reports"),("Sound Tuning","Tone, fader and balance"),("Sound defaults","Hyundai's sound reset")]
-    note = "Hyundai's own screens, including hidden ones. Changes there stay until you change them back."
-    nl = wrap(tg, note, font(15), cw - dp(36)); y = len(nl)*dp(19) + dp(6)
-    for r in rows:
-        y += dp(8); y, nlines = row(tg, 0, y, cw - dp(36), r[0], r[1], 'button', True, "Open")
-    h = dp(14) + dp(34) + y + dp(12); yy = draw_card(g, x, top, cw, h, "Hyundai sound pages")
-    for k, l in enumerate(nl): g.text((x+dp(18), yy + k*dp(19)), l, font=font(15), fill=C['VAR'])
-    yy += len(nl)*dp(19) + dp(6)
-    for r in rows:
-        yy += dp(8); yy, nlines = row(g, x+dp(18), yy, cw - dp(36), r[0], r[1], 'button', True, "Open")
-        if nlines > 1: print("hyundai row wraps:", r[0])
-    bottoms.append(top + h)
-    x, cw = xs[1], ws[1]
-    def conv(gg, y0):
-        y = y0; cx = x + dp(18)
-        for lab, sel in [("Stock", False), ("High", False), ("Very high", True)]:
-            cx += chip(gg, cx, y, lab, sel) + dp(8)
-        if cx - dp(8) > x + cw - dp(18): print("chips overflow by %.0f" % (cx - dp(8) - (x + cw - dp(18))))
-        y += dp(42) + dp(8)
-        for l in wrap(gg, "Main output at 48 kHz: Android Auto's music is not converted. This converter handles voice prompts and anything not at 48 kHz. In use: EQ Engine's tables, 40 taps a side (audio server, 17:59:53)", font(15), cw - dp(36)):
-            gg.text((x+dp(18), y), l, font=font(15), fill=C['VAR']); y += dp(19)
-        y += dp(8); gg.line([(x+dp(18), y), (x+cw-dp(18), y)], fill=C['OUTLINE'], width=2); y += dp(2)
-        y, _ = row(gg, x+dp(18), y, cw - dp(36), "48 kHz output", "48 kHz: link pcm2p, measured 48000 frames/s", 'button', True, "Settings")
-        y, _ = row(gg, x+dp(18), y, cw - dp(36), "Driver watch (test)", "Watching: link pcm2p 48000 Hz, measured 48000 frames/s", 'switch', True)
+    def logs(gg, x, y, cw):
+        y, _ = row(gg, x, y, cw, "Detailed logging", "Every change, and an audio summary every 30 s. Off again after each update", 'switch', False)
+        y, _ = row(gg, x, y, cw, "Save to USB", "Report: for sharing. All logs: private", 'button', True, "Report|All logs")
+        y, n = row(gg, x, y, cw, "Screenshot to USB", "Of whatever is on screen 5 s after the tap; saved to the stick only", 'button', True, "In 5 s")
+        y += dp(6)
+        for l in wrap(gg, "All logs hold the phone's name, Bluetooth addresses and song titles; share them only with someone you trust. The report leaves those out.", font(14), cw):
+            gg.text((x, y), l, font=font(14), fill=C['VAR']); y += font(14).size*1.1*1.3
         return y
-    hh = conv(tg, 0) + dp(14) + dp(34) + dp(12)
-    yy = draw_card(g, x, top, cw, hh, "Converter and driver"); conv(g, yy); bottoms.append(top + hh)
-    x, cw = xs[2], ws[2]
-    d = ("Records 120 s of Android's system log and before/after snapshots of the audio system. Change sound settings, "
-         "volume or sources while it records. Settings > Save to USB > All logs copies it to the stick with everything else.")
-    dl = wrap(tg, d, font(15), cw - dp(36)); h2 = dp(14) + dp(34) + len(dl)*dp(20) + dp(14) + dp(46) + dp(6) + dp(26)*2 + dp(26) + dp(12)
-    yy = draw_card(g, x, top, cw, h2, "Audio trace")
-    for k, l in enumerate(dl): g.text((x+dp(18), yy + k*dp(20)), l, font=font(15), fill=C['VAR'])
-    yy += len(dl)*dp(20) + dp(14); btn(g, x+dp(18), yy, "Record 120 s", 'filled')
-    g.text((x+dp(18), yy+dp(54)), "Last trace: 19:20:05 (2026-11-19)", font=font(16), fill=C['VAR'])
-    g.text((x+dp(18), yy+dp(54)+dp(28)), "ALSA mixer: 52 controls, 2 cards", font=font(15), fill=C['VAR'])
-    bottoms.append(top + h2)
-    return im, max(bottoms)
+    def trace(gg, x, y, cw):
+        for l in wrap(gg, "Records 120 s of Android's system log, with snapshots of the audio system before and after. Change sources, volume or settings while it records. All logs copies it to the stick.", font(15), cw):
+            gg.text((x, y), l, font=font(15), fill=C['VAR']); y += font(15).size*1.15*1.3
+        y += dp(12); btn(gg, x, y, "Record 120 s", 'filled'); y += dp(46) + dp(10)
+        gg.text((x, y), "Last trace: 16:24:32 (2026-11-20)", font=font(16), fill=C['VAR']); y += dp(26)
+        gg.text((x, y), "ALSA mixer: 52 controls, 2 cards", font=font(15), fill=C['VAR']); y += dp(24)
+        return y
+    def watch(gg, x, y, cw):
+        y, _ = row(gg, x, y, cw, "Watch the audio driver", "Off", 'switch', False)
+        y += dp(6)
+        for l in wrap(gg, "A test for troubleshooting: writes down what Android asks of the factory audio driver and measures the speaker link. It does not change the sound. Switching it on or off restarts Android's audio (parked only); it ends at the next car start.", font(14), cw):
+            gg.text((x, y), l, font=font(14), fill=C['VAR']); y += font(14).size*1.1*1.3
+        return y
+    bottom = 0
+    for fn, title, x, cw in ((logs, "Logs", xs[0], ws[0]), (trace, "Audio trace", xs[1], ws[1]), (watch, "Driver watch", xs[2], ws[2])):
+        h = dp(14) + dp(34) + fn(tg, 0, 0, cw - dp(36)) + dp(12)
+        yy = draw_card(g, x, top, cw, h, title); fn(g, x + dp(18), yy, cw - dp(36)); bottom = max(bottom, top + h)
+    return im, bottom
 
 def page_position(posv, delay_ms):
     im, g = base(1)
-    header(g, "Listening position", "Times the speakers for one seat by delaying the side that is closer to it")
-    top = Y0 + dp(52) + dp(10); total = X1 - X0 - dp(16); cw = total*1.15/2.15; iw = total - cw
+    header_line(g, "Listening position", "Times the speakers for one seat by delaying the side that is closer to it")
+    top = Y0 + HDR + dp(10); total = X1 - X0 - dp(16); cw = total*1.15/2.15; iw = total - cw
     g.rounded_rectangle([X0, top, X0+cw, Y1], dp(16), fill=C['SURFACE'])
     # car view area
     vx0, vy0, vw, vh = X0 + dp(18), top + dp(14), cw - dp(36), (Y1 - dp(12)) - (top + dp(14)) - dp(66)
     labelH = dp(26); Hh = vh - labelH - dp(10); Ww = Hh*0.44; cx = vx0 + vw/2; t0 = vy0 + labelH + (vh - labelH - Hh)/2
     f = font(15); w = g.textlength("FRONT", font=f); g.text((cx-w/2, t0-dp(9)-f.size*0.85), "FRONT", font=f, fill=C['VAR'])
     def R(x0,y0,x1,y1): return [cx+x0*Ww, t0+y0*Hh, cx+x1*Ww, t0+y1*Hh]
-    g.rounded_rectangle([cx-Ww/2-0.09*Ww, t0+0.25*Hh, cx-Ww/2+0.02*Ww, t0+0.29*Hh], dp(4), fill=C['SURFACE_TOP'])
-    g.rounded_rectangle([cx+Ww/2-0.02*Ww, t0+0.25*Hh, cx+Ww/2+0.09*Ww, t0+0.29*Hh], dp(4), fill=C['SURFACE_TOP'])
+    g.rounded_rectangle([cx-Ww/2-0.09*Ww, t0+0.25*Hh, cx-Ww/2+0.02*Ww, t0+0.29*Hh], dp(2.5), fill=C['SURFACE_TOP'])
+    g.rounded_rectangle([cx+Ww/2-0.02*Ww, t0+0.25*Hh, cx+Ww/2+0.09*Ww, t0+0.29*Hh], dp(2.5), fill=C['SURFACE_TOP'])
     g.rounded_rectangle([cx-Ww/2, t0, cx+Ww/2, t0+Hh], 0.22*Ww, fill=C['SURFACE_HI'], outline=C['OUTLINE'], width=3)
     tz = lambda y0,y1,w0,w1: g.polygon([(cx-w0*Ww/2,t0+y0*Hh),(cx+w0*Ww/2,t0+y0*Hh),(cx+w1*Ww/2,t0+y1*Hh),(cx-w1*Ww/2,t0+y1*Hh)], fill=C['SURFACE_TOP'])
     tz(0.19,0.29,0.66,0.84); tz(0.84,0.91,0.82,0.66)
@@ -326,8 +358,13 @@ def page_position(posv, delay_ms):
     return im
 resp = [int(v) for v in open(sys.argv[1]).read().split(",")]
 out = sys.argv[2]
-page_eq(resp, [500,400,200,-100,-200,-100,100,300,400,400], -500, "Rock").save(out + "_eq.png")
+rock = [500,400,200,-100,-200,-100,100,300,400,400]
+page_eq(resp, rock, -500, "Rock").save(out + "_eq.png")
+# a music-like live view for the mockup: falling about 3.5 dB an octave, with some ripple
+spec = [-30 - 3.5*math.log2(max(20*1000**(b/47), 60)/1000) - (8 if 20*1000**(b/47) < 45 else 0) - (14 if 20*1000**(b/47) > 15000 else 0) + 3*math.sin(b*0.9) for b in range(48)]
+page_eq(resp, rock, -500, "Rock", live=True, ends=(True, False), spec=spec).save(out + "_eq_live.png")
 im, b = page_settings(); im.save(out + "_settings.png"); print("settings bottom %.0f of %d px" % (b, H - dp(10)))
 page_status().save(out + "_status.png")
+page_status(carplay=True).save(out + "_status_carplay.png")
 page_position(-100, 1.7).save(out + "_position.png")
-im, b = page_lab(); im.save(out + "_lab.png"); print("lab bottom %.0f of %d px" % (b, H - dp(10)))
+im, b = page_diag(); im.save(out + "_diagnostics.png"); print("diagnostics bottom %.0f of %d px" % (b, H - dp(10)))

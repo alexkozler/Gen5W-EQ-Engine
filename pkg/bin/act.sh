@@ -23,7 +23,7 @@
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
-VER=0.6.4
+VER=0.6.6
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -72,6 +72,10 @@ KEEP_TRIES=3
 IDLE_BAD=$S/idle48_bad
 # a new audio server gets this long (s) for its clients to reconnect before a switch while idle
 IDLE_AFTER=${EQE_IDLE_AFTER:-8}
+# the main link (I2S_3), which Android's main output plays on; another process may open it itself
+MAIN_PCM=pcm2p
+# no switch while nothing plays until the main link has been free of other processes this long (s)
+OTHER_QUIET=${EQE_OTHER_QUIET:-60}
 # Hold.java (in the app's package) keeps the main output's tracks safe during a rate change
 HOLD_D=$S/hold
 HOLD_MAX=90
@@ -292,7 +296,7 @@ watch_on() {
     read _w < $WATCHSUM
     [ "$(md5of $WATCH)" = "$_w" ] || { echo "the driver watch failed its check; not starting it"; return 1; }
     [ "$(md5of $HAL_T)" = "$HAL_MD5" ] || {
-        echo "Hyundai's audio driver is not the one this was built for (md5 $(md5of $HAL_T)); not starting the driver watch"
+        echo "the factory audio driver is not the one this was built for (md5 $(md5of $HAL_T)); not starting the driver watch"
         return 1
     }
     mkdir -p $D/lib/hal
@@ -300,7 +304,7 @@ watch_on() {
     if [ "$(md5of $HAL_COPY)" != "$HAL_MD5" ]; then
         cat $HAL_T > $HAL_COPY.new && mv $HAL_COPY.new $HAL_COPY
         chmod 644 $HAL_COPY
-        [ "$(md5of $HAL_COPY)" = "$HAL_MD5" ] || { rm -f $HAL_COPY; echo "copying Hyundai's audio driver failed"; return 1; }
+        [ "$(md5of $HAL_COPY)" = "$HAL_MD5" ] || { rm -f $HAL_COPY; echo "copying the factory audio driver failed"; return 1; }
     fi
     # the watch writes its notes here, as the audio server's user
     mkdir -p $DRV
@@ -340,6 +344,8 @@ watch_on() {
 #      wanted, or else to 44100.
 #  - Every rate change is made with the main output's tracks held (hold_begin, below), and the
 #    tracks' buffers are checked after it and at every link start.
+#  - While a process other than the audio server has the main link open itself (the factory
+#    CarPlay app, wired CarPlay), it changes nothing (link_other, below; state=other).
 # At most KEEP_TRIES switches per audio server. It never restarts the audio server. state/output
 # tells the app what it found and state/output.log what it did; state/rate48_sent (the time of
 # the last switch) lets the boot step put an audio server crash right after a switch down to it.
@@ -413,6 +419,107 @@ link_now() {
     return 1
 }
 
+# ---- another process on the main link
+#
+# Wired CarPlay (0.6.4 on the car): the factory CarPlay app (com.daudio.app.dipo, Hyundai's DiPO)
+# opens the main link (pcm2p, I2S_3) itself through TinyALSA, at 44.1 kHz; its music never goes
+# through Android's audio server. While it has the link open, the audio server's own opens fail
+# ("Device or resource busy"). A silent track or a switch can then do nothing but make the driver
+# retry its opens (0.6.4: about 1,050 failed opens a second for 4 s). So while a process other than
+# the audio server has the main link open, the keeper changes nothing, spends none of its tries and
+# says who has the link (state=other, owner=<process name>). When the link is free again it carries
+# on as before; the switch while nothing plays waits OTHER_QUIET s more, because the other process
+# may take the link back (a pause) and a silent track would then be in its way.
+
+# 0 = a process other than the current audio server has the main link open (any state): LO_TID
+# (the thread the kernel names as the link's owner), LO_STATE and LO_RATE (its hw_params rate),
+# and K_OTHER_AT is now; 1 = not (closed, or opened by one of the audio server's own threads)
+link_other() {
+    LO_TID=""; LO_STATE=""; LO_RATE=""
+    [ -n "$K_PID" ] || return 1
+    for _of in $PROC/asound/card*/$MAIN_PCM/sub0/status; do
+        [ -f $_of ] || continue
+        _ost=""; _oow=""
+        while read -r _ok _oa _ob _oc; do
+            case "$_ok" in
+                state:) _ost=$_oa ;;
+                owner_pid) _oow=$_ob ;;
+            esac
+        done < $_of
+        case "$_oow" in
+            ''|0|*[!0-9]*) continue ;;
+        esac
+        [ -d $PROC/$K_PID/task/$_oow ] && return 1
+        LO_TID=$_oow
+        LO_STATE=$_ost
+        _od=${_of%/sub0/status}
+        if [ -f $_od/sub0/hw_params ]; then
+            while read -r _ok _oa _ob; do
+                [ "$_ok" = "rate:" ] && LO_RATE=$_oa
+            done < $_od/sub0/hw_params
+        fi
+        K_OTHER_AT=$(uptime_s)
+        return 0
+    done
+    return 1
+}
+
+# LO_PID and LO_NAME: the process of the thread LO_TID ("thread N of <name>", as in the report's
+# link_owners), looked up once per thread
+other_name() {
+    [ -n "$LO_TID" ] && [ "$LO_TID" = "$LO_NTID" ] && return 0
+    LO_NTID=$LO_TID
+    _otg=""
+    if [ -f $PROC/$LO_TID/status ]; then
+        while read -r _ok _oa _orest; do
+            [ "$_ok" = "Tgid:" ] && _otg=$_oa
+        done < $PROC/$LO_TID/status
+    fi
+    LO_PID=${_otg:-$LO_TID}
+    LO_NAME=$(proc_name $LO_PID)
+}
+
+# Another process has the main link (link_other said so): one log line when it appears, and the
+# app is told who has it.
+keep_other() {
+    other_name
+    if [ "$K_OTHER" != "$LO_PID" ]; then
+        # what the app was shown before, for when the link is free again
+        [ -z "$K_OTHER" ] && { K_PREV_STATE=$K_STATE; K_PREV_NOTE=$K_NOTE; }
+        K_OTHER=$LO_PID
+        K_OTHER_NAME=$LO_NAME
+        # the link's frames/s since it started (one reading of the kernel's counters, no wait)
+        O_FPS=""
+        if [ -x $LABBIN ]; then
+            set -- $($LABBIN rate 0 2>/dev/null | {
+                _of=""
+                while read -r _ok _opcm _ocard _ost _oow _ora _ofp _onote; do
+                    [ "$_ok" = link ] && [ "$_opcm" = $MAIN_PCM ] && [ "$_oow" = "owner=$LO_TID" ] && [ -z "$_of" ] && _of=${_ofp#fps=}
+                done
+                echo "$_of"
+            })
+            O_FPS=${1%%.*}
+        fi
+        out_log "the main link ($MAIN_PCM) is in use by $LO_NAME (thread $LO_TID, ${LO_STATE:-?} at ${LO_RATE:-?} Hz), which plays to it directly, not through Android's audio server; the keeper changes nothing while it has the link"
+    fi
+    K_LAST=""
+    keep_note other "the main speaker link is in use by $LO_NAME, which plays to it directly, not through Android's audio server; EQ Engine cannot process that sound"
+}
+
+# The other process has let go of the main link: the app is shown what it was shown before (or
+# that the keeper waits for music); a link start of Android's is then checked as usual.
+keep_other_gone() {
+    out_log "the main link ($MAIN_PCM) is no longer in use by $K_OTHER_NAME; the keeper carries on"
+    K_OTHER=""; K_OTHER_NAME=""; K_LAST=""; LO_NTID=""
+    # the switch while nothing plays counts its OTHER_QUIET s from here
+    K_OTHER_AT=$(uptime_s)
+    if [ -n "$K_PREV_STATE" ] && [ "$K_PREV_STATE" != other ]; then
+        keep_note "$K_PREV_STATE" "$K_PREV_NOTE"
+    else
+        keep_note waiting "Waiting for music"
+    fi
+}
+
 # Hyundai's driver's own lines about its rate, from the system log (newest last)
 hal_rate_lines() {
     logcat -d -v time -s audio_hw_primary:V 2>/dev/null | {
@@ -466,19 +573,27 @@ out_log() {
     chmod 644 $OUTLOG
 }
 
-# keep_note <state> <note>: what the app shows. state: 48k | 44k | held | mismatch | waiting | off
+# keep_note <state> <note>: what the app shows. state: 48k | 44k | held | mismatch | unsafe |
+# waiting | off | other. With "other" (another process plays to the main link itself), link,
+# link_rate and fps are that process's, and owner= names it.
 keep_note() {
-    [ "$1|$2|$K_FPS" = "$K_NOTED" ] && return
-    K_NOTED="$1|$2|$K_FPS"
+    _nl=$K_LINK; _nr=$K_LR; _nf=$K_FPS; _no=""
+    if [ "$1" = other ]; then
+        _nl=$MAIN_PCM; _nr=$LO_RATE; _nf=$O_FPS; _no=$LO_NAME
+    fi
+    [ "$1|$2|$_nf|$_nr|$_no" = "$K_NOTED" ] && return
+    K_NOTED="$1|$2|$_nf|$_nr|$_no"
     K_STATE=$1
+    K_NOTE=$2
     {
         echo "want=$K_WANT"
         echo "state=$1"
         echo "server=$K_PID"
         echo "out=$K_OUT"
-        echo "link=$K_LINK"
-        echo "link_rate=$K_LR"
-        echo "fps=$K_FPS"
+        echo "link=$_nl"
+        echo "link_rate=$_nr"
+        echo "fps=$_nf"
+        [ -n "$_no" ] && echo "owner=$_no"
         echo "at=$(uptime_s)"
         echo "note=$2"
     } > $OUTST.tmp
@@ -787,10 +902,11 @@ hold_end() {
 # again, 3 times at most. With "wake", Hold.java also plays silence, and the main link must be
 # running before this returns. 0 = ready for a rate change (HOLD_N sessions held, HOLD_SILENT the
 # silent track's session); 1 = not (HOLD_WHY; HOLD_NOFX when EQ Engine's filter is not in this
-# audio server, so trying again cannot help)
+# audio server, so trying again cannot help; HOLD_OTHER when another process took the main link
+# while the silent track was starting)
 hold_begin() {
     _wake=$1
-    HOLD_N=0; HOLD_SESS=""; HOLD_SILENT=""; HOLD_WHY=""; HOLD_NOFX=""
+    HOLD_N=0; HOLD_SESS=""; HOLD_SILENT=""; HOLD_WHY=""; HOLD_NOFX=""; HOLD_OTHER=""
     hold_end
     # the hold is made of EQ Engine filters: none if the audio server read its effects list
     # before the boot step's overlay
@@ -844,11 +960,18 @@ hold_begin() {
             while [ $_i -lt 3 ]; do
                 set -- $(link_now $K_TID)
                 [ "$2" = RUNNING ] && { _run=1; break; }
+                # taken by another process meanwhile: the silent track cannot have it
+                link_other && { HOLD_OTHER=1; break; }
                 sleep 1
                 _i=$((_i + 1))
             done
             if [ -z "$_run" ]; then
-                HOLD_WHY="the main output's link did not start with the silent track"
+                if [ -n "$HOLD_OTHER" ]; then
+                    other_name
+                    HOLD_WHY="the main link was taken by $LO_NAME"
+                else
+                    HOLD_WHY="the main output's link did not start with the silent track"
+                fi
                 hold_end
                 return 1
             fi
@@ -926,12 +1049,25 @@ keep_buffers() {
 # (K_HOLDFAIL: the tracks could not be held; tried again unless K_HELD says why not).
 keep_change() {
     _to=$1; _why=$2; _add=$3; _kw=$4
-    K_HOLDFAIL=""
+    K_HOLDFAIL=""; HOLD_OTHER=""
+    # Another process has the main link (the factory CarPlay app), or took it while the silent
+    # track was starting: nothing is changed and no try is spent; the next round says who has it,
+    # and the change is made once Android has the link again.
+    if link_other; then
+        other_name
+        K_HOLDFAIL=1; HOLD_OTHER=1
+        out_log "no rate change: the main link is in use by $LO_NAME"
+        return 1
+    fi
     uptime_s > $SENT
     chmod 644 $SENT
     if ! hold_begin $_kw; then
-        K_TRIES=$((K_TRIES + 1))
         K_HOLDFAIL=1
+        if [ -n "$HOLD_OTHER" ]; then
+            out_log "no rate change: $HOLD_WHY"
+            return 1
+        fi
+        K_TRIES=$((K_TRIES + 1))
         out_log "no rate change: the main output's tracks could not be held for it ($HOLD_WHY)"
         # tried again (while music plays at the next check; after a silent try when music starts),
         # unless the filter is missing or the tries are used up
@@ -997,17 +1133,20 @@ keep_change() {
 
 # Nothing plays on the main link: switch now, with a silent track running the link (the driver
 # ignores a rate sent to a stream in standby), so that the music starts at the rate wanted with
-# no gap. Once per audio server and setting, IDLE_AFTER s after the audio server appeared.
+# no gap. Once per audio server and setting, IDLE_AFTER s after the audio server appeared, and
+# OTHER_QUIET s after another process last had the main link (it may take it back: a pause).
 keep_idle() {
     [ -n "$K_PID" ] && [ -n "$K_IO" ] || return 0
     [ "$K_IDLED" = "$K_PID $K_WANT" ] && return 0
     [ -n "$K_HELD$K_NO48$K_UNSAFE" ] && return 0
     [ $K_TRIES -lt $KEEP_TRIES ] || return 0
     [ $(($(uptime_s) - K_SINCE)) -ge $IDLE_AFTER ] || return 0
+    [ -n "$K_OTHER_AT" ] && [ $(($(uptime_s) - K_OTHER_AT)) -lt $OTHER_QUIET ] && return 0
     set -- $(main_out)
     [ "$2" = "$K_TID" ] || return 0
     K_OUT=$3
     K_IDLED="$K_PID $K_WANT"
+    HOLD_OTHER=""
     if [ $K_WANT = 1 ] && [ "$K_OUT" = 44100 ]; then
         out_log "nothing plays: switching the main output to 48 kHz now, so the music starts at it"
         keep_change 48000 "48 kHz did not take" 1 wake
@@ -1015,6 +1154,8 @@ keep_idle() {
         out_log "nothing plays: putting 44.1 kHz back now"
         keep_change 44100 "44.1 kHz did not come back at the first try" "" wake
     fi
+    # another process took the main link meanwhile: tried again once it has been free for a while
+    [ -n "$HOLD_OTHER" ] && K_IDLED=""
     return 0
 }
 
@@ -1107,6 +1248,8 @@ keep_loop() {
     K_PID=""; K_IO=""; K_TID=""; K_OUT=""; K_LINK=""; K_LR=""; K_FPS=""; K_STATE=""; K_NOTED=""
     K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_WANT=""; K_NO48=""
     K_SINCE=0; K_IDLED=""; K_IDLESW=""; K_UNSAFE=""; K_MISSAID=""; K_HOLDFAIL=""
+    K_NOTE=""; K_OTHER=""; K_OTHER_NAME=""; K_OTHER_AT=""; K_PREV_STATE=""; K_PREV_NOTE=""
+    LO_TID=""; LO_NTID=""; LO_PID=""; LO_NAME=""; LO_STATE=""; LO_RATE=""; O_FPS=""; HOLD_OTHER=""
     SR1=""; LR=""
     # 0.6.3 marked "no switch while nothing plays" here; 0.6.4 switches with a silent track instead
     rm -f $IDLE_BAD
@@ -1141,6 +1284,8 @@ keep_loop() {
             K_IO=""; K_TID=""; K_OUT=""; K_LINK=""; K_LR=""; K_FPS=""
             K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_NOTED=""
             K_SINCE=$(uptime_s); K_IDLED=""; K_IDLESW=""; K_UNSAFE=""; K_MISSAID=""
+            # what was shown for the last audio server is not restored for this one
+            K_PREV_STATE=""; K_PREV_NOTE=""
             hold_end
             rm -f $R48
             [ -n "$K_PID" ] && out_log "audio server $K_PID"
@@ -1156,6 +1301,14 @@ keep_loop() {
             rm -f $KEEP_PID
             exit 0
         fi
+        # another process (the factory CarPlay app) plays to the main link itself: hands off
+        if link_other; then
+            keep_other
+            sleep $KEEP_POLL
+            continue
+        fi
+        # (without an audio server nothing can be told: an audio restart is not the link let go)
+        [ -n "$K_OTHER" ] && [ -n "$K_PID" ] && keep_other_gone
         if [ -z "$K_TID" ]; then
             sleep $KEEP_POLL
             continue
@@ -1184,8 +1337,8 @@ keep_loop() {
 # One text file for sharing: what this car is, what EQ Engine finds on it and a short audio log.
 # It is meant to hold nothing personal: lines that could carry Bluetooth addresses or device
 # names, song details, a location, serial numbers or a VIN are dropped, and the kernel command
-# line is never read. Hyundai's files are not copied: only their checksums and the sample rates
-# their audio policy declares.
+# line is never read. Hyundai's files are not copied: only their checksums, the sample rates
+# their audio policy declares and (the CarPlay probe) names from their dynamic symbol tables.
 
 # passes only lines that cannot carry personal data
 safe() {
@@ -1216,8 +1369,127 @@ report_props() {
             ro.build.*|ro.product.*|ro.board.*|ro.hardware|ro.chipname|ro.daudio.*|ro.config.*|af.*|audio.*|tcc.audio.*) echo "$_l" ;;
             persist.audio.*|persist.sys.audio*|*amp*|*sound*|*arkam*|*dsp*|*spdif*|*resampler*|*speaker*|*bose*|*premium*) echo "$_l" ;;
             *vehicle*|*model*|*region*|*country*|*variant*|*nemesis*|*hmg*|sys.boot_completed) echo "$_l" ;;
+            ro.debuggable|ro.secure|wrap.$CP_APP) echo "$_l" ;;
         esac
     done | safe
+}
+
+# ---- the factory CarPlay app's audio code (the report's CarPlay probe, and carplay_probe.txt in
+# All logs). Wired CarPlay's music does not go through Android's audio server (0.6.4 on the car):
+# the factory CarPlay app opens the main link itself through TinyALSA. This lists the libraries the
+# app has loaded, what each needs and which TinyALSA (pcm_*) and mixer (mixer_*) functions it
+# imports, from their dynamic symbol tables (eqe_lab imports): no file is copied and no code is
+# read or disassembled. libtinyalsa.so is a factory file: only its md5 and its exported names.
+CP_APP=com.daudio.app.dipo
+CP_TMP=$S/cp_probe
+
+# the pid of the factory CarPlay app's main process, from /proc/<pid>/cmdline (nothing if none)
+cp_pid() {
+    for _cf in $PROC/[0-9]*/cmdline; do
+        [ -f $_cf ] || continue
+        _cc=""
+        { read -r _cc < $_cf; } 2>/dev/null
+        [ "$_cc" = $CP_APP ] || continue
+        _cf=${_cf%/cmdline}
+        echo "${_cf##*/}"
+        return 0
+    done
+    return 1
+}
+
+# the distinct libraries (.so) mapped into the process $1, in the order they appear
+cp_libs() {
+    _cl=" "
+    [ -f $PROC/$1/maps ] || return 0
+    while read -r _ma _mp _mo _md _mi _mf _mx; do
+        case "$_mf" in
+            /*.so) ;;
+            *) continue ;;
+        esac
+        case "$_cl" in
+            *" $_mf "*) ;;
+            *) _cl="$_cl$_mf "; echo "$_mf" ;;
+        esac
+    done < $PROC/$1/maps
+}
+
+# carplay_probe [list]: the probe, one item per line (with "list", first the plain list of the
+# mapped libraries)
+carplay_probe() {
+    rm -rf $CP_TMP
+    mkdir -p $CP_TMP
+    _cpp=$(cp_pid)
+    if [ -z "$_cpp" ]; then
+        echo "  the factory CarPlay app ($CP_APP) is not running"
+    else
+        cp_libs $_cpp > $CP_TMP/libs
+        _cpn=0; _cpa=""
+        while read -r _cpl; do
+            _cpn=$((_cpn + 1))
+            case "$_cpl" in
+                */libleafiaaac.so) _cpa=$_cpl ;;
+            esac
+        done < $CP_TMP/libs
+        echo "  the factory CarPlay app ($CP_APP) runs as pid $_cpp, with $_cpn libraries mapped"
+        if [ -n "$_cpa" ]; then
+            echo "  HMG-API's AAC decoder libleafiaaac.so is mapped: $_cpa"
+        else
+            echo "  HMG-API's AAC decoder libleafiaaac.so is not mapped"
+        fi
+        if [ "$1" = list ]; then
+            echo "  mapped libraries:"
+            while read -r _cpl; do
+                echo "    $_cpl"
+            done < $CP_TMP/libs
+        fi
+        if [ ! -x $LABBIN ]; then
+            echo "  eqe_lab is not installed: the symbol tables were not read"
+        else
+            while read -r _cpl; do
+                echo "  library $_cpl"
+                $LABBIN imports "$SYS$_cpl" < /dev/null > $CP_TMP/imp 2>&1
+                _cpr=$?
+                _cpd=""; _cpe=""
+                : > $CP_TMP/pcm
+                while read -r _cpk _cpv _cpx; do
+                    case "$_cpk" in
+                        needed) _cpd="$_cpd $_cpv" ;;
+                        import)
+                            case "$_cpv" in
+                                pcm_*|mixer_*) echo "    imports $_cpv" >> $CP_TMP/pcm ;;
+                            esac ;;
+                        EQE_LAB_ERR) _cpe="$_cpv $_cpx"; [ "$_cpv" = "imports:" ] && _cpe=$_cpx ;;
+                    esac
+                done < $CP_TMP/imp
+                if [ $_cpr != 0 ]; then
+                    echo "    not read (${_cpe:-eqe_lab answered $_cpr})"
+                    continue
+                fi
+                echo "    needs:${_cpd:- nothing}"
+                cat $CP_TMP/pcm
+            done < $CP_TMP/libs
+        fi
+    fi
+    _cpt=$SYS/system/lib/libtinyalsa.so
+    if [ ! -f $_cpt ]; then
+        echo "  /system/lib/libtinyalsa.so is not there"
+    else
+        echo "  /system/lib/libtinyalsa.so (factory file, not copied): md5 $(md5of $_cpt)"
+        if [ -x $LABBIN ]; then
+            $LABBIN imports $_cpt < /dev/null > $CP_TMP/imp 2>&1
+            while read -r _cpk _cpv _cpx; do
+                case "$_cpk" in
+                    export) echo "    exports $_cpv" ;;
+                    EQE_LAB_ERR) [ "$_cpv" = "imports:" ] && _cpv=""; echo "    not read (${_cpv:+$_cpv }$_cpx)" ;;
+                esac
+            done < $CP_TMP/imp
+        fi
+    fi
+    for _cpk in ro.debuggable ro.secure wrap.$CP_APP; do
+        echo "  $_cpk = [$(getprop $_cpk)]"
+    done
+    rm -rf $CP_TMP
+    return 0
 }
 
 # "<section>: <rates>" for each part of an audio policy file that declares sampling rates
@@ -1423,7 +1695,7 @@ report_checks() {
         done < $OUTST
         case "$_os" in
             48k) check ok "48 kHz output: $_on" ;;
-            44k|waiting|off) check ? "48 kHz output: $_on" ;;
+            44k|waiting|off|other) check ? "48 kHz output: $_on" ;;
             *) check NO "48 kHz output: $_on" ;;
         esac
     else
@@ -1468,9 +1740,9 @@ report() {
         echo
         echo "Made by EQ Engine $VER on $(date)."
         echo "It is meant to hold nothing personal: lines that could carry Bluetooth addresses or device"
-        echo "names, song details, a location, serial numbers or a VIN are left out, and Hyundai's files"
-        echo "are not copied (only their checksums and declared sample rates). Please read it through"
-        echo "before you post it anywhere public."
+        echo "names, song details, a location, serial numbers or a VIN are left out, and the car maker's"
+        echo "files are not copied (only their checksums, declared sample rates and the names in their"
+        echo "symbol tables). Please read it through before you post it anywhere public."
         report_section "Car"
         for _k in ro.build.product ro.product.device ro.product.model ro.build.description ro.build.version.release; do
             echo "  $_k = $(getprop $_k)"
@@ -1483,20 +1755,22 @@ report() {
         for _f in $PROC/asound/cards $PROC/asound/pcm $PROC/asound/card*/pcm*/sub0/hw_params $PROC/asound/card*/pcm*/sub0/status; do
             [ -f $_f ] && { echo "== $_f"; cat $_f; }
         done
-        report_section "Hyundai's audio files (checksums only)"
+        report_section "Factory audio files (checksums only)"
         for _f in $SYS/system/etc/audio_policy.conf $SYS/vendor/etc/audio_policy.conf $EFX_T $SYS/vendor/etc/audio_effects.conf \
                   $SYS/system/lib/hw/audio.primary.*.so $SYS/vendor/lib/hw/audio.*.so $SYS/system/lib/libmedia.so; do
             [ -f $_f ] || continue
             set -- $(ls -l $_f)
             echo "  $(md5of $_f) $4 bytes $_f"
         done
-        mounted_at $HAL_T && echo "  (the driver watch is laid over the driver; Hyundai's copy: $(md5of $HAL_COPY))"
+        mounted_at $HAL_T && echo "  (the driver watch is laid over the driver; the factory driver's copy: $(md5of $HAL_COPY))"
         mounted_at $EFX_T && echo "  (EQ Engine's effects list is laid over Android's)"
         for _f in $SYS/system/etc/audio_policy.conf $SYS/vendor/etc/audio_policy.conf; do
             [ -f $_f ] && { echo "  sample rates declared in $_f:"; policy_rates $_f; }
         done
         echo "  driver folders:"
         ls -l $SYS/system/lib/hw $SYS/vendor/lib/hw 2>&1 | safe
+        echo "-- CarPlay app's audio code (symbol tables only)"
+        carplay_probe | safe
         report_section "Properties (build and audio only)"
         report_props
         report_section "Apps playing through Android's audio server"
@@ -1821,7 +2095,8 @@ save)
     fi > converter_tables.txt
     ps > ps.txt 2>&1
     ls -l $D $D/lib $D/conf $D/state $D/settings $D/bin > files.txt 2>&1
-    ls -l /data/tombstones > tombstones_list.txt 2>&1
+    TOMB=$SYS/data/tombstones
+    ls -l $TOMB > tombstones_list.txt 2>&1
     for t in $LAB/trace_*; do
         [ -d "$t" ] || continue
         mkdir -p "lab/${t##*/}"
@@ -1830,9 +2105,19 @@ save)
         done
     done
     if [ "$4" = 1 ]; then
-        for f in /data/tombstones/tombstone_*; do
-            [ -f "$f" ] && cat "$f" > "${f##*/}.txt"
+        # Only the tombstones written since this install (act.sh is written by the install): the
+        # older ones were in earlier saves. All of them are listed in tombstones_list.txt.
+        REF=$D/bin/act.sh
+        TN=""
+        for f in $TOMB/tombstone_*; do
+            [ -f "$f" ] || continue
+            [ ! -f $REF ] || [ "$f" -nt $REF ] || continue
+            cat "$f" > "${f##*/}.txt"
+            TN="$TN ${f##*/}"
         done
+        echo "copied here (written since this install of EQ Engine):${TN:- none}" >> tombstones_list.txt
+        # the factory CarPlay app's libraries and their TinyALSA and mixer imports
+        carplay_probe list > carplay_probe.txt 2>&1
         /system/bin/dumpsys media.audio_flinger > audioflinger.txt 2>&1
         /system/bin/dumpsys meminfo > meminfo_apps.txt 2>&1
         /system/bin/logcat -d -v time > logcat.txt 2>&1
@@ -1930,9 +2215,9 @@ trace)
         read _b
         echo "$_a; $_b"
     } > $LAB/alsa_summary.txt
-    # keep the newest 3 traces (names sort by time)
+    # keep the newest 2 traces (names sort by time)
     set -- $LAB/trace_*
-    while [ $# -gt 3 ]; do
+    while [ $# -gt 2 ]; do
         rm -rf "$1"
         shift
     done
@@ -1958,8 +2243,34 @@ conv)
     setprop af.resampler.quality $2
     echo "converter $2 from the next audio server start"
     ;;
+shot)
+    # A screenshot $3 seconds from now (default 5, at most 30), written by Android's screencap
+    # straight to the stick ($2): nothing is kept on the head unit, and the app never loads it.
+    # It shows whatever is in front by then. A hardware video layer (Android Auto's or CarPlay's
+    # picture) may come out black.
+    U=$2
+    N=$3
+    case "$N" in
+        ''|*[!0-9]*) N=5 ;;
+    esac
+    [ $N -gt 30 ] && N=30
+    [ -d "$U" ] || { echo "no USB stick at $U"; exit 1; }
+    [ -x $SYS/system/bin/screencap ] || { echo "this head unit has no screencap tool"; exit 1; }
+    sleep $N
+    [ -d "$U" ] || { echo "the USB stick was removed"; exit 1; }
+    mkdir -p "$U/EQENGINE" || { echo "cannot write to $U/EQENGINE"; exit 1; }
+    F=screen_$(date +%Y%m%d_%H%M%S).png
+    $SYS/system/bin/screencap -p "$U/EQENGINE/$F" 2>&1
+    if [ ! -s "$U/EQENGINE/$F" ]; then
+        rm -f "$U/EQENGINE/$F"
+        echo "the screenshot failed"
+        exit 1
+    fi
+    sync
+    echo "EQE_SHOT EQENGINE/$F"
+    ;;
 *)
-    echo "usage: act.sh save|restart|conv|lab|keep|report|off|on|open|trace"
+    echo "usage: act.sh save|restart|conv|lab|keep|report|off|on|open|trace|shot"
     exit 2
     ;;
 esac

@@ -20,12 +20,20 @@ import java.util.UUID;
 final class Engine {
     static final UUID TYPE = UUID.fromString("1de0ea4c-d55d-460b-a1e5-4a8c2e95c191");
     static final UUID IMPL = UUID.fromString("64b3439e-9662-4040-9fd1-83f116f74988");
-    static final int P_STATS = 2, P_VERSION = 3, P_SETTINGS = 10, P_RESPONSE = 11, P_GAINS = 12, P_VHQ = 13;
-    /** 0x310 = 0.5 filter (adds P_VHQ); 0x300 = 0.4 filter (same layout otherwise), still accepted. */
-    static final int LIB_VERSION = 0x310, LIB_VERSION_04 = 0x300;
-    static final int NRESP = 96, NSTATS = 28;
+    static final int P_STATS = 2, P_VERSION = 3, P_SETTINGS = 10, P_RESPONSE = 11, P_GAINS = 12, P_VHQ = 13,
+            P_SPECTRUM = 14, P_LEVEL = 15;
+    /**
+     * 0x320 = 0.6.6 filter (settings layout 2 with the end-band types, P_SPECTRUM, P_LEVEL);
+     * 0x310 = 0.5 filter (adds P_VHQ); 0x300 = 0.4 filter. The older ones stay in the audio server
+     * after an update until it restarts, so they are still driven (without the new parts).
+     */
+    static final int LIB_VERSION = 0x320, LIB_VERSION_05 = 0x310, LIB_VERSION_04 = 0x300;
+    static final int NRESP = 96, NSTATS = 28, NSPEC = 48;
     static final int RESP_NONE = 0x80000000;
-    private static final long TICK_MS = 3000, FAST_MS = 250, SUMMARY_MS = 30000, SUMMARY_QUIET_MS = 600000;
+    private static final long TICK_MS = 3000, STATS_MS = 250, SUMMARY_MS = 30000, SUMMARY_QUIET_MS = 600000;
+    /** How often the screen reads the filter: Status tiles only, the EQ page's meter, or the meter and the live view. */
+    static final int POLL_STATS = 0, POLL_METER = 1, POLL_LIVE = 2;
+    private static final long[] POLL_MS = {250, 50, 40};
 
     interface Listener {
         void onEngine();
@@ -65,6 +73,10 @@ final class Engine {
     private boolean sumAudio;
     private int lastLimited = -1, lastClipped = -1, lastInClip = -1;
     private boolean changedInApp;
+    private int pollMode = POLL_STATS;
+    private boolean freshlyLoaded;
+    private long lastStatsAt;
+    private int[] level, spectrum;
 
     private Engine(Context ctx) {
         this.ctx = ctx;
@@ -75,8 +87,20 @@ final class Engine {
         } catch (Throwable t) {
             EqLog.e("AudioEffect methods not found", t);
         }
-        settings = EqSettings.load(ctx);
+        settings = loadSettings(ctx);
+        freshlyLoaded = true;
         EqLog.detailed = settings.detailedLog;
+    }
+
+    /** Loads the settings; after an install or update, saves them back with detailed logging off. */
+    private static EqSettings loadSettings(Context ctx) {
+        EqSettings s = EqSettings.load(ctx);
+        if (s.fromOtherVersion) {
+            s.fromOtherVersion = false;
+            s.saveAsync(ctx);
+            EqLog.i("settings from another version (or none): detailed logging starts off in " + MainActivity.VERSION);
+        }
+        return s;
     }
 
     // ------------------------------------------------------------------ lifecycle
@@ -85,7 +109,9 @@ final class Engine {
         if (s != null) service = s;
         if (running) return;
         running = true;
-        if (!changedInApp) settings = EqSettings.load(ctx);
+        // (just loaded by the constructor: reading again would see the same file before its save lands)
+        if (!changedInApp && !freshlyLoaded) settings = loadSettings(ctx);
+        freshlyLoaded = false;
         EqLog.detailed = settings.detailedLog;
         EqLog.i("engine started; settings: " + settings.describe());
         h.post(tick);
@@ -107,6 +133,22 @@ final class Engine {
         listener = l;
         h.removeCallbacks(fast);
         if (l != null) h.post(fast);
+        else {
+            level = null;
+            spectrum = null;
+        }
+    }
+
+    /** POLL_STATS, POLL_METER or POLL_LIVE (the live view is read only in POLL_LIVE, so it stops otherwise). */
+    void setPoll(int mode) {
+        if (mode == pollMode) return;
+        pollMode = mode;
+        if (mode != POLL_LIVE) spectrum = null;
+        if (mode == POLL_STATS) level = null;
+        if (listener != null) {
+            h.removeCallbacks(fast);
+            h.post(fast);
+        }
     }
 
     private final Runnable tick = new Runnable() {
@@ -118,15 +160,47 @@ final class Engine {
         }
     };
 
+    /**
+     * While the screen is open. Each read is one short call to the filter in the audio server
+     * (it answers from numbers it already has); the statistics, which also reset its "since the
+     * last read" counters, are read every 250 ms whatever the mode.
+     */
     private final Runnable fast = new Runnable() {
         public void run() {
             if (listener == null) return;
-            readStats();
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now - lastStatsAt >= STATS_MS - 5) {
+                readStats();
+                lastStatsAt = now;
+            }
+            boolean nw = fx != null && libVersion == LIB_VERSION;
+            level = nw && pollMode >= POLL_METER ? readInts(P_LEVEL, 6) : null;
+            spectrum = nw && pollMode == POLL_LIVE ? readInts(P_SPECTRUM, 4 + NSPEC) : null;
             Listener l = listener;
             if (l != null) l.onEngine();
-            h.postDelayed(this, FAST_MS);
+            h.postDelayed(this, POLL_MS[pollMode]);
         }
     };
+
+    /** The last buffer's output level from the 0.6.6 filter (see eqengine.c level_read), or null. */
+    int[] level() {
+        return level;
+    }
+
+    /** The live view's band levels from the 0.6.6 filter (see eqengine.c spec_read), or null. */
+    int[] spectrum() {
+        return spectrum;
+    }
+
+    /** The running audio server has the 0.6.6 filter (end-band shelves, live view, buffer level). */
+    boolean newFilter() {
+        return fx != null && libVersion == LIB_VERSION;
+    }
+
+    /** Attached to an older filter (the audio server started before the update). */
+    boolean olderFilter() {
+        return fx != null && libVersion != LIB_VERSION;
+    }
 
     private void check() {
         BootStatus bs = BootStatus.read();
@@ -173,9 +247,13 @@ final class Engine {
         check2();
     }
 
+    private static boolean known(int v) {
+        return v == LIB_VERSION || v == LIB_VERSION_05 || v == LIB_VERSION_04;
+    }
+
     private void check2() {
         int v = version();
-        if (v == LIB_VERSION || v == LIB_VERSION_04) {
+        if (known(v)) {
             failures = 0;
         } else if (++failures >= 2) {
             EqLog.w("the filter stopped answering (" + v + "); Android's audio server probably restarted");
@@ -213,7 +291,7 @@ final class Engine {
         }
         int v = version();
         libVersion = v;
-        if (v != LIB_VERSION && v != LIB_VERSION_04) {
+        if (!known(v)) {
             release("wrong filter version");
             oldLibrary = v == 0x100 || v == 0x200;
             oldLibraryPid = oldLibrary ? Root.mediaserverPid() : -1;
@@ -241,8 +319,8 @@ final class Engine {
         } catch (Throwable ignored) {
         }
         state = en == 0 && rc == 0 ? "EQ attached to all music" : "EQ attached, but enable returned " + en + ", settings " + rc;
-        EqLog.i("attached to session 0: id " + safeId() + ", control " + control + ", settings rc " + rc + ", enable rc " + en
-                + "; " + settings.describe());
+        EqLog.i("attached to session 0: id " + safeId() + ", filter " + Integer.toHexString(v) + ", control " + control
+                + ", settings rc " + rc + ", enable rc " + en + "; " + settings.describe());
         sumStart = System.currentTimeMillis();
     }
 
@@ -261,6 +339,8 @@ final class Engine {
         fx = null;
         stats = null;
         response = null;
+        level = null;
+        spectrum = null;
         EqLog.i("EQ detached (" + why + ")");
     }
 
@@ -309,7 +389,7 @@ final class Engine {
         if (fx == null) return -1;
         int rc;
         try {
-            rc = (Integer) setP.invoke(fx, intsToBytes(new int[] {P_SETTINGS}), settings.toParam());
+            rc = (Integer) setP.invoke(fx, intsToBytes(new int[] {P_SETTINGS}), settings.toParam(libVersion == LIB_VERSION));
         } catch (Throwable t) {
             EqLog.e("sending settings failed", unwrap(t));
             return -2;
@@ -347,7 +427,7 @@ final class Engine {
      * [4] taps per side, [5] phase bits, [6] table version.
      */
     int[] vhqStatus() {
-        if (fx == null || libVersion != LIB_VERSION) return null;
+        if (fx == null || (libVersion != LIB_VERSION && libVersion != LIB_VERSION_05)) return null;
         return readInts(P_VHQ, 8);
     }
 

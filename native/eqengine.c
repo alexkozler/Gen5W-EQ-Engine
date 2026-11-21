@@ -1,16 +1,23 @@
 /*
- * EQ Engine 0.2: a 10-band graphic EQ audio effect for Android 4.4 (Gen5W head unit).
+ * EQ Engine: a 10-band graphic EQ audio effect for Android 4.4 (Gen5W head unit).
  *
  * Loaded by mediaserver's effect factory (listed in audio_effects.conf) and run inside the music
  * mixer on session 0 (all music output) when the EQ Engine app attaches it.
  *
  * Signal path, per stereo frame (all math in double precision):
- *   16-bit in -> preamp -> 10 peaking filters (31 Hz .. 16 kHz, one octave apart)
+ *   16-bit in -> preamp -> 10 filters (31 Hz .. 16 kHz, one octave apart)
  *             -> crossfade with the untouched input (EQ on/off) -> clip guard -> TPDF dither -> 16-bit out
  *
+ * - Bands (0.6.6): one-octave peaking filters with the bandwidth prewarped, so the 8 and 16 kHz
+ *   bells are as wide as the others near Nyquist. The 31 Hz and 16 kHz bands can each be a shelf
+ *   instead (settings "ends"): a low shelf turning over at 50 Hz, a high shelf at 11.3 kHz. The
+ *   slider still sets the level at the band's centre.
  * - Accurate sliders: neighbouring bands overlap, so a plain graphic EQ overshoots when several
- *   are raised. The requested slider values are solved for (an interaction matrix plus two
+ *   are raised. The requested slider values are solved for (an interaction matrix plus three
  *   refinement passes) so the measured response at each band centre matches its slider.
+ * - Live view (0.6.6): while the app reads EQE_PARAM_SPECTRUM (at least every 2 s), the output
+ *   is analysed once per buffer (4096-point FFT, 48 bands from 20 Hz to 20 kHz). Nothing is
+ *   allocated or computed until the first read.
  * - Click-free changes: new filter settings are reached by interpolating the coefficients over
  *   1024 samples (stable for every step in between); preamp changes are smoothed; EQ on/off
  *   crossfades over 2048 samples.
@@ -46,7 +53,8 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
-#define EQE_LIB_VERSION 0x00000310 /* 0.5: as 0.4 (0x300) plus EQE_PARAM_VHQ */
+#define EQE_LIB_VERSION 0x00000320 /* 0.6.6: settings layout 2 (ends), EQE_PARAM_SPECTRUM, EQE_PARAM_LEVEL;
+                                      0x310 (0.5): as 0.4 (0x300) plus EQE_PARAM_VHQ */
 #define EQE_MAGIC 0x45514532u     /* "EQE2" */
 #define EQE_MAX_FRAMES 65536u
 
@@ -57,12 +65,21 @@
 #define EQE_PARAM_RESPONSE 11 /* r:  int32[EQE_NRESP] EQ response in 0.01 dB at eqe_resp_hz() */
 #define EQE_PARAM_GAINS    12 /* r:  int32[EQE_NB] solved filter gains in 0.01 dB (diagnostic) */
 #define EQE_PARAM_VHQ      13 /* r:  int32[8] very high quality converter status, see vhq_status() */
+#define EQE_PARAM_SPECTRUM 14 /* r:  int32[4 + EQE_NSPEC] live view, see spec_read(); reading keeps it on */
+#define EQE_PARAM_LEVEL    15 /* r:  int32[6] the last buffer's output level, see level_read() */
 static void vhq_status(int32_t *v);
 
 #define EQE_NB 10
 #define EQE_NRESP 96
+#define EQE_NSPEC 48            /* live view bands, 20 Hz .. 20 kHz, log spaced */
 #define EQE_STATS_COUNT 28
-#define EQE_SET_COUNT 16
+#define EQE_SET_COUNT 17
+#define EQE_SET1_BYTES (16 * 4)  /* layout 1 (0.4 .. 0.6.4): no "ends" */
+#define EQE_ENDS_LOW 1          /* the 31 Hz band is a low shelf */
+#define EQE_ENDS_HIGH 2         /* the 16 kHz band is a high shelf */
+#define LOW_SHELF_HZ 50.0       /* shelf midpoints: between the end band and its neighbour */
+#define HIGH_SHELF_HZ 11300.0
+#define BAND_BW_OCT 1.0         /* bell width between the half-gain points, octaves */
 #define EQE_BAND_LIMIT 1500     /* +-15 dB per slider */
 #define EQE_PRE_MIN (-2400)     /* preamp -24 dB .. +6 dB */
 #define EQE_PRE_MAX 600
@@ -80,12 +97,13 @@ static void vhq_status(int32_t *v);
 #define EQE_PI 3.14159265358979323846
 
 typedef struct {
-    int32_t layout;            /* 1 */
+    int32_t layout;            /* 2 (layout 1, without "ends", is still accepted) */
     int32_t eq_on;             /* 0 = bypass (bit-exact), 1 = EQ on */
     int32_t preamp_cdb;        /* 0.01 dB */
     int32_t guard_on;          /* clip guard */
     int32_t band_cdb[EQE_NB];  /* slider values, 0.01 dB */
     int32_t delay_us[2];       /* listening position: extra delay, left and right (0..5000 us) */
+    int32_t ends;              /* layout 2: EQE_ENDS_LOW | EQE_ENDS_HIGH, shelves for the end bands */
 } eqe_settings;
 
 typedef struct { double b0, b1, b2, a1, a2; } coefs_t;
@@ -95,6 +113,29 @@ typedef struct {
     double z1[2], z2[2];
     int active;                /* cur/tgt not identity, or state not yet zero */
 } band_t;
+
+/* live view: allocated at the first EQE_PARAM_SPECTRUM read */
+#define SPEC_N 4096             /* analysis length (real samples); FFT of SPEC_N / 2 complex points */
+#define SPEC_M (SPEC_N / 2)
+#define SPEC_KEEP_NS 2000000000LL /* analyse while the view was read within the last 2 s */
+typedef struct {
+    float ring[SPEC_N];        /* mono output, oldest at pos */
+    float win[SPEC_N];         /* Hann window */
+    double re[SPEC_M], im[SPEC_M];
+    double twr[SPEC_M], twi[SPEC_M]; /* e^(-2 pi i k / SPEC_N) */
+    int16_t rev[SPEC_M];       /* bit reversal for SPEC_M points */
+    int pos, fresh, filled;
+    double winsum2;            /* sum of the window's squares */
+    double rate;               /* the band table below is for this rate */
+    int lo[EQE_NSPEC], hi[EQE_NSPEC]; /* bin range per band (lo > hi: none) */
+    double scale[EQE_NSPEC];   /* bands narrower than a bin: their share of the nearest bin */
+    int32_t lvl[EQE_NSPEC];    /* 0.01 dBFS */
+    uint32_t seq;
+    int64_t at_ns;
+} spec_t;
+
+/* sliding minimum over the clip guard's look-ahead (a monotonic queue) */
+typedef struct { double v; uint32_t t; } gq_t;
 
 typedef struct eqe_ctx {
     const struct effect_interface_s *itfe; /* must be first: effect_handle_t points here */
@@ -106,6 +147,7 @@ typedef struct eqe_ctx {
     eqe_settings set;
     /* design */
     double rate;
+    int32_t design_ends;       /* the end-band types binv was made for */
     double binv[EQE_NB][EQE_NB];
     double gains[EQE_NB];      /* solved filter gains, dB */
     band_t band[EQE_NB];
@@ -119,12 +161,23 @@ typedef struct eqe_ctx {
     double dbuf[2][DMAX];
     int dpos;
     int dcur[2], dnew[2], dfade[2];
-    double rq[LA];
+    gq_t gq[LA];               /* requested gains of the last LA samples that can still be the minimum */
+    int gq_head, gq_n;
+    uint32_t gq_clock;         /* sample counter for the queue */
     double box[LA];
     double boxsum;
-    int below;                 /* entries of rq below 1 */
+    int box_low;               /* entries of box below 1 */
     int li;                    /* ring position */
     double g2, krel;
+    /* live view and level */
+    spec_t *spec;
+    int64_t spec_wanted_ns;
+    int spec_running;
+    uint32_t blk_seq;
+    int64_t blk_ns;
+    int32_t blk_peak;
+    uint64_t blk_ss;
+    uint32_t blk_frames;
     int processing;            /* 0 = bit-exact delay path, 1 = processing path */
     uint32_t rng;
     /* statistics */
@@ -157,8 +210,8 @@ static const effect_descriptor_t gDescriptor = {
     EFFECT_CONTROL_API_VERSION,
     EFFECT_FLAG_TYPE_INSERT | EFFECT_FLAG_INSERT_LAST,
     40, /* cpuLoad, 0.1 MIPS units (estimate) */
-    8,  /* memoryUsage, KB */
-    "EQ Engine 0.4 (10-band EQ)",
+    8,  /* memoryUsage, KB (the live view's buffers, about 100 KB, exist only while the app shows it) */
+    "EQ Engine (10-band EQ)",
     "EQ Engine",
 };
 
@@ -182,8 +235,8 @@ static int is_identity(const coefs_t *k) {
     return k->b0 == 1.0 && k->b1 == 0.0 && k->b2 == 0.0 && k->a1 == 0.0 && k->a2 == 0.0;
 }
 
-/* RBJ peaking filter; returns identity for 0 dB or a centre too close to Nyquist. */
-static coefs_t peaking(double f0, double gain_db, double rate) {
+/* RBJ peaking filter with Q = sqrt(2) (0.4 .. 0.6.4); kept for comparisons in the tests. */
+static __attribute__((unused)) coefs_t peaking(double f0, double gain_db, double rate) {
     if (gain_db == 0.0 || rate <= 0.0 || f0 >= 0.45 * rate) return kIdentity;
     double A = pow(10.0, gain_db / 40.0);
     double w0 = 2.0 * EQE_PI * f0 / rate;
@@ -197,6 +250,61 @@ static coefs_t peaking(double f0, double gain_db, double rate) {
     k.a1 = (-2.0 * cw) / a0;
     k.a2 = (1.0 - alpha / A) / a0;
     return k;
+}
+
+/* RBJ peaking filter, BAND_BW_OCT octaves between the half-gain points, with the bandwidth
+ * prewarped (the cookbook's BW form). Far below Nyquist it is the Q = sqrt(2) filter above; near
+ * Nyquist the plain Q form gets narrower (at 44.1 kHz the 16 kHz bell was about a third as
+ * wide), which left a dip between 8 and 16 kHz when both were raised. */
+static coefs_t bell(double f0, double gain_db, double rate) {
+    if (gain_db == 0.0 || rate <= 0.0 || f0 >= 0.45 * rate) return kIdentity;
+    double A = pow(10.0, gain_db / 40.0);
+    double w0 = 2.0 * EQE_PI * f0 / rate;
+    double sw = sin(w0), cw = cos(w0);
+    double alpha = sw * sinh(0.5 * log(2.0) * BAND_BW_OCT * w0 / sw);
+    double a0 = 1.0 + alpha / A;
+    coefs_t k;
+    k.b0 = (1.0 + alpha * A) / a0;
+    k.b1 = (-2.0 * cw) / a0;
+    k.b2 = (1.0 - alpha * A) / a0;
+    k.a1 = (-2.0 * cw) / a0;
+    k.a2 = (1.0 - alpha / A) / a0;
+    return k;
+}
+
+/* RBJ shelving filter, slope S = 1; f0 is the midpoint (half the shelf's gain in dB). */
+static coefs_t shelf(int high, double f0, double gain_db, double rate) {
+    if (gain_db == 0.0 || rate <= 0.0 || f0 >= 0.45 * rate) return kIdentity;
+    double A = pow(10.0, gain_db / 40.0);
+    double w0 = 2.0 * EQE_PI * f0 / rate;
+    double cw = cos(w0), sw = sin(w0);
+    double alpha = sw / 2.0 * sqrt(2.0); /* S = 1 */
+    double sa = 2.0 * sqrt(A) * alpha;
+    double b0, b1, b2, a0, a1, a2;
+    if (!high) {
+        b0 = A * ((A + 1.0) - (A - 1.0) * cw + sa);
+        b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cw);
+        b2 = A * ((A + 1.0) - (A - 1.0) * cw - sa);
+        a0 = (A + 1.0) + (A - 1.0) * cw + sa;
+        a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cw);
+        a2 = (A + 1.0) + (A - 1.0) * cw - sa;
+    } else {
+        b0 = A * ((A + 1.0) + (A - 1.0) * cw + sa);
+        b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cw);
+        b2 = A * ((A + 1.0) + (A - 1.0) * cw - sa);
+        a0 = (A + 1.0) - (A - 1.0) * cw + sa;
+        a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cw);
+        a2 = (A + 1.0) - (A - 1.0) * cw - sa;
+    }
+    coefs_t k = {b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0};
+    return k;
+}
+
+/* Band j's filter at gain g (dB), with the end-band types in `ends`. */
+static coefs_t band_coefs(int32_t ends, int j, double g, double rate) {
+    if (j == 0 && (ends & EQE_ENDS_LOW)) return shelf(0, LOW_SHELF_HZ, g, rate);
+    if (j == EQE_NB - 1 && (ends & EQE_ENDS_HIGH)) return shelf(1, HIGH_SHELF_HZ, g, rate);
+    return bell(kCenters[j], g, rate);
 }
 
 static double coefs_db(const coefs_t *k, double f, double rate) {
@@ -237,11 +345,13 @@ static int invert(double m[EQE_NB][EQE_NB], double out[EQE_NB][EQE_NB]) {
 
 static int band_usable(double rate, int j) { return kCenters[j] < 0.45 * rate; }
 
-/* Interaction matrix for the current sample rate: response of band j (at +12 dB) at centre i. */
-static void prepare_rate(eqe_ctx *c) {
+/* Interaction matrix for the current sample rate and end-band types: response of band j (at
+ * +12 dB) at centre i. */
+static void prepare_matrix(eqe_ctx *c) {
     double m[EQE_NB][EQE_NB];
+    c->design_ends = c->set.ends;
     for (int j = 0; j < EQE_NB; j++) {
-        coefs_t k = peaking(kCenters[j], 12.0, c->rate);
+        coefs_t k = band_coefs(c->set.ends, j, 12.0, c->rate);
         for (int i = 0; i < EQE_NB; i++) {
             if (!band_usable(c->rate, i) || !band_usable(c->rate, j)) {
                 m[i][j] = i == j ? 1.0 : 0.0;
@@ -256,6 +366,11 @@ static void prepare_rate(eqe_ctx *c) {
             for (int j = 0; j < EQE_NB; j++) c->binv[i][j] = i == j ? 1.0 : 0.0;
         LOGW("interaction matrix not invertible at %.0f Hz; sliders are used as filter gains", c->rate);
     }
+}
+
+/* Everything that depends on the sample rate. */
+static void prepare_rate(eqe_ctx *c) {
+    prepare_matrix(c);
     c->pre_k = 1.0 - exp(-1.0 / (0.010 * c->rate));
     c->krel = 1.0 - exp(-1.0 / (0.080 * c->rate));
 }
@@ -281,7 +396,7 @@ static void solve_gains(eqe_ctx *c, double g[EQE_NB]) {
     }
     for (int pass = 0; pass < 3; pass++) {
         coefs_t k[EQE_NB];
-        for (int j = 0; j < EQE_NB; j++) k[j] = peaking(kCenters[j], g[j], c->rate);
+        for (int j = 0; j < EQE_NB; j++) k[j] = band_coefs(c->set.ends, j, g[j], c->rate);
         double e[EQE_NB];
         for (int i = 0; i < EQE_NB; i++) {
             double r = 0.0;
@@ -325,11 +440,33 @@ static int delay_samples(const eqe_ctx *c, int ch) {
 
 static void reset_guard(eqe_ctx *c) {
     memset(c->dl, 0, sizeof(c->dl));
-    for (int i = 0; i < LA; i++) { c->rq[i] = 1.0; c->box[i] = 1.0; }
+    for (int i = 0; i < LA; i++) c->box[i] = 1.0;
     c->boxsum = LA;
-    c->below = 0;
+    c->box_low = 0;
+    c->gq_head = c->gq_n = 0;
     c->li = 0;
     c->g2 = 1.0;
+}
+
+/* Adds this sample's requested gain to the look-ahead window and returns the smallest request of
+ * the last LA samples (1.0 when none asked for less). The same as scanning the window, in O(1)
+ * per sample on average. */
+static inline double guard_min_push(eqe_ctx *c, double req) {
+    uint32_t t = ++c->gq_clock;
+    /* drop requests that left the window (older than LA samples) */
+    while (c->gq_n > 0 && t - c->gq[c->gq_head].t >= LA) {
+        c->gq_head = (c->gq_head + 1) & (LA - 1);
+        c->gq_n--;
+    }
+    if (req < 1.0) {
+        /* drop newer-but-larger requests from the back: they can never be the minimum again */
+        while (c->gq_n > 0 && c->gq[(c->gq_head + c->gq_n - 1) & (LA - 1)].v >= req) c->gq_n--;
+        int at = (c->gq_head + c->gq_n) & (LA - 1);
+        c->gq[at].v = req;
+        c->gq[at].t = t;
+        c->gq_n++;
+    }
+    return c->gq_n > 0 ? c->gq[c->gq_head].v : 1.0;
 }
 
 /* Applies c->set. jump = 1: no ramps (new sample rate or first config). */
@@ -337,10 +474,11 @@ static void apply_settings(eqe_ctx *c, int jump) {
     c->pre_tgt = pow(10.0, c->set.preamp_cdb / 2000.0);
     c->w_tgt = c->set.eq_on ? 1.0 : 0.0;
     if (c->rate <= 0.0) return;
+    if (c->set.ends != c->design_ends) prepare_matrix(c);
     solve_gains(c, c->gains);
     for (int j = 0; j < EQE_NB; j++) {
         band_t *b = &c->band[j];
-        b->tgt = peaking(kCenters[j], c->gains[j], c->rate);
+        b->tgt = band_coefs(c->set.ends, j, c->gains[j], c->rate);
         if (jump) b->cur = b->tgt;
         if (!(is_identity(&b->cur) && is_identity(&b->tgt))) b->active = 1;
     }
@@ -373,7 +511,8 @@ static void apply_settings(eqe_ctx *c, int jump) {
 }
 
 static int settings_valid(const eqe_settings *s) {
-    if (s->layout != 1) return 0;
+    if (s->layout != 2) return 0;
+    if (s->ends & ~(EQE_ENDS_LOW | EQE_ENDS_HIGH)) return 0;
     if (s->eq_on != 0 && s->eq_on != 1) return 0;
     if (s->guard_on != 0 && s->guard_on != 1) return 0;
     if (s->preamp_cdb < EQE_PRE_MIN || s->preamp_cdb > EQE_PRE_MAX) return 0;
@@ -404,19 +543,27 @@ static inline double uni(eqe_ctx *c) {
     return (double)(x >> 8) * (1.0 / 16777216.0);
 }
 
+/* floor(s + 0.5) without a libm call (VFPv3 has no rounding instruction): shifted to positive and
+ * truncated. Exact for |s| < 2^30, which quantise() makes sure of. */
+static inline int32_t round_half_up(double s) {
+    return (int32_t)((uint32_t)(s + 1073741824.5) - 1073741824u);
+}
+
 static inline int32_t quantise(eqe_ctx *c, double v, int guard) {
     double s = v * 32768.0;
-    double r = floor(s + 0.5);
-    if (r != s) r = floor(s + uni(c) - uni(c) + 0.5);
-    if (r > 32767.0) {
+    if (!(s < 1e9)) s = 1e9;        /* also catches NaN */
+    else if (s < -1e9) s = -1e9;
+    int32_t r = round_half_up(s);
+    if ((double)r != s) r = round_half_up(s + uni(c) - uni(c));
+    if (r > 32767) {
         if (!guard) c->clipped++;
         return 32767;
     }
-    if (r < -32768.0) {
+    if (r < -32768) {
         if (!guard) c->clipped++;
         return -32768;
     }
-    return (int32_t)r;
+    return r;
 }
 
 /* Flat-top detection for one input sample: a run of 2 or more consecutive samples at the same
@@ -432,10 +579,25 @@ static inline uint32_t rail_count(eqe_ctx *c, int ch, int32_t x) {
     return 1;
 }
 
-static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t frames, int accumulate) {
-    int32_t ipl = c->in_peak_l, ipr = c->in_peak_r, opk = c->out_peak;
+/* One buffer. The per-sample work is only what the settings need (0.6.6):
+ * - "transparent" (EQ on but flat, preamp 0 dB, no seat delay, the guard idle): the input goes
+ *   through the look-ahead delay as in the bit-exact path, which gives exactly the same samples
+ *   as the full path would;
+ * - only bands that are not at 0 dB are run;
+ * - the guard's bookkeeping is skipped while it is idle and the sample needs no limiting;
+ * - a channel without seat delay skips the delay line's reads.
+ * sp: the live view's buffer while the app shows it, else NULL. */
+static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t frames, int accumulate, spec_t *sp) {
+    int32_t ipl = c->in_peak_l, ipr = c->in_peak_r, bpk = 0;
     uint64_t iss = 0, oss = 0;
     uint32_t clip = 0;
+    band_t *act[EQE_NB];
+    int nb = 0;
+    for (int j = 0; j < EQE_NB; j++)
+        if (c->band[j].active) act[nb++] = &c->band[j];
+    int transparent = c->processing && nb == 0 && c->ramp_left == 0 && c->pre_cur == 1.0 && c->pre_tgt == 1.0 &&
+                      c->w == 1.0 && c->w_tgt == 1.0 && c->dcur[0] == 0 && c->dcur[1] == 0 && c->dfade[0] == 0 &&
+                      c->dfade[1] == 0 && c->gq_n == 0 && c->box_low == 0 && c->g2 == 1.0;
     for (size_t f = 0; f < frames; f++) {
         int32_t il = src[2 * f], ir = src[2 * f + 1];
         int32_t al = il < 0 ? -il : il, ar = ir < 0 ? -ir : ir;
@@ -447,35 +609,40 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
         double xl = il * (1.0 / 32768.0), xr = ir * (1.0 / 32768.0);
         int32_t ol, orr;
 
-        if (!c->processing) {
+        if (!c->processing || transparent) {
             /* Bit-exact path: the input, delayed by LA - 1 samples. */
-            int w = c->li, rd = (c->li + 1) % LA;
+            int w = c->li, rd = (w + 1) & (LA - 1);
             double dl = c->dl[0][rd], dr = c->dl[1][rd];
             c->dl[0][w] = xl;
             c->dl[1][w] = xr;
             c->li = rd;
             ol = (int32_t)(dl * 32768.0);
             orr = (int32_t)(dr * 32768.0);
-            if (c->w_tgt > 0.0) {
+            if (transparent) {
+                /* the seat delay keeps its history, for a later change */
+                c->dbuf[0][c->dpos] = xl;
+                c->dbuf[1][c->dpos] = xr;
+                c->dpos = (c->dpos + 1) & (DMAX - 1);
+            } else if (c->w_tgt > 0.0) {
                 /* EQ turned on: start the processing path; the crossfade begins at w = 0. */
                 c->processing = 1;
             }
         } else {
             /* preamp */
-            c->pre_cur += (c->pre_tgt - c->pre_cur) * c->pre_k;
-            if (fabs(c->pre_tgt - c->pre_cur) < 1e-12) c->pre_cur = c->pre_tgt;
+            if (c->pre_cur != c->pre_tgt) {
+                c->pre_cur += (c->pre_tgt - c->pre_cur) * c->pre_k;
+                if (fabs(c->pre_tgt - c->pre_cur) < 1e-12) c->pre_cur = c->pre_tgt;
+            }
             double yl = xl * c->pre_cur, yr = xr * c->pre_cur;
             /* filters */
-            for (int j = 0; j < EQE_NB; j++) {
-                band_t *b = &c->band[j];
-                if (!b->active) continue;
+            for (int n = 0; n < nb; n++) {
+                band_t *b = act[n];
                 yl = biquad(b, 0, yl);
                 yr = biquad(b, 1, yr);
             }
             if (c->ramp_left > 0) {
-                for (int j = 0; j < EQE_NB; j++) {
-                    band_t *b = &c->band[j];
-                    if (!b->active) continue;
+                for (int n = 0; n < nb; n++) {
+                    band_t *b = act[n];
                     b->cur.b0 += b->inc.b0;
                     b->cur.b1 += b->inc.b1;
                     b->cur.b2 += b->inc.b2;
@@ -490,18 +657,19 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
                 int wp = c->dpos;
                 c->dbuf[0][wp] = yl;
                 c->dbuf[1][wp] = yr;
-                double *yy[2] = {&yl, &yr};
                 for (int ch = 0; ch < 2; ch++) {
-                    double a = c->dbuf[ch][(wp - c->dcur[ch] + DMAX) % DMAX];
+                    if (c->dcur[ch] == 0 && c->dfade[ch] == 0) continue; /* tap 0 is the sample itself */
+                    double a = c->dbuf[ch][(unsigned)(wp - c->dcur[ch]) & (DMAX - 1)];
                     if (c->dfade[ch] > 0) {
-                        double b = c->dbuf[ch][(wp - c->dnew[ch] + DMAX) % DMAX];
+                        double b = c->dbuf[ch][(unsigned)(wp - c->dnew[ch]) & (DMAX - 1)];
                         double t = 1.0 - (double)c->dfade[ch] / DFADE_LEN;
                         a += (b - a) * t;
                         if (--c->dfade[ch] == 0) c->dcur[ch] = c->dnew[ch];
                     }
-                    *yy[ch] = a;
+                    if (ch == 0) yl = a;
+                    else yr = a;
                 }
-                c->dpos = (wp + 1) % DMAX;
+                c->dpos = (wp + 1) & (DMAX - 1);
             }
             /* EQ on/off crossfade (the dry signal has no preamp) */
             if (c->w != c->w_tgt) {
@@ -510,34 +678,36 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
             }
             double ml = xl + (yl - xl) * c->w, mr = xr + (yr - xr) * c->w;
             /* clip guard (look-ahead peak limiter) */
-            int w = c->li, rd = (c->li + 1) % LA;
+            int w = c->li, rd = (w + 1) & (LA - 1);
             double dl = c->dl[0][rd], dr = c->dl[1][rd];
             c->dl[0][w] = ml;
             c->dl[1][w] = mr;
-            double pk = fabs(ml) > fabs(mr) ? fabs(ml) : fabs(mr);
-            double req = (c->set.guard_on && pk > GUARD_THR) ? GUARD_THR / pk : 1.0;
-            if (c->rq[w] < 1.0) c->below--;
-            c->rq[w] = req;
-            if (req < 1.0) c->below++;
-            double m = 1.0;
-            if (c->below > 0)
-                for (int i = 0; i < LA; i++)
-                    if (c->rq[i] < m) m = c->rq[i];
-            c->boxsum += m - c->box[w];
-            c->box[w] = m;
-            double g = c->boxsum * (1.0 / LA);
-            if (g > 1.0) g = 1.0;
-            if (g < c->g2) c->g2 = g;
-            else c->g2 += (g - c->g2) * c->krel;
-            if (c->g2 > 1.0 || (g == 1.0 && c->g2 > 1.0 - 1e-9)) c->g2 = 1.0;
             c->li = rd;
-            double gl = c->g2;
-            if (gl < 0.99999) c->limited++;
-            if (gl < c->min_gain) c->min_gain = gl;
+            double pk = fabs(ml) > fabs(mr) ? fabs(ml) : fabs(mr);
+            int over = c->set.guard_on && pk > GUARD_THR;
+            double gl;
+            if (!over && c->gq_n == 0 && c->box_low == 0 && c->g2 == 1.0) {
+                /* idle: nothing to limit now or anywhere in the look-ahead */
+                gl = 1.0;
+            } else {
+                double m = guard_min_push(c, over ? GUARD_THR / pk : 1.0);
+                if (c->box[w] < 1.0) c->box_low--;
+                c->boxsum += m - c->box[w];
+                c->box[w] = m;
+                if (m < 1.0) c->box_low++;
+                double g = c->boxsum * (1.0 / LA);
+                if (g > 1.0) g = 1.0;
+                if (g < c->g2) c->g2 = g;
+                else c->g2 += (g - c->g2) * c->krel;
+                if (c->g2 > 1.0 || (g == 1.0 && c->g2 > 1.0 - 1e-9)) c->g2 = 1.0;
+                gl = c->g2;
+                if (gl < 0.99999) c->limited++;
+                if (gl < c->min_gain) c->min_gain = gl;
+            }
             ol = quantise(c, dl * gl, c->set.guard_on);
             orr = quantise(c, dr * gl, c->set.guard_on);
             /* Back to the bit-exact path once fully off and settled. */
-            if (c->w == 0.0 && c->w_tgt == 0.0 && c->below == 0 && c->g2 >= 0.99999 &&
+            if (c->w == 0.0 && c->w_tgt == 0.0 && c->gq_n == 0 && c->g2 >= 0.99999 &&
                 c->boxsum >= LA - 1e-9) {
                 c->processing = 0;
                 c->g2 = 1.0;
@@ -551,15 +721,27 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
             if (orr > 32767) orr = 32767; else if (orr < -32768) orr = -32768;
         }
         int32_t aol = ol < 0 ? -ol : ol, aor = orr < 0 ? -orr : orr;
-        if (aol > opk) opk = aol;
-        if (aor > opk) opk = aor;
+        if (aol > bpk) bpk = aol;
+        if (aor > bpk) bpk = aor;
         oss += (uint64_t)(ol * ol) + (uint64_t)(orr * orr);
         dst[2 * f] = (int16_t)ol;
         dst[2 * f + 1] = (int16_t)orr;
+        if (sp) {
+            sp->ring[sp->pos] = (float)((ol + orr) * (0.5 / 32768.0));
+            sp->pos = (sp->pos + 1) & (SPEC_N - 1);
+        }
+    }
+    if (sp) {
+        sp->fresh += (int)frames;
+        sp->filled = sp->filled + (int)frames > SPEC_N ? SPEC_N : sp->filled + (int)frames;
     }
     c->in_peak_l = ipl;
     c->in_peak_r = ipr;
-    c->out_peak = opk;
+    if (bpk > c->out_peak) c->out_peak = bpk;
+    c->blk_peak = bpk;
+    c->blk_ss = oss;
+    c->blk_frames = (uint32_t)frames;
+    c->blk_seq++;
     c->in_ss += iss;
     c->out_ss += oss;
     c->ss_frames += frames;
@@ -581,6 +763,148 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
     c->boxsum = s;
 }
 
+/* ------------------------------------------------------------------ live view */
+
+static double eqe_spec_hz(int b) { return 20.0 * pow(1000.0, (double)b / (EQE_NSPEC - 1)); }
+
+/* Allocates the live view and its fixed tables (from a command, never from process()). */
+static spec_t *spec_new(void) {
+    spec_t *sp = (spec_t *)calloc(1, sizeof(spec_t));
+    if (sp == NULL) return NULL;
+    double s2 = 0.0;
+    for (int n = 0; n < SPEC_N; n++) {
+        double w = 0.5 - 0.5 * cos(2.0 * EQE_PI * n / SPEC_N); /* periodic Hann */
+        sp->win[n] = (float)w;
+        s2 += (double)sp->win[n] * sp->win[n];
+    }
+    sp->winsum2 = s2;
+    for (int k = 0; k < SPEC_M; k++) {
+        sp->twr[k] = cos(2.0 * EQE_PI * k / SPEC_N);
+        sp->twi[k] = -sin(2.0 * EQE_PI * k / SPEC_N);
+    }
+    int bits = 0;
+    while ((1 << bits) < SPEC_M) bits++;
+    for (int m = 0; m < SPEC_M; m++) {
+        int r = 0;
+        for (int b = 0; b < bits; b++)
+            if (m & (1 << b)) r |= 1 << (bits - 1 - b);
+        sp->rev[m] = (int16_t)r;
+    }
+    return sp;
+}
+
+/* Which FFT bins make up each band at this rate. Bands narrower than a bin take their share of
+ * the nearest bin, so every band reads a power, not a density. */
+static void spec_bands(spec_t *sp, double rate) {
+    double half = sqrt(pow(1000.0, 1.0 / (EQE_NSPEC - 1)));
+    double binhz = rate / SPEC_N;
+    for (int b = 0; b < EQE_NSPEC; b++) {
+        double f = eqe_spec_hz(b), flo = f / half, fhi = f * half;
+        sp->scale[b] = 1.0;
+        if (f >= 0.5 * rate) {
+            sp->lo[b] = 1;
+            sp->hi[b] = 0;
+            sp->scale[b] = 0.0;
+            continue;
+        }
+        if (fhi > 0.5 * rate) fhi = 0.5 * rate;
+        int lo = (int)ceil(flo / binhz), hi = (int)floor(fhi / binhz);
+        if (lo < 1) lo = 1;
+        if (hi > SPEC_M - 1) hi = SPEC_M - 1;
+        if (lo > hi) {
+            int k = (int)floor(f / binhz + 0.5);
+            if (k < 1) k = 1;
+            if (k > SPEC_M - 1) k = SPEC_M - 1;
+            lo = hi = k;
+            sp->scale[b] = (fhi - flo) / binhz;
+        }
+        sp->lo[b] = lo;
+        sp->hi[b] = hi;
+    }
+    sp->rate = rate;
+}
+
+/* One analysis of the newest SPEC_N output samples: a Hann window, the real FFT done as a
+ * SPEC_M-point complex FFT, band powers in 0.01 dBFS (a full-scale sine reads -3.01 dB, as the
+ * level meter does). */
+static void spec_analyse(spec_t *sp, double rate, int64_t now) {
+    if (sp->rate != rate) spec_bands(sp, rate);
+    for (int m = 0; m < SPEC_M; m++) {
+        int i0 = (sp->pos + 2 * m) & (SPEC_N - 1), i1 = (i0 + 1) & (SPEC_N - 1);
+        int r = sp->rev[m];
+        sp->re[r] = (double)sp->ring[i0] * sp->win[2 * m];
+        sp->im[r] = (double)sp->ring[i1] * sp->win[2 * m + 1];
+    }
+    for (int len = 2; len <= SPEC_M; len <<= 1) {
+        int half = len >> 1, tstep = SPEC_N / len;
+        for (int s = 0; s < SPEC_M; s += len) {
+            for (int j = 0; j < half; j++) {
+                double wr = sp->twr[j * tstep], wi = sp->twi[j * tstep];
+                int a = s + j, b = a + half;
+                double tr = sp->re[b] * wr - sp->im[b] * wi;
+                double ti = sp->re[b] * wi + sp->im[b] * wr;
+                sp->re[b] = sp->re[a] - tr;
+                sp->im[b] = sp->im[a] - ti;
+                sp->re[a] += tr;
+                sp->im[a] += ti;
+            }
+        }
+    }
+    /* The real signal's bin k: X[k] = E[k] + W^k O[k], with E = (Z[k] + conj Z[M-k]) / 2 and
+       O = (Z[k] - conj Z[M-k]) / 2i. Only the bins the bands use are computed. Power: one-sided
+       Parseval with the window's energy, so a band holding a whole sine reads its mean square. */
+    double norm = 2.0 / ((double)SPEC_N * sp->winsum2);
+    for (int b = 0; b < EQE_NSPEC; b++) {
+        if (sp->scale[b] == 0.0) {
+            sp->lvl[b] = EQE_RESP_NONE;
+            continue;
+        }
+        double sum = 0.0;
+        for (int k = sp->lo[b]; k <= sp->hi[b]; k++) {
+            double zr = sp->re[k], zi = sp->im[k];
+            double cr = sp->re[SPEC_M - k], ci = -sp->im[SPEC_M - k];
+            double er = 0.5 * (zr + cr), ei = 0.5 * (zi + ci);
+            double orr = 0.5 * (zi - ci), oi = -0.5 * (zr - cr);
+            double wr = sp->twr[k], wi = sp->twi[k];
+            double xr = er + wr * orr - wi * oi, xi = ei + wr * oi + wi * orr;
+            sum += xr * xr + xi * xi;
+        }
+        double ms = sum * sp->scale[b] * norm;
+        sp->lvl[b] = ms > 1e-12 ? (int32_t)lrint(1000.0 * log10(ms)) : -12000;
+    }
+    sp->seq++;
+    sp->at_ns = now;
+    sp->fresh = 0;
+}
+
+/* EQE_PARAM_SPECTRUM: [0] analyses so far, [1] age of the newest in ms (-1: none yet), [2]
+ * EQE_NSPEC, [3] sample rate, [4..] band levels in 0.01 dBFS at eqe_spec_hz() (EQE_RESP_NONE:
+ * nothing yet, or above Nyquist). Each read keeps the analysis running for SPEC_KEEP_NS. */
+static void spec_read(eqe_ctx *c, int32_t *v) {
+    int64_t now = now_ns();
+    c->spec_wanted_ns = now;
+    if (c->spec == NULL) c->spec = spec_new();
+    spec_t *sp = c->spec;
+    int have = sp != NULL && sp->seq > 0;
+    v[0] = sp ? (int32_t)sp->seq : 0;
+    v[1] = have ? (int32_t)((now - sp->at_ns) / 1000000LL) : -1;
+    v[2] = EQE_NSPEC;
+    v[3] = (int32_t)c->rate;
+    for (int b = 0; b < EQE_NSPEC; b++) v[4 + b] = have ? sp->lvl[b] : EQE_RESP_NONE;
+}
+
+/* EQE_PARAM_LEVEL: the last buffer's output: [0] buffers so far, [1] ms since it was processed
+ * (-1: none yet), [2] peak 0..32768, [3] average (RMS) in 0.01 dBFS, [4] frames, [5] rate. */
+static int32_t rms_cdb(uint64_t ss, uint64_t frames);
+static void level_read(eqe_ctx *c, int32_t *v) {
+    v[0] = (int32_t)c->blk_seq;
+    v[1] = c->blk_ns ? (int32_t)((now_ns() - c->blk_ns) / 1000000LL) : -1;
+    v[2] = c->blk_peak;
+    v[3] = rms_cdb(c->blk_ss, c->blk_frames);
+    v[4] = (int32_t)c->blk_frames;
+    v[5] = (int32_t)c->rate;
+}
+
 static int32_t eqe_process(effect_handle_t self, audio_buffer_t *in, audio_buffer_t *out) {
     eqe_ctx *c = ctx_of(self);
     if (c == NULL) return -EINVAL;
@@ -595,10 +919,18 @@ static int32_t eqe_process(effect_handle_t self, audio_buffer_t *in, audio_buffe
     int64_t t0 = now_ns();
     /* Audio resumed after the output went idle: start clean, so nothing from before the pause
      * (the look-ahead delay, filter memory) comes out first. */
-    if (c->last_call_ns != 0 && t0 - c->last_call_ns > 500000000LL) {
+    int gap = c->last_call_ns != 0 && t0 - c->last_call_ns > 500000000LL;
+    if (gap) {
         reset_states(c);
         reset_guard(c);
     }
+    /* the live view runs while the app reads it; it starts again from empty after a pause */
+    spec_t *sp = c->spec != NULL && t0 - c->spec_wanted_ns < SPEC_KEEP_NS ? c->spec : NULL;
+    if (sp != NULL && (gap || !c->spec_running)) {
+        sp->filled = 0;
+        sp->fresh = 0;
+    }
+    c->spec_running = sp != NULL;
 
     int supported = c->config.inputCfg.format == AUDIO_FORMAT_PCM_16_BIT &&
                     c->config.inputCfg.channels == AUDIO_CHANNEL_OUT_STEREO && c->rate > 0.0;
@@ -618,10 +950,12 @@ static int32_t eqe_process(effect_handle_t self, audio_buffer_t *in, audio_buffe
             }
         }
     } else if (frames > 0) {
-        process_frames(c, in->s16, out->s16, frames, accumulate);
+        process_frames(c, in->s16, out->s16, frames, accumulate, sp);
+        if (sp != NULL && sp->filled >= SPEC_N && sp->fresh >= SPEC_M) spec_analyse(sp, c->rate, t0);
     }
 
     int64_t t1 = now_ns();
+    c->blk_ns = t1;
     int64_t dt = t1 - t0;
     if (dt < 0) dt = 0;
     if (dt > 0x7fffffff) dt = 0x7fffffff;
@@ -711,10 +1045,11 @@ static int32_t reply_int(uint32_t *replySize, void *pReply, int32_t v) {
 
 static void log_settings(eqe_ctx *c, const char *what) {
     const eqe_settings *s = &c->set;
-    LOGI("%s: eq %s, preamp %d, guard %d, bands %d %d %d %d %d %d %d %d %d %d (0.01 dB), delay L %d R %d us", what,
-         s->eq_on ? "on" : "off", s->preamp_cdb, s->guard_on, s->band_cdb[0], s->band_cdb[1], s->band_cdb[2],
+    LOGI("%s: eq %s, preamp %d, guard %d, bands %d %d %d %d %d %d %d %d %d %d (0.01 dB), ends %s/%s, delay L %d R %d us",
+         what, s->eq_on ? "on" : "off", s->preamp_cdb, s->guard_on, s->band_cdb[0], s->band_cdb[1], s->band_cdb[2],
          s->band_cdb[3], s->band_cdb[4], s->band_cdb[5], s->band_cdb[6], s->band_cdb[7], s->band_cdb[8],
-         s->band_cdb[9], s->delay_us[0], s->delay_us[1]);
+         s->band_cdb[9], (s->ends & EQE_ENDS_LOW) ? "shelf" : "peak", (s->ends & EQE_ENDS_HIGH) ? "shelf" : "peak",
+         s->delay_us[0], s->delay_us[1]);
 }
 
 static int32_t eqe_command(effect_handle_t self, uint32_t cmd, uint32_t cmdSize, void *pCmd,
@@ -785,9 +1120,16 @@ static int32_t eqe_command(effect_handle_t self, uint32_t cmd, uint32_t cmdSize,
             return reply_int(replySize, pReply, -EINVAL);
         int32_t id;
         memcpy(&id, p->data, sizeof(id));
-        if (id == EQE_PARAM_SETTINGS && p->vsize == sizeof(eqe_settings)) {
+        if (id == EQE_PARAM_SETTINGS && (p->vsize == sizeof(eqe_settings) || p->vsize == EQE_SET1_BYTES)) {
             eqe_settings s;
-            memcpy(&s, p->data + sizeof(int32_t), sizeof(s));
+            memset(&s, 0, sizeof(s));
+            memcpy(&s, p->data + sizeof(int32_t), p->vsize);
+            if (p->vsize == EQE_SET1_BYTES) {
+                /* an app from before 0.6.6: layout 1, both end bands peaks */
+                if (s.layout != 1) return reply_int(replySize, pReply, -EINVAL);
+                s.layout = 2;
+                s.ends = 0;
+            }
             if (!settings_valid(&s)) return reply_int(replySize, pReply, -EINVAL);
             int first = c->set.layout == 0;
             c->set = s;
@@ -847,6 +1189,14 @@ static int32_t eqe_command(effect_handle_t self, uint32_t cmd, uint32_t cmdSize,
             int32_t v[8];
             if (room < sizeof(v)) r->status = -EINVAL;
             else { vhq_status(v); memcpy(value, v, sizeof(v)); vsize = sizeof(v); }
+        } else if (id == EQE_PARAM_SPECTRUM) {
+            int32_t v[4 + EQE_NSPEC];
+            if (room < sizeof(v)) r->status = -EINVAL;
+            else { spec_read(c, v); memcpy(value, v, sizeof(v)); vsize = sizeof(v); }
+        } else if (id == EQE_PARAM_LEVEL) {
+            int32_t v[6];
+            if (room < sizeof(v)) r->status = -EINVAL;
+            else { level_read(c, v); memcpy(value, v, sizeof(v)); vsize = sizeof(v); }
         } else if (id == EQE_PARAM_GAINS) {
             int32_t v[EQE_NB];
             if (room < sizeof(v)) r->status = -EINVAL;
@@ -958,7 +1308,7 @@ static int32_t lib_create(const effect_uuid_t *uuid, int32_t sessionId, int32_t 
     if (c->rng == 0) c->rng = 1;
     reset_guard(c);
     *pHandle = (effect_handle_t)c;
-    LOGI("created (session %d, io %d), library 0.5.0", sessionId, ioId);
+    LOGI("created (session %d, io %d), filter version %x", sessionId, ioId, EQE_LIB_VERSION);
     return 0;
 }
 
@@ -968,6 +1318,7 @@ static int32_t lib_release(effect_handle_t handle) {
     LOGI("released after %u buffers", c->calls);
     c->magic = 0;
     c->enabled = 0;
+    free(c->spec);
     free(c);
     return 0;
 }

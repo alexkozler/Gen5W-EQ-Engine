@@ -203,6 +203,8 @@ final class Ui {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setMinimumHeight(dp(c, 56));
+        // room between rows whose text wraps to several lines
+        row.setPadding(0, dp(c, 6), 0, dp(c, 6));
         LinearLayout texts = new LinearLayout(c);
         texts.setOrientation(LinearLayout.VERTICAL);
         texts.addView(text(c, title, 18, ON_SURFACE, false));
