@@ -2,9 +2,10 @@
 
 > [!WARNING]
 > **Mostly written by AI. Use at your own risk.** The code, the measurements and this README were
-> mostly written by an AI assistant. A person directed the work and tested it on one car. Tests on
-> a PC and on that car have not shown problems, but this software runs inside Android's audio
-> server on your head unit, and you are responsible for anything you install on your car.
+> mostly written by an AI assistant. A person directed the work and tested it on one car, and one
+> other owner has reported theirs. Tests on a PC and on those cars have not shown problems, but
+> this software runs inside Android's audio server on your head unit, and you are responsible for
+> anything you install on your car.
 
 EQ Engine is a [NEMESIS](https://github.com/xwtk/hmg_nemesis) package for the Gen5W head unit
 (Android 4.4), which is fitted to Hyundai, Kia and Genesis cars. It works on Android's main audio
@@ -27,18 +28,23 @@ output and does two separate things:
 It is a plain NEMESIS package. It is **not** an HMG-API mod and does not need HMG-API (it works
 alongside it).
 
-**Current version: 0.6.6**, tested on the car below on 2026-11-20.
+**Current version: 0.6.6**, tested on the two cars below.
 
 ## Verified vehicles
 
 | Car | Region | Audio system | Head unit software | Tested with |
 |---|---|---|---|---|
 | 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 (`NEEV.USA.0000.V015.012.260507`) | 0.6.6 (2026-11-20) |
+| 2024 Hyundai Ioniq 6 Preferred AWD | Canada | Bose | 260903 (`CEEV.CAN.0000.V016.010.260903`) | 0.6.6 (2026-11-21, by its owner: [car report](https://github.com/alexkozler/Gen5W-EQ-Engine/issues/1)) |
+
+The Ioniq 6 owner's car report covers nine car starts after the install. The EQ, 48 kHz output
+and EQ Engine's converter tables all worked, and the link was measured at 48,003 frames a
+second. Its audio driver and audio policy file are the same as the Ioniq 5's.
 
 No other car or software version has been tested, including Kia and Genesis cars with the same
-head unit. Other cars may have a different amplifier (for example Bose), audio driver or audio
-settings. The package is marked for US Ioniq 5 software (`os="NEEV.USA.*"`); on other software
-NEMESIS shows it as a partial match. If you try it on another car, please send a
+head unit. Other cars may have a different amplifier, audio driver or audio settings. The
+package is marked for US Ioniq 5 software (`os="NEEV.USA.*"`); on other software NEMESIS shows it
+as a partial match. If you try it on another car, please send a
 [car report](#reporting-a-problem).
 
 ## What it does
@@ -55,7 +61,7 @@ link behind it to 48 kHz while the car runs:
   the kernel) all say 48,000, and checked again whenever music starts. Otherwise it goes back to
   44.1 kHz.
 
-On the tested car the link ran at 47,995-48,004 frames a second, at the right pitch, with no
+On the tested cars the link ran at 47,995-48,004 frames a second, at the right pitch, with no
 clicks. [How the switch works](#the-48-khz-switch).
 
 ### The EQ
@@ -240,7 +246,7 @@ the master switch). Status > Output should say "48 kHz, unconverted" while Andro
   service in the same process as the audio server. Audio restarts (Settings > Restart Android
   audio, a converter change, the driver watch) happen only when you ask: do them parked, never
   while reversing.
-- **One car tested, mostly written by AI.** See the warning above and
+- **Two cars tested, mostly written by AI.** See the warning above and
   [Verified vehicles](#verified-vehicles).
 
 ## Install
