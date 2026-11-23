@@ -356,6 +356,12 @@ With the EQ off, CarPlay's music is passed through untouched too.
   from [Releases](https://github.com/alexkozler/Gen5W-EQ-Engine/releases), or build them
   ([Building from source](#building-from-source)).
 - Use one or two blank USB sticks formatted exFAT or FAT32.
+- **Other audio add-ons:** EQ Engine never undoes another package's changes. If a package or mod
+  has changed Android's audio effects list (`/system/etc/audio_effects.conf`, or added
+  `/vendor/etc/audio_effects.conf`), EQ Engine does not start at all (Android Auto, Bluetooth
+  audio and CarPlay alike), and its Status page says why. If one has laid its own file over the
+  CarPlay app's library, only EQ on CarPlay stays off, and the app tells you. HMG-API and its
+  wireless package are fine: the tested car runs them.
 - Do this **parked**, never while reversing. The install itself restarts nothing, but you restart
   the head unit afterwards, and Android's audio server, which also runs the rear camera service,
   starts again with it.
