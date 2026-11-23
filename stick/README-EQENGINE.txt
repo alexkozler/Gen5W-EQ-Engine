@@ -83,8 +83,11 @@ Pages (rail on the left)
 - Settings:
   - Equalizer, Clip guard.
   - 48 kHz output (on by default), for what plays through Android (Android
-    Auto, Bluetooth audio). At every car start and after every audio restart
-    the main output switches to 48 kHz: while nothing plays if it can (a
+    Auto, Bluetooth audio). On a stock car Android converts Android Auto's
+    48 kHz music to 44.1 kHz with its simplest converter (duller treble and
+    false tones; see Converter below); at 48 kHz it is not converted at all.
+    At every car start and after every audio restart the main output
+    switches to 48 kHz: while nothing plays if it can (a
     silent track of EQ Engine's keeps the link running for a few seconds, and
     the music then starts at 48 kHz with no gap), otherwise a few seconds
     after the music starts (a short gap in the sound). No audio restart. It
@@ -111,10 +114,15 @@ Pages (rail on the left)
   only), a 120 s audio trace, and what EQ on CarPlay is doing.
 
 Converter (Settings: Stock, High, Very high; Very high is the default)
-It converts the navigation and voice prompts (16 kHz up to 44.1 kHz), Android
-Auto's music whenever the output is at 44.1 kHz, and anything not at 48 kHz.
-It is for what plays through Android only: CarPlay is never converted.
-- Stock = Android's default converter.
+It is used for Bluetooth audio (44.1 kHz up to 48 kHz) and for Android Auto's
+music whenever the output is at 44.1 kHz. In Android 4.4's code it applies
+only between 44.1 and 48 kHz: every other rate (navigation and voice prompts,
+for example) gets Android's linear converter whatever this choice is, as on a
+stock car. CarPlay is never converted.
+- Stock = Android's default converter, linear interpolation, the one a stock
+  car uses. It has no low-pass filter: from 48 to 44.1 kHz the treble is
+  3.3 dB down at 16 kHz and 5.3 dB at 20 kHz, and each tone also comes out
+  3.9 kHz lower (23 dB below a 10 kHz tone, 6 dB below a 20 kHz one).
 - High = Android's high-quality converter: at 44.1 kHz, the treble is 3.5 dB
   down at 16 kHz and 17 dB down at 20 kHz.
 - Very high = Android's very high quality converter with EQ Engine's own

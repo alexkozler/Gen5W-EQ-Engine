@@ -16,6 +16,12 @@ g++ -std=gnu++11 -O1 -g $SAN -I. -I$AOSP -Wno-unused-parameter \
     $AOSP/AudioResamplerSinc.cpp test_vhq.cpp -ldl -o $OUT/test_vhq
 LD_LIBRARY_PATH=$OUT $OUT/test_vhq all
 LD_LIBRARY_PATH=$OUT/nolib $OUT/test_vhq fallback 2>&1 | grep -v "^E/x"
+# Android's linear converter (a stock car's): its class and portable code, extracted unchanged
+sed -n '/^class AudioResamplerOrder1/,/^};/p' $AOSP/AudioResampler.cpp > $OUT/order1.inc
+awk '/^void AudioResamplerOrder1::resample\(/ {p = 1} /^} \/\/ namespace android/ {p = 0} p' \
+    $AOSP/AudioResampler.cpp >> $OUT/order1.inc
+g++ -std=gnu++11 -O1 -g $SAN -I. -I$OUT -Wno-unused-parameter test_linear.cpp -o $OUT/test_linear
+$OUT/test_linear
 # CPU, without sanitizers
 gcc -std=c11 -O2 -fPIC -shared -I.. ../vhq.c -o $OUT/nolib/../libaudio-resampler-o2.so -Wl,-soname,libaudio-resampler.so
 mkdir -p $OUT/o2 && cp $OUT/libaudio-resampler-o2.so $OUT/o2/libaudio-resampler.so

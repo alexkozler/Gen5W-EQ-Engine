@@ -11,10 +11,12 @@
 EQ Engine is a [NEMESIS](https://github.com/xwtk/hmg_nemesis) package for the Gen5W head unit
 (Android 4.4), which is fitted to Hyundai, Kia and Genesis cars. It does two separate things:
 
-1. **Sound quality, with no EQ needed.** It runs Android's main audio output at 48 kHz instead of
-   the factory 44.1 kHz, so Android Auto's 48 kHz music reaches the audio hardware without being
-   resampled. What still has to be resampled (Bluetooth audio, voice prompts) goes through a better
-   converter. CarPlay plays at the rate the phone sends (44.1 or 48 kHz) and is never resampled.
+1. **Sound quality, with no EQ needed.** On a stock car Android resamples every sample of Android
+   Auto's 48 kHz music to 44.1 kHz with its simplest converter, which dulls the treble and adds
+   false tones ([what goes wrong](#48-khz-output-on-by-default)). EQ Engine runs Android's main
+   output at 48 kHz instead, so Android Auto's music reaches the audio hardware without being
+   resampled, and Bluetooth audio, which still has to be, goes through a better converter. CarPlay
+   plays at the rate the phone sends (44.1 or 48 kHz) and is never resampled.
 2. **Tone and imaging, if you want them**, on Android Auto, CarPlay and Bluetooth audio: an
    accurate 10-band EQ whose end bands can be shelves, or a parametric EQ with up to 20 bands, a
    preamp, a clip guard, a listening-position delay, and a live view of the music behind the EQ
@@ -49,10 +51,20 @@ software NEMESIS shows it as a partial match. If you try it on another car, plea
 
 ### 48 kHz output (on by default)
 
-Android Auto sends its music at 48,000 samples a second, and the factory software runs Android's
-main output at 44,100. On a stock car every sample is resampled, and Android 4.4's converters lose
-treble doing it ([measurements](#the-converter)). EQ Engine switches the output and the hardware
-link behind it to 48 kHz while the car runs:
+**On a stock car**, Android Auto sends its music at 48,000 samples a second and the factory
+software runs Android's main output at 44,100, so Android converts every sample. The factory
+software does not choose a converter, so Android 4.4 uses its simplest one, linear interpolation,
+which has no low-pass filter. Measured with Android 4.4's own code on a PC:
+- the treble drops: -1.3 dB at 10 kHz, -3.3 dB at 16 kHz, -5.3 dB at 20 kHz;
+- every treble tone gets a false tone 3.9 kHz below it, unrelated to the music's harmonics: 23 dB
+  below a 10 kHz tone (at 6.1 kHz), 12 dB below a 16 kHz tone (at 12.1 kHz) and 6 dB below a
+  20 kHz tone (at 16.1 kHz).
+
+Treble in music is usually much quieter than the midrange, so the false tones are too; how audible
+they are has not been measured. [All the converters compared](#the-converter).
+
+**With EQ Engine**, the output and the hardware link behind it run at 48 kHz while the car runs,
+so Android Auto's music is not converted at all:
 - with Android's own run-time setting: nothing in `/system` changes and the audio server is not
   restarted for it;
 - accepted only if Android, the audio driver and the rate the hardware really takes (counted by
@@ -146,7 +158,7 @@ default; a seat offset adjusts it). Volumes stay with the car's balance and fade
 | Android Auto music (wired or wireless) | yes | 48 kHz, not converted |
 | CarPlay music (wired or wireless) | yes | 44.1 or 48 kHz (as the phone sends it), not converted |
 | Bluetooth audio (for example an iPhone) | yes | 44.1 kHz, converted up to 48 kHz (Very high) |
-| Android Auto's directions voice, the car's navigation prompts | no (Android's second output) | voice converted with the converter choice |
+| Android Auto's directions voice, the car's navigation prompts | no (Android's second output) | converted as on a stock car (the converter choice does not apply) |
 | Siri, phone calls (hands-free, CarPlay calls) | no | not touched |
 | FM and SiriusXM radio | no (most likely not through Android) | not touched |
 
@@ -272,27 +284,42 @@ EQ Engine keeps out of their way:
 
 ## The converter
 
-The converter choice (Settings) applies to what Android still converts:
+The converter choice (Settings) applies to what Android converts between 44.1 and 48 kHz:
 - Bluetooth audio while the output is at 48 kHz;
-- voice and navigation prompts;
-- Android Auto's music whenever the output is at 44.1 kHz.
+- Android Auto's music whenever the output is at 44.1 kHz (on a stock car, always).
 
-CarPlay is never converted.
+In Android 4.4's code the choice applies only between those two rates. Everything else Android
+converts, such as voice and navigation prompts at 16 or 22.05 kHz, always gets its linear
+converter, as on a stock car. CarPlay is never converted.
 
-Measured with Android 4.4's own converter code on a PC, relative to each converter's gain:
+Measured with Android 4.4's own converter code on a PC, relative to each converter's gain.
+"False tones and noise" is everything in the output except the tone itself, relative to the tone.
 
-| Converter | 48 → 44.1 kHz, at 16 / 20 kHz | 44.1 → 48 kHz, at 16 / 20 kHz | 16 → 44.1 kHz, at 7 kHz |
-|---|---|---|---|
-| Stock (Android's default) | -3.3 / -5.3 dB (calculated) | not measured | not measured |
-| High | -3.5 / -16.7 dB | -1.2 / -10.0 dB | -7.45 dB |
-| **Very high** (default) | 0.0 / 0.0 dB | 0.0 / -3.2 dB | -0.28 dB |
+48 → 44.1 kHz (Android Auto's music at a 44.1 kHz output):
 
-- **Very high** is Android's very-high-quality converter with EQ Engine's own filter tables (a
-  Kaiser-windowed sinc, 40 taps a side, 512 phases).
-- **Noise and aliasing:** -87 dB or lower up to 20 kHz, against about -72 dB (48 to 44.1) and
-  -30 dB (44.1 to 48) with High near 19-20 kHz.
+| Converter | Level at 10 / 16 / 20 kHz | False tones and noise, 10 / 20 kHz tone |
+|---|---|---|
+| Stock (Android's default: linear interpolation) | -1.3 / -3.3 / -5.3 dB | -22 / -6 dB |
+| High | 0.0 / -3.5 / -16.7 dB | -89 / -74 dB |
+| **Very high** (EQ Engine's default) | 0.0 / 0.0 / 0.0 dB | -91 / -92 dB |
+
+44.1 → 48 kHz (Bluetooth audio at EQ Engine's 48 kHz output; a stock car never does this):
+
+| Converter | Level at 10 / 16 / 20 kHz | False tones and noise, 10 / 20 kHz tone |
+|---|---|---|
+| Stock | -1.5 / -3.9 / -6.3 dB | -20 / -3 dB |
+| High | 0.0 / -1.2 / -10.0 dB | -87 / -30 dB |
+| **Very high** | 0.0 / 0.0 / -3.2 dB | -91 / -87 dB |
+
+- **Stock** has no low-pass filter: each tone also comes out 3.9 kHz away (lower at 48 → 44.1,
+  higher at 44.1 → 48). **High** has one but rolls off above about 12 kHz. **Very high** is
+  Android's very-high-quality converter with EQ Engine's own filter tables (a Kaiser-windowed
+  sinc, 40 taps a side, 512 phases).
+- **Prompts** (linear, whatever the choice): a 16 kHz voice comes out 2.9 dB down at 5 kHz, with a
+  false tone at 11 kHz 14 dB below it.
 - **Headroom:** the tables have -1.6 dB of gain, so the conversion cannot overflow. In the car's
-  logs, High let 588-1664 clipped samples through per 30 s of music; Very high let none.
+  logs, High let 588-1664 clipped samples through per 30 s of music; Very high let none. Stock
+  cannot overshoot (linear interpolation stays between neighbouring samples).
 - **Cost:** about 1.6% more of one core than High, on the car.
 - **Fallbacks:** if the tables fail their checksum, Android uses High, bit for bit. Each
   unexpected audio server restart steps the choice down one level and keeps it.
@@ -320,8 +347,7 @@ With the EQ off, CarPlay's music is passed through untouched too.
 ## Upsides and downsides
 
 **Upsides**
-- No resampling of Android Auto's or CarPlay's music, and better conversion for what is still
-  converted.
+- No resampling of Android Auto's or CarPlay's music, and better conversion for Bluetooth audio.
 - The same EQ on Android Auto, CarPlay and Bluetooth audio: accurate, and bit-exact when it is off.
 - Light on the head unit, and nothing written to `/system`.
 - The car's own volume, balance, fader and tone controls keep working.
@@ -514,7 +540,7 @@ named with the version from `pkg/NEMESIS.data`; the build stops if any other fil
 ```sh
 sh build.sh                                   # native code, app, package and the stick zips
 for s in dash bash mksh; do bash tests/boot/run.sh $s; bash tests/act/run.sh $s; done
-bash vhq/host/run.sh 40 9                     # converter tables against Android's converter code
+bash vhq/host/run.sh 40 9                     # converter tables against Android's converter code, and Android's stock linear converter
 gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I tests -I native \
     -o tests/host_test tests/host_test.c -lm -ldl -lpthread && ./tests/host_test   # after vhq/host
 sh native/cpwtest/run.sh                      # EQ on CarPlay against stand-ins of the CarPlay libraries
@@ -537,7 +563,7 @@ bash and mksh, with printf missing as on the car.
 |---|---|
 | `native/eqengine.c` | the audio filter, loaded by Android's audio server (and, without its audio-effect parts, by EQ on CarPlay) |
 | `native/cpwatch.c`, `native/cpeq.h` | EQ on CarPlay: the library laid over the CarPlay app's JNI library, and the files it shares with the app |
-| `vhq/` | EQ Engine's converter tables: the design script, the generated tables and their tests |
+| `vhq/` | EQ Engine's converter tables: the design script, the generated tables and their tests, and the measurement of Android's stock linear converter |
 | `native/eqe_lab.c` | root helper: the links' real rate, Android's run-time settings, symbol tables for the report, EQ on CarPlay's check before use |
 | `native/drvwatch.c`, `native/gen_tramp.py` | a driver watch for troubleshooting (not in the app's screens since 0.7.5) |
 | `native/aosp44/`, `third_party/aosp-af/` | Android 4.4.2 headers and audio code, for building and testing |
