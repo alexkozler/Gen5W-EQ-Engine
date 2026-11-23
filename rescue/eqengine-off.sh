@@ -48,8 +48,9 @@ mounted() {
     else
         echo "overlay removed (or was not there)"
     fi
-    # Lab tests (the driver watch, or 0.6.0's 48 kHz policy copy), if one was on
-    for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf; do
+    # Lab tests (the driver watch, 0.6.0's 48 kHz policy copy, or the CarPlay watch laid over the
+    # CarPlay app's JNI library), if one was on
+    for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf /system/lib/libCarPlayAndroid.so; do
         i=0
         while [ $i -lt 5 ]; do
             m=0
@@ -65,6 +66,15 @@ mounted() {
         [ $m = 1 ] && echo "Lab test $t still mounted: it goes away when the head unit restarts"
     done
     rm -f $D/state/lab_active
+    # the CarPlay watch's choice for later car starts (0.6.10), and 0.6.7's setting for the CarPlay
+    # app's next start, if either is still there
+    if [ -f $D/state/cpw_want ]; then
+        rm -f $D/state/cpw_want
+        echo "CarPlay watch turned off for later car starts"
+    fi
+    case "$(getprop wrap.com.daudio.app.dipo)" in
+        *eqe_cpwatch.so*) setprop wrap.com.daudio.app.dipo ""; echo "CarPlay watch setting cleared" ;;
+    esac
     # the 48 kHz keeper puts 44.1 kHz back and stops once it sees "disabled"; then it is stopped
     if [ -f $D/state/keep.pid ]; then
         read kp < $D/state/keep.pid

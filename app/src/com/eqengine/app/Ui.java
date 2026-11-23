@@ -218,6 +218,95 @@ final class Ui {
         return row;
     }
 
+    /** Options in one outlined pill, the chosen one filled with the tonal colour (the EQ page's Easy | Expert). */
+    static final class Seg extends LinearLayout {
+        interface Listener {
+            void onPick(int i);
+        }
+
+        private final TextView[] opts;
+
+        Seg(Context c, String[] labels, final Listener l) {
+            super(c);
+            setOrientation(HORIZONTAL);
+            setBackground(outlined(Color.TRANSPARENT, OUTLINE, dp(c, 1.5f), dp(c, 23)));
+            setPadding(dp(c, 2), dp(c, 2), dp(c, 2), dp(c, 2));
+            opts = new TextView[labels.length];
+            float r = dp(c, 21);
+            for (int i = 0; i < labels.length; i++) {
+                TextView t = text(c, labels[i], 18, ON_SURFACE, true);
+                t.setGravity(Gravity.CENTER);
+                t.setPadding(dp(c, 20), 0, dp(c, 20), 0);
+                t.setBackground(states(round(Color.TRANSPARENT, r), round(SURFACE_HI, r), round(PRIMARY_CONTAINER, r), null));
+                t.setClickable(true);
+                final int k = i;
+                t.setOnClickListener(new View.OnClickListener() {
+                    public void onClick(View v) {
+                        l.onPick(k);
+                    }
+                });
+                opts[i] = t;
+                addView(t, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.MATCH_PARENT));
+            }
+        }
+
+        void select(int i) {
+            for (int k = 0; k < opts.length; k++) {
+                opts[k].setSelected(k == i);
+                opts[k].setTextColor(k == i ? ON_PRIMARY_CONTAINER : ON_SURFACE);
+            }
+        }
+    }
+
+    /** A trash can, drawn (no image files): the Expert page's Delete band. */
+    static final class TrashIcon extends android.graphics.drawable.Drawable {
+        private final android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+
+        TrashIcon(int color, float strokePx) {
+            p.setColor(color);
+            p.setStyle(android.graphics.Paint.Style.STROKE);
+            p.setStrokeWidth(strokePx);
+            p.setStrokeCap(android.graphics.Paint.Cap.ROUND);
+            p.setStrokeJoin(android.graphics.Paint.Join.ROUND);
+        }
+
+        @Override
+        public void draw(android.graphics.Canvas c) {
+            android.graphics.Rect b = getBounds();
+            float s = b.height(), cx = b.exactCenterX(), cy = b.exactCenterY();
+            c.drawLine(cx - s * 0.42f, cy - s * 0.30f, cx + s * 0.42f, cy - s * 0.30f, p);
+            android.graphics.Path h = new android.graphics.Path();
+            h.moveTo(cx - s * 0.14f, cy - s * 0.30f);
+            h.lineTo(cx - s * 0.14f, cy - s * 0.46f);
+            h.lineTo(cx + s * 0.14f, cy - s * 0.46f);
+            h.lineTo(cx + s * 0.14f, cy - s * 0.30f);
+            c.drawPath(h, p);
+            android.graphics.Path body = new android.graphics.Path();
+            body.moveTo(cx - s * 0.32f, cy - s * 0.22f);
+            body.lineTo(cx - s * 0.26f, cy + s * 0.46f);
+            body.lineTo(cx + s * 0.26f, cy + s * 0.46f);
+            body.lineTo(cx + s * 0.32f, cy - s * 0.22f);
+            c.drawPath(body, p);
+            c.drawLine(cx - s * 0.1f, cy - s * 0.1f, cx - s * 0.1f, cy + s * 0.32f, p);
+            c.drawLine(cx + s * 0.1f, cy - s * 0.1f, cx + s * 0.1f, cy + s * 0.32f, p);
+        }
+
+        @Override
+        public void setAlpha(int a) {
+            p.setAlpha(a);
+        }
+
+        @Override
+        public void setColorFilter(android.graphics.ColorFilter f) {
+            p.setColorFilter(f);
+        }
+
+        @Override
+        public int getOpacity() {
+            return android.graphics.PixelFormat.TRANSLUCENT;
+        }
+    }
+
     static View divider(Context c) {
         View v = new View(c);
         v.setBackgroundColor(OUTLINE);

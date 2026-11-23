@@ -6,6 +6,10 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Locale;
 
 /**
  * EQ settings and presets. Stored in /data/eqengine/settings (a folder the installer gives to
@@ -18,41 +22,46 @@ final class EqSettings {
     static final String[] LABELS = {"31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"};
     static final double[] CENTRES = {31.25, 62.5, 125, 250, 500, 1000, 2000, 4000, 8000, 16000};
     static final int BAND_MIN = -1200, BAND_MAX = 1200; // slider range, 0.01 dB
-    static final int PRE_MIN = -1800, PRE_MAX = 600;
+    // down to -24 dB, as far as the filter goes: the solved filters can boost up to about +22 dB
+    // (a 31 Hz shelf at +12 next to 63 Hz at -12, at 0 Hz), and Auto preamp must cover that
+    static final int PRE_MIN = -2400, PRE_MAX = 600;
     static final int STEP = 50;                         // 0.5 dB
     static final String SHARED_DIR = "/data/eqengine/settings";
 
-    // Genre presets in the spirit of car head units, in 0.01 dB for 31 Hz .. 16 kHz. Kept within
-    // +-6 dB; loading one also sets the preamp to minus its largest boost.
-    static final String[] BUILTIN_NAMES = {"Flat", "Rock", "Pop", "Jazz", "Classical", "EDM", "Hip-Hop", "Acoustic",
-            "Vocal", "Speech", "Bass boost", "Treble boost", "Loudness"};
-    static final int[][] BUILTIN = {
-            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-            {500, 400, 200, -100, -200, -100, 100, 300, 400, 400},
-            {-100, 100, 250, 300, 150, 0, -50, 50, 150, 200},
-            {300, 250, 100, 150, -100, -100, 0, 100, 200, 300},
-            {250, 200, 100, 0, 0, 0, 0, 50, 150, 250},
-            {600, 550, 300, 0, -150, -50, 50, 200, 400, 450},
-            {600, 500, 250, 100, -100, -100, 50, 0, 100, 200},
-            {250, 200, 100, 150, 200, 150, 200, 250, 200, 100},
-            {-200, -150, -50, 100, 250, 350, 300, 150, 0, -100},
-            {-600, -450, -200, 0, 200, 400, 400, 200, 0, -200},
-            {600, 500, 350, 150, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0, 0, 100, 300, 500, 600},
-            {600, 450, 200, 0, -100, 0, 0, 200, 350, 450},
-    };
+    // 0.6.11: no built-in genre presets (written without hearing them on the car); Flat stays,
+    // and four user slots that both modes share
     static final int USER_SLOTS = 4;
+
+    // Expert mode (0.6.11): up to NX bands of its own. Each band is int[4] {type, frequency in
+    // 0.01 Hz, gain in 0.01 dB (not for the low cut), width: peak = bandwidth in 0.001 octave,
+    // low cut = Q x 1000, shelves = unused}, as the filter's settings layout 3 has them.
+    static final int NX = 20;
+    static final int X_PEAK = 1, X_LOW_SHELF = 2, X_HIGH_SHELF = 3, X_LOW_CUT = 4;
+    static final String[] X_TYPES = {"", "Peak", "Low shelf", "High shelf", "Low cut"};
+    static final int X_FMIN = 2000, X_FMAX = 2000000;
+    static final int X_GAIN = 1500;
+    static final int X_BWMIN = 100, X_BWMAX = 4000, X_BW_DEFAULT = 1000;
+    static final int X_QMIN = 500, X_QMAX = 2000, X_Q_DEFAULT = 707;
+    /** The Easy page's end bands as shelves: their midpoints, in 0.01 Hz (eqengine.c). */
+    static final int LOW_SHELF_CHZ = 5000, HIGH_SHELF_CHZ = 1130000;
 
     boolean eqOn = true;
     int preamp = 0;
     boolean guard = true;
     int[] bands = new int[NB];
     boolean hq = true;
-    String preset = "Flat";       // name shown on the EQ page; "Custom" after a manual change
+    String preset = "Flat";       // name shown on the EQ page: Flat, User 1-4, or Custom after a change
     boolean detailedLog = false;  // troubleshooting log level; off again after every install or update
     int position = 0;             // listening position: -100 driver's seat .. 0 centre .. +100 passenger's seat
     int seatDelayUs = 1700;       // delay at a full seat offset (about 58 cm of path difference)
     boolean lowShelf, highShelf;  // 0.6.6: the 31 Hz / 16 kHz band as a shelf (one setting, not part of presets)
+    boolean expert;               // 0.6.11: Expert mode (xb) plays instead of the ten sliders
+    boolean expertSeen;           // the first switch to Expert (Copy Easy EQ or Start flat) is done
+    ArrayList<int[]> xb = new ArrayList<int[]>(); // Expert bands, in frequency order
+    String xPreset = "Flat";      // Expert's name on the EQ page (each mode keeps its own)
+    int xSel;                     // the selected Expert band
+    boolean cpEq = true;          // EQ on CarPlay (Settings; 0.7.4: on by default, one switch for the watch and its EQ)
+    String cpwAck = "";           // 0.7.4: the last state/cpw_failed the app has told the user about (its id)
     /** Loaded from settings another app version saved (or from none): detailed logging was reset. */
     boolean fromOtherVersion;
     static final int SEAT_DELAY_MIN = 500, SEAT_DELAY_MAX = 3000, SEAT_DELAY_STEP = 100;
@@ -71,7 +80,51 @@ final class EqSettings {
         s.seatDelayUs = seatDelayUs;
         s.lowShelf = lowShelf;
         s.highShelf = highShelf;
+        s.expert = expert;
+        s.expertSeen = expertSeen;
+        s.xb = copyBands(xb);
+        s.xSel = xSel;
+        s.xPreset = xPreset;
+        s.cpEq = cpEq;
+        s.cpwAck = cpwAck;
         return s;
+    }
+
+    static ArrayList<int[]> copyBands(ArrayList<int[]> from) {
+        ArrayList<int[]> out = new ArrayList<int[]>();
+        for (int[] b : from) out.add(b.clone());
+        return out;
+    }
+
+    /** The EQ itself (not the switches, the position or logging): what Undo steps back through. */
+    String eqKey() {
+        StringBuilder sb = new StringBuilder().append(expert ? 'x' : 'e').append(preamp).append('|').append(ends());
+        for (int v : bands) sb.append(',').append(v);
+        sb.append('|').append(xbText(xb));
+        return sb.toString();
+    }
+
+    /** Takes the EQ itself from o (Undo). */
+    void takeEq(EqSettings o) {
+        preamp = o.preamp;
+        bands = o.bands.clone();
+        lowShelf = o.lowShelf;
+        highShelf = o.highShelf;
+        expert = o.expert;
+        xb = copyBands(o.xb);
+        xSel = o.xSel;
+        preset = o.preset;
+        xPreset = o.xPreset;
+    }
+
+    /** The playing mode's name: Flat, User 1-4 or Custom. */
+    String name() {
+        return expert ? xPreset : preset;
+    }
+
+    void setName(String n) {
+        if (expert) xPreset = n;
+        else preset = n;
     }
 
     /** The filter's end-band types: 1 = 31 Hz shelf, 2 = 16 kHz shelf. */
@@ -79,20 +132,130 @@ final class EqSettings {
         return (lowShelf ? 1 : 0) | (highShelf ? 2 : 0);
     }
 
+    /** The selected Expert band, or null when there is none. */
+    int[] sel() {
+        if (xb.isEmpty()) return null;
+        xSel = clamp(xSel, 0, xb.size() - 1);
+        return xb.get(xSel);
+    }
+
+    /** A band's values put in range for its type (as the filter checks them). */
+    static int[] clampBand(int[] b) {
+        int[] o = b.clone();
+        o[0] = clamp(o[0], X_PEAK, X_LOW_CUT);
+        o[1] = clamp(o[1], X_FMIN, X_FMAX);
+        o[2] = o[0] == X_LOW_CUT ? 0 : clamp(o[2], -X_GAIN, X_GAIN);
+        if (o[0] == X_PEAK) o[3] = clamp(o[3], X_BWMIN, X_BWMAX);
+        else if (o[0] == X_LOW_CUT) o[3] = clamp(o[3], X_QMIN, X_QMAX);
+        else o[3] = 0;
+        return o;
+    }
+
+    /** Puts the Expert bands in frequency order, keeping the selected one selected. */
+    /** Band i's place by frequency (ties by their order), 0-based: its number on screen (0.7.4). */
+    int rankOf(int i) {
+        if (i < 0 || i >= xb.size()) return 0;
+        int r = 0, fi = xb.get(i)[1];
+        for (int j = 0; j < xb.size(); j++) {
+            int fj = xb.get(j)[1];
+            if (fj < fi || (fj == fi && j < i)) r++;
+        }
+        return r;
+    }
+
+    void sortBands() {
+        final int[] s0 = sel();
+        Collections.sort(xb, new Comparator<int[]>() {
+            public int compare(int[] a, int[] b) {
+                return a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0;
+            }
+        });
+        if (s0 != null) xSel = Math.max(0, xb.indexOf(s0));
+    }
+
     /**
-     * The engine's settings parameter, little-endian: layout 2 (int32[17], with the end-band
-     * types) for the 0.6.6 filter, layout 1 (int32[16]) for an older one still in the audio server.
+     * The Easy EQ as Expert bands with the same sound: the filter's solved gains (gains, 0.01 dB;
+     * the sliders themselves when the filter cannot tell) on the same filters, one-octave bells at
+     * the ten centres and the end bands' shelves. Gains past +-15 dB are set to +-15 (counted in
+     * clamped[0]).
      */
-    byte[] toParam(boolean layout2) {
-        int[] v = new int[layout2 ? 17 : 16];
-        v[0] = layout2 ? 2 : 1;
+    static ArrayList<int[]> fromEasy(EqSettings e, int[] gains, int[] clamped) {
+        ArrayList<int[]> out = new ArrayList<int[]>();
+        int n = 0;
+        for (int j = 0; j < NB; j++) {
+            boolean lo = j == 0 && e.lowShelf, hi = j == NB - 1 && e.highShelf;
+            int g = gains != null && gains.length == NB ? gains[j] : e.bands[j];
+            if (g > X_GAIN || g < -X_GAIN) n++;
+            out.add(clampBand(new int[] {lo ? X_LOW_SHELF : hi ? X_HIGH_SHELF : X_PEAK,
+                    lo ? LOW_SHELF_CHZ : hi ? HIGH_SHELF_CHZ : (int) Math.round(CENTRES[j] * 100), g, lo || hi ? 0 : X_BW_DEFAULT}));
+        }
+        if (clamped != null) clamped[0] = n;
+        return out;
+    }
+
+    /** "630 Hz", "1.10 kHz", "31.3 Hz", "11.3 kHz". */
+    static String hz(int centiHz) {
+        double f = centiHz / 100.0;
+        if (f >= 10000) return String.format(Locale.US, "%.1f kHz", f / 1000);
+        if (f >= 1000) return String.format(Locale.US, "%.2f kHz", f / 1000);
+        if (f >= 100) return String.format(Locale.US, "%.0f Hz", f);
+        return String.format(Locale.US, "%.1f Hz", f);
+    }
+
+    /** A frequency rounded to three significant figures, in 0.01 Hz (the -/+ steps). */
+    static int round3(double hz) {
+        double step = hz >= 10000 ? 100 : hz >= 1000 ? 10 : hz >= 100 ? 1 : 0.1;
+        return (int) Math.round(Math.round(hz / step) * step * 100);
+    }
+
+    static String xbText(ArrayList<int[]> list) {
+        StringBuilder sb = new StringBuilder();
+        for (int[] b : list) {
+            if (sb.length() > 0) sb.append(';');
+            sb.append(b[0]).append(':').append(b[1]).append(':').append(b[2]).append(':').append(b[3]);
+        }
+        return sb.toString();
+    }
+
+    static ArrayList<int[]> parseBands(String v) {
+        ArrayList<int[]> out = new ArrayList<int[]>();
+        if (v == null) return out;
+        for (String t : v.trim().split(";")) {
+            String[] f = t.trim().split(":");
+            if (f.length != 4) continue;
+            try {
+                int[] b = new int[4];
+                for (int i = 0; i < 4; i++) b[i] = Integer.parseInt(f[i].trim());
+                if (out.size() < NX) out.add(clampBand(b));
+            } catch (NumberFormatException ignored) {
+                // a damaged band is left out
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The engine's settings parameter, little-endian: layout 3 (int32[99]: layout 2, then the mode,
+     * the band count and 20 Expert bands) for 0.6.11's filter; layout 2 (int32[17], with the
+     * end-band types) for 0.6.6 .. 0.6.10's; layout 1 (int32[16]) for an older one still in the
+     * audio server. The older layouts carry the Easy EQ only.
+     */
+    byte[] toParam(int layout) {
+        int[] v = new int[layout >= 3 ? 19 + 4 * NX : layout == 2 ? 17 : 16];
+        v[0] = layout >= 3 ? 3 : layout == 2 ? 2 : 1;
         v[1] = eqOn ? 1 : 0;
         v[2] = clamp(preamp, PRE_MIN, PRE_MAX);
         v[3] = guard ? 1 : 0;
         for (int i = 0; i < NB; i++) v[4 + i] = clamp(bands[i], BAND_MIN, BAND_MAX);
         v[14] = delayUs(true);
         v[15] = delayUs(false);
-        if (layout2) v[16] = ends();
+        if (layout >= 2) v[16] = ends();
+        if (layout >= 3) {
+            v[17] = expert ? 1 : 0;
+            int n = Math.min(NX, xb.size());
+            v[18] = n;
+            for (int j = 0; j < n; j++) System.arraycopy(clampBand(xb.get(j)), 0, v, 19 + 4 * j, 4);
+        }
         return Engine.intsToBytes(v);
     }
 
@@ -115,7 +278,19 @@ final class EqSettings {
         StringBuilder sb = new StringBuilder();
         sb.append("eq ").append(eqOn ? "on" : "off").append(", preamp ").append(db(preamp)).append(", clip guard ")
                 .append(guard ? "on" : "off").append(", position ").append(position).append(" (L ").append(delayUs(true))
-                .append(" us, R ").append(delayUs(false)).append(" us)").append(", bands");
+                .append(" us, R ").append(delayUs(false)).append(" us)");
+        if (expert) {
+            sb.append(", Expert, ").append(xb.size()).append(" bands:");
+            for (int[] b : xb) {
+                sb.append(' ').append(X_TYPES[clamp(b[0], 1, 4)].toLowerCase(Locale.US).replace(" ", "")).append(' ').append(hz(b[1]));
+                if (b[0] != X_LOW_CUT) sb.append(' ').append(db(b[2]));
+                if (b[0] == X_PEAK) sb.append(' ').append(String.format(Locale.US, "%.2foct", b[3] / 1000.0));
+                if (b[0] == X_LOW_CUT) sb.append(String.format(Locale.US, " Q%.2f", b[3] / 1000.0));
+                sb.append(';');
+            }
+            return sb.toString();
+        }
+        sb.append(", bands");
         for (int i = 0; i < NB; i++) sb.append(' ').append(LABELS[i]).append('=').append(db(bands[i]));
         sb.append(", 31 Hz ").append(lowShelf ? "shelf" : "peak").append(", 16 kHz ").append(highShelf ? "shelf" : "peak");
         return sb.toString();
@@ -124,6 +299,11 @@ final class EqSettings {
     static String db(int cdb) {
         String s = String.valueOf(Math.abs(cdb) / 100) + (Math.abs(cdb) % 100 == 0 ? "" : "." + (Math.abs(cdb) % 100) / 10);
         return (cdb > 0 ? "+" : cdb < 0 ? "-" : "") + s;
+    }
+
+    /** Gain with one decimal always ("-7.0"), for the Expert band card. */
+    static String db1(int cdb) {
+        return (cdb > 0 ? "+" : cdb < 0 ? "-" : "") + String.format(Locale.US, "%.1f", Math.abs(cdb) / 100.0);
     }
 
     static int clamp(int v, int lo, int hi) {
@@ -172,6 +352,13 @@ final class EqSettings {
                     else if (k.equals("seat_delay")) s.seatDelayUs = clamp(Integer.parseInt(v), SEAT_DELAY_MIN, SEAT_DELAY_MAX);
                     else if (k.equals("preamp")) s.preamp = clamp(Integer.parseInt(v), PRE_MIN, PRE_MAX);
                     else if (k.equals("guard")) s.guard = !"0".equals(v);
+                    else if (k.equals("mode")) s.expert = "expert".equals(v);
+                    else if (k.equals("expert_seen")) s.expertSeen = "1".equals(v);
+                    else if (k.equals("xbands")) s.xb = parseBands(v);
+                    else if (k.equals("xsel")) s.xSel = Integer.parseInt(v);
+                    else if (k.equals("xpreset")) s.xPreset = v.length() > 0 && v.length() < 40 ? v : "Custom";
+                    else if (k.equals("cp_eq")) s.cpEq = !"0".equals(v);
+                    else if (k.equals("cpw_ack")) s.cpwAck = v.length() < 120 ? v : "";
                     else if (k.equals("bands")) {
                         String[] f = v.split(",");
                         for (int i = 0; i < NB && i < f.length; i++)
@@ -190,6 +377,14 @@ final class EqSettings {
         if (!presetSeen) {
             for (int v : s.bands) if (v != 0) s.preset = "Custom";
         }
+        // the built-in genre presets are gone (0.6.11): a curve loaded from one stays, as Custom
+        if (!s.preset.equals("Flat") && !s.preset.equals("Custom") && !s.preset.matches("User [1-" + USER_SLOTS + "]")) {
+            boolean flat = s.preamp == 0;
+            for (int v : s.bands) if (v != 0) flat = false;
+            s.preset = flat ? "Flat" : "Custom";
+        }
+        if (s.expert) s.expertSeen = true;
+        s.sortBands();
         // detailed logging starts off after every install and update (settings are kept across them)
         if (!MainActivity.VERSION.equals(savedBy)) {
             s.detailedLog = false;
@@ -265,6 +460,13 @@ final class EqSettings {
         sb.append("position=").append(position).append('\n');
         sb.append("seat_delay=").append(seatDelayUs).append('\n');
         sb.append("ends=").append(ends()).append('\n');
+        sb.append("mode=").append(expert ? "expert" : "easy").append('\n');
+        sb.append("expert_seen=").append(expertSeen ? 1 : 0).append('\n');
+        sb.append("xbands=").append(xbText(xb)).append('\n');
+        sb.append("xsel=").append(xSel).append('\n');
+        sb.append("xpreset=").append(xPreset).append('\n');
+        sb.append("cp_eq=").append(cpEq ? 1 : 0).append('\n');
+        sb.append("cpw_ack=").append(cpwAck).append('\n');
         sb.append("app=").append(MainActivity.VERSION).append('\n');
         sb.append("bands=");
         for (int i = 0; i < NB; i++) sb.append(i == 0 ? "" : ",").append(bands[i]);
@@ -302,26 +504,52 @@ final class EqSettings {
         });
     }
 
-    /** User preset: preamp + bands, or null if the slot is empty. */
-    static int[] loadUser(Context ctx, int slot) {
-        String line = Root.readFirstLine(new File(dir(ctx), "preset" + slot + ".txt"));
+    /** A user slot (both modes share the four): an Easy EQ or an Expert one, with its preamp. */
+    static final class Slot {
+        boolean expert;
+        int preamp;
+        int[] bands = new int[NB];
+        ArrayList<int[]> xb = new ArrayList<int[]>();
+    }
+
+    /**
+     * User slot, or null if it is empty or damaged. One line: "preamp,10 bands" for an Easy EQ
+     * (as before 0.6.11), "x;preamp;type:Hz:gain:width;..." for an Expert one.
+     */
+    static Slot loadUser(Context ctx, int slot) {
+        return parseSlot(Root.readFirstLine(new File(dir(ctx), "preset" + slot + ".txt")));
+    }
+
+    static Slot parseSlot(String line) {
         if (line == null) return null;
-        String[] f = line.trim().split(",");
-        if (f.length != NB + 1) return null;
-        int[] v = new int[NB + 1];
+        line = line.trim();
+        Slot sl = new Slot();
         try {
-            for (int i = 0; i <= NB; i++) v[i] = Integer.parseInt(f[i].trim());
+            if (line.startsWith("x;")) {
+                int at = line.indexOf(';', 2);
+                sl.expert = true;
+                sl.preamp = clamp(Integer.parseInt((at < 0 ? line.substring(2) : line.substring(2, at)).trim()), PRE_MIN, PRE_MAX);
+                sl.xb = parseBands(at < 0 ? "" : line.substring(at + 1));
+                return sl;
+            }
+            String[] f = line.split(",");
+            if (f.length != NB + 1) return null;
+            sl.preamp = clamp(Integer.parseInt(f[0].trim()), PRE_MIN, PRE_MAX);
+            for (int i = 0; i < NB; i++) sl.bands[i] = clamp(Integer.parseInt(f[i + 1].trim()), BAND_MIN, BAND_MAX);
+            return sl;
         } catch (NumberFormatException e) {
             return null;
         }
-        v[0] = clamp(v[0], PRE_MIN, PRE_MAX);
-        for (int i = 1; i <= NB; i++) v[i] = clamp(v[i], BAND_MIN, BAND_MAX);
-        return v;
     }
 
     static void saveUser(Context ctx, int slot, EqSettings s, Saved done) {
-        StringBuilder sb = new StringBuilder().append(s.preamp);
-        for (int i = 0; i < NB; i++) sb.append(',').append(s.bands[i]);
+        StringBuilder sb = new StringBuilder();
+        if (s.expert) {
+            sb.append("x;").append(s.preamp).append(';').append(xbText(s.xb));
+        } else {
+            sb.append(s.preamp);
+            for (int i = 0; i < NB; i++) sb.append(',').append(s.bands[i]);
+        }
         writeAsync(new File(dir(ctx), "preset" + slot + ".txt"), sb.append('\n').toString(), done);
     }
 

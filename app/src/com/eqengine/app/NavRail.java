@@ -19,6 +19,9 @@ final class NavRail extends View {
     }
 
     static final int EQ = 0, POSITION = 1, SETTINGS = 2, STATUS = 3;
+    /** The rail's width (0.7.3: 100 dp, was 116; labels 15.5 dp, were 17), for more room on the pages. */
+    static final int WIDTH_DP = 100;
+    private static final float LABEL_DP = 15.5f, PILL_HALF_DP = 32;
     private static final String[] LABELS = {"EQ", "Position", "Settings", "Status"};
 
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -71,13 +74,13 @@ final class NavRail extends View {
         float d = d();
         float cx = getWidth() / 2f;
         float st = step();
-        float label = Math.min(17 * d, st * 0.21f);
+        float label = Math.min(LABEL_DP * d, st * 0.21f);
         t.setTextSize(label);
         float pillH = Math.min(44 * d, st * 0.52f);
         for (int i = 0; i < LABELS.length; i++) {
             float top = itemTop(i) + (st - (pillH + label * 1.9f)) / 2;
             boolean sel = i == selected;
-            r.set(cx - 36 * d, top, cx + 36 * d, top + pillH);
+            r.set(cx - PILL_HALF_DP * d, top, cx + PILL_HALF_DP * d, top + pillH);
             if (sel || i == pressed) {
                 p.setStyle(Paint.Style.FILL);
                 p.setColor(sel ? Ui.PRIMARY_CONTAINER : Ui.SURFACE_HI);

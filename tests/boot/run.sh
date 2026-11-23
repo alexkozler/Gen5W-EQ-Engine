@@ -18,6 +18,8 @@ setup() {
     echo "${1:-bootid-1}" > $T/proc/sys/kernel/random/boot_id
     echo "/dev/block/system /system ext4 ro 0 0" > $T/proc/mounts
     echo 167 > $T/mspid; mkdir -p $T/proc/167
+    # its stat (started 2.93 s after power-on, field 22 in clock ticks), as init starts it
+    echo "167 (mediaserver) S 1 167 0 0 -1 4194560 100 0 0 0 10 5 0 0 20 0 9 0 293 30000000 2000 4294967295" > $T/proc/167/stat
     cat > $T/stubs/md5 <<'S'
 #!/bin/sh
 md5sum "$1"
@@ -26,6 +28,8 @@ S
 #!/bin/sh
 # mount -o bind SRC DST
 [ "$1" = "-o" ] && [ "$2" = "bind" ] || exit 1
+e=/tmp/eqeboot/root/data/eqengine/state/events.log; n=0; [ -f $e ] && n=$(wc -l < $e | tr -d " ")
+echo "mount after $n event lines" >> /tmp/eqeboot/mount.log
 cp "$4" "$4.under.$$" && cp "$3" "$4" && echo "$4.under.$$" >> /tmp/eqeboot/stack && echo "none $4 none rw 0 0" >> /tmp/eqeboot/proc/mounts
 S
     cat > $T/stubs/umount <<'S'
@@ -79,18 +83,34 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$f" ] && echo "11-18 16:00:00.000 D/AudioResampler(  166): forcing AudioResampler quality to 3" > "$f"
+# a dump (-d, no file): what system_server logs when it dies
+[ -z "$f" ] && case " $(cat /tmp/eqeboot/logcat.log | tail -n1) " in *" -d "*) echo "11-18 16:00:17.000  654  700 E AndroidRuntime: *** FATAL EXCEPTION IN SYSTEM PROCESS: main" ;; esac
 exit 0
 S
+    cat > $T/stubs/dmesg <<'S'
+#!/bin/sh
+echo "<3>[   17.020000] init: untracked pid 165 exited"
+S
+    # the car has no printf (its mksh has none, nor its toolbox)
+    printf '#!/bin/sh\necho "printf: not found" >&2\nexit 127\n' > $T/stubs/printf
     # the 48 kHz keeper: notes that it was started and shows up as a process (in the simulated /proc)
     cat > $T/stubs/keeper <<'S'
 #!/bin/sh
 mkdir -p /tmp/eqeboot/proc/$$; echo "keeper $$" >> /tmp/eqeboot/keeper.log
 S
-    chmod +x $T/stubs/*; : > $T/stack; rm -f $T/setprop.log $T/am.log $T/logcat.log $T/keeper.log
+    # act.sh cpwboot (the CarPlay watch at the car start): notes when it ran
+    cat > $T/stubs/cpwboot <<'S'
+#!/bin/sh
+n=0; [ -f /tmp/eqeboot/root/data/eqengine/state/events.log ] && n=$(wc -l < /tmp/eqeboot/root/data/eqengine/state/events.log)
+echo "cpwboot after $n event lines" >> /tmp/eqeboot/cpwboot.log
+echo "EQE_CPW_NOTE a note for the app only"
+echo "EQE_CPW laid over the CarPlay app's JNI library at the car start (uptime 3)"
+S
+    chmod +x $T/stubs/*; : > $T/stack; rm -f $T/setprop.log $T/am.log $T/logcat.log $T/keeper.log $T/cpwboot.log
 }
 runboot() {  # runs until the script exits or ~$1 simulated seconds pass
     # exec: $BP is the boot step itself, so the kill below stops it (a leftover run would write into the next test)
-    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) &
+    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper EQE_CPW_CMD=$T/stubs/cpwboot PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) &
     BP=$!
     # generous real-time budget: the scripts end by themselves (stop_here) in the tests that need it
     i=0; while kill -0 $BP 2>/dev/null && [ $i -lt $(( ${1:-300} * 4 )) ]; do /bin/sleep 0.05; i=$((i+1)); done
@@ -154,7 +174,7 @@ cat > $T/hook <<'H'
 read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}
 n=$(cat /tmp/eqeboot/crashes 2>/dev/null || echo 0)
 if [ $u -ge 110 ] && [ $n -lt 2 ] && [ $u -ge $((110 + n * 20)) ]; then
-  p=$(cat /tmp/eqeboot/mspid); rmdir /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; echo $((n + 1)) > /tmp/eqeboot/crashes
+  p=$(cat /tmp/eqeboot/mspid); rm -rf /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; echo $((n + 1)) > /tmp/eqeboot/crashes
 fi
 H
 runboot 400
@@ -168,7 +188,7 @@ cat > $T/hook <<'H'
 read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}
 if [ $u -ge 120 ] && [ ! -f /tmp/eqeboot/done8 ]; then
   echo $u > /tmp/eqeboot/root/data/eqengine/state/expected_restart
-  p=$(cat /tmp/eqeboot/mspid); rmdir /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; touch /tmp/eqeboot/done8
+  p=$(cat /tmp/eqeboot/mspid); rm -rf /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; touch /tmp/eqeboot/done8
 fi
 [ $u -ge 300 ] && echo x > /tmp/eqeboot/root/data/eqengine/state/disabled
 H
@@ -223,7 +243,7 @@ cat > $T/hook <<'H'
 read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}
 n=$(cat /tmp/eqeboot/crashes 2>/dev/null || echo 0)
 if [ $u -ge 110 ] && [ $n -lt 2 ] && [ $u -ge $((110 + n * 20)) ]; then
-  p=$(cat /tmp/eqeboot/mspid); rmdir /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; echo $((n + 1)) > /tmp/eqeboot/crashes
+  p=$(cat /tmp/eqeboot/mspid); rm -rf /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; echo $((n + 1)) > /tmp/eqeboot/crashes
 fi
 H
 runboot 400
@@ -335,7 +355,7 @@ crashhook() {  # $1 $2 ... = uptimes of unexpected audio server restarts; stop a
       echo "[ \$u -ge ${STOPAT:-260} ] && touch /tmp/eqeboot/stop"; } > $T/hook
 }
 rununtilstop() {
-    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
+    ( cd /; EQE_TEST_ROOT=$T/root EQE_PROC=$T/proc EQE_KEEP_CMD=$T/stubs/keeper EQE_CPW_CMD=$T/stubs/cpwboot PATH=$T/stubs:/usr/bin:/bin exec $SH $BOOT > $T/out.txt 2>&1 ) & P1=$!
     while [ ! -f $T/stop ]; do /bin/sleep 0.05; done; kill $P1; wait $P1 2>/dev/null
 }
 
@@ -345,6 +365,7 @@ crashhook 130; rununtilstop
 ok "stepped down: converter 3 kept in the settings, marker gone, reason kept for the app" "[ \"\$(cat $VSET/converter)\" = 3 ] && [ ! -f $VS/vhq_load ] && [ \"\$(tail -n1 $T/setprop.log)\" = af.resampler.quality=3 ] && grep -q 'restarted unexpectedly' $VS/conv_cut"
 ok "one crash alone does not turn EQ Engine off" "[ ! -f $VS/disabled ] && grep -q 'stepped down to 3' $T/out.txt"
 ok "the setting and the reason stay readable by the app" "[ \"\$(stat -c %a $VSET/converter)\" = 644 ] && [ \"\$(stat -c %a $VS/conv_cut)\" = 644 ]"
+ok "the log at that moment is kept, root only (0.6.12)" "head -n1 $VS/crash.log | grep -q 'the audio server restarted unexpectedly: pid 167 -> 168' && grep -q 'FATAL EXCEPTION' $VS/crash.log && grep -q 'untracked pid' $VS/crash.log && [ \"\$(stat -c %a $VS/crash.log)\" = 600 ] && grep -q 'the log is in state/crash.log' $VS/events.log"
 
 echo "== 20. very high quality chosen later in the app (marker and 4 for the next start): a crash steps it down"
 setup bootV5; vhqsetup 0 good map
@@ -481,9 +502,119 @@ echo "== 28. a new start: the previous start's 48 kHz state is cleared, its keep
 setup bootK5; mkdir -p $VS; echo "167 101" > $VS/rate48; echo 90 > $VS/rate48_sent; echo "state=48k" > $VS/output; echo 4444 > $VS/keep.pid
 mkdir -p $VS/hold; echo "held 2 13 21" > $VS/hold/state; echo 4445 > $VS/hold/pid
 echo "80 switched to 48000 Hz" > $VS/output.log; echo bootK0 > $VS/runboot
+printf 'state=on\npid=2300\n' > $VS/cpwatch; echo "90 on in the factory CarPlay app (pid 2300)" > $VS/cpw_result
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
 rununtilstop
 ok "rate48, rate48_sent, output and keep.pid cleared; output.log moved" "[ ! -f $VS/rate48 ] && [ ! -f $VS/rate48_sent ] && [ ! -f $VS/output ] && [ ! -f $VS/keep.pid ] && [ ! -f $VS/output.log ] && grep -q 'switched to 48000' $VS/output.prev.log"
 ok "the 48 kHz helper's folder from the last start is gone" "[ ! -d $VS/hold ]"
+ok "the CarPlay watch's state from the last start is gone, its results kept as the previous ones" "[ ! -f $VS/cpwatch ] && [ ! -f $VS/cpw_result ] && grep -q 'pid 2300' $VS/cpw_result.prev"
+
+echo "== 29. the overlay first, the timing, and a late effects list (0.6.9)"
+setup bootT1; mkdir -p $VS; echo "100 an old line" > $VS/events.log; rm -f $T/mount.log
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "mounted before this start wrote any event line" "grep -qx 'mount after 1 event lines' $T/mount.log && grep -q 'overlay applied' $T/out.txt"
+ok "the order in the event log: starting, overlay, timing" "[ \"\$(sed -n 2p $VS/events.log | cut -d' ' -f2-)\" = 'EQ Engine boot step 0.7.5 starting (strikes 0)' ] && sed -n 3p $VS/events.log | grep -q 'effects list overlay applied' && sed -n 4p $VS/events.log | grep -q '^[0-9]* timing: '"
+ok "timing: this step's start and the overlay with decimals, the audio server's own start (its stat), nothing loaded yet" "grep -q 'timing: this step started at 100.25 s (its process at ? s), the overlay was in place at 100.25 s; Android.s audio server (pid 167) started at 2.93 s and had loaded at 100.25 s: no effect library yet' $T/out.txt"
+ok "timing kept for the app and the logs; in time, no late note" "grep -qx 'audio_server_start=2.93' $VS/boot_timing && grep -qx 'loaded_at_overlay=none' $VS/boot_timing && grep -qx 'result=in_time' $VS/boot_timing && grep -qx 'overlay_at=100.25' $VS/boot_timing && grep -qx 'checked_at=100.25' $VS/boot_timing && [ ! -f $VS/late_list ]"
+
+setup bootT2
+printf 'b6b00000-b6b20000 r-xp 00000000 b3:19 99   /system/lib/libaudioflinger.so\nb6c00000-b6c10000 r-xp 00000000 b3:19 98   /system/lib/soundfx/libbundlewrapper.so\n' > $T/proc/167/maps
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "late: the factory list was already loaded at the overlay, and still is a second later: said at once" "grep -q \"Android's audio server (167) read the factory effects list before the overlay was in place: EQ Engine is not active this start. Restart Android audio once (parked); the EQ Engine app offers it\" $T/out.txt && grep -qx 'result=late' $VS/boot_timing && grep -qx 'loaded_at_overlay=factory' $VS/boot_timing"
+ok "late: noted for the app (boot id and audio server), in the status too" "[ \"\$(cat $VS/late_list)\" = 'bootT2 167' ] && grep -q 'read its effects list before it' $VS/status"
+ok "late: at 'confirmed good' it is not said a second time" "grep -q 'confirmed good' $T/out.txt && ! grep -q 'is not loaded in the audio server (167)' $T/out.txt && grep -q 'read its effects list before it' $VS/status"
+
+setup bootT3
+printf 'b6c00000-b6c10000 r-xp 00000000 b3:19 98   /system/lib/soundfx/libbundlewrapper.so\n' > $T/proc/167/maps
+# it was loading EQ Engine's list at that moment: EQ Engine's filter is there a second later
+cat > $T/hook <<'H'
+echo "b6d00000-b6d10000 r-xp 00000000 b3:19 97   /data/eqengine/lib/libeqengine.so" >> /tmp/eqeboot/proc/167/maps
+read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && touch /tmp/eqeboot/stop
+H
+rununtilstop
+ok "loading at the overlay, EQ Engine's filter there a second later: in time, no late note" "grep -qx 'result=in_time' $VS/boot_timing && grep -qx 'loaded_at_overlay=factory' $VS/boot_timing && [ ! -f $VS/late_list ] && ! grep -q 'read the factory effects list' $T/out.txt"
+
+setup bootT4; mkdir -p $VS; touch $VS/fresh_install
+printf 'b6c00000-b6c10000 r-xp 00000000 b3:19 98   /system/lib/soundfx/libbundlewrapper.so\n' > $T/proc/167/maps
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "right after an install: the timing is kept, but no late note (that audio server predates EQ Engine)" "grep -qx 'result=late' $VS/boot_timing && grep -qx 'fresh_install=1' $VS/boot_timing && [ ! -f $VS/late_list ] && ! grep -q 'read the factory effects list' $T/out.txt"
+
+setup bootT5
+printf 'b6c00000-b6c10000 r-xp 00000000 b3:19 98   /system/lib/soundfx/libbundlewrapper.so\n' > $T/proc/167/maps
+cat > $T/hook <<'H'
+read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}
+if [ $u -ge 120 ] && [ ! -f /tmp/eqeboot/restarted ]; then
+    touch /tmp/eqeboot/restarted; echo $u > /tmp/eqeboot/root/data/eqengine/state/expected_restart
+    rm -rf /tmp/eqeboot/proc/167; mkdir -p /tmp/eqeboot/proc/168; echo 168 > /tmp/eqeboot/mspid
+fi
+[ $u -ge 140 ] && touch /tmp/eqeboot/stop
+H
+rununtilstop
+ok "the requested audio restart: the late note is gone (the new audio server read EQ Engine's list)" "grep -q 'restarted on request' $T/out.txt && [ ! -f $VS/late_list ]"
+
+setup bootT6; mkdir -p $VS; echo "bootT0 167" > $VS/late_list; echo "result=late" > $VS/boot_timing; echo bootT0 > $VS/runboot
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "a new start: the last start's late note and timing are replaced" "[ ! -f $VS/late_list ] && grep -qx 'boot_id=bootT6' $VS/boot_timing && grep -qx 'result=in_time' $VS/boot_timing"
+
+setup bootT7; mkdir -p $VS; echo "turned off in the app" > $VS/disabled; rm -f $T/mount.log
+runboot 30
+ok "turned off: nothing mounted, no timing, the start's events still written" "[ ! -f $T/mount.log ] && [ ! -f $VS/boot_timing ] && grep -q 'boot step 0.7.5 starting' $VS/events.log && [ \"\$(st state)\" = off ]"
+
+setup bootT8
+# the audio server loads EQ Engine's list while this step does its housekeeping (its first chmod)
+cat > $T/stubs/chmod <<'S'
+#!/bin/sh
+grep -q libeqengine /tmp/eqeboot/proc/167/maps 2>/dev/null || echo "b6d00000-b6d10000 r-xp 00000000 b3:19 97   /data/eqengine/lib/libeqengine.so" >> /tmp/eqeboot/proc/167/maps
+exec /bin/chmod "$@"
+S
+chmod +x $T/stubs/chmod
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "the audio server is looked at right after the mount, before the housekeeping (0.6.10)" "grep -qx 'loaded_at_overlay=none' $VS/boot_timing && grep -qx 'result=in_time' $VS/boot_timing && grep -q 'libeqengine' $T/proc/167/maps"
+
+echo "== 30. the CarPlay watch at the car start (0.6.10)"
+setup bootC1; mkdir -p $VS; echo "1 0123456789abcdef0123456789abcdef 1000" > $VS/cpw_want
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "on: act.sh cpwboot runs once, after the overlay and its timing line, before the main loop" "[ \$(wc -l < $T/cpwboot.log) = 1 ] && n=\$(sed -n 's/^cpwboot after \([0-9]*\) event lines\$/\1/p' $T/cpwboot.log) && [ \$n -ge 4 ] && grep -qx 'mount after 0 event lines' $T/mount.log"
+ok "on: its result goes into the event log, its notes for the app do not" "grep -q \"CarPlay watch: laid over the CarPlay app's JNI library at the car start (uptime 3)\" $VS/events.log && ! grep -q 'a note for the app only' $VS/events.log"
+ok "on: the choice is kept for later car starts" "[ -f $VS/cpw_want ]"
+setup bootC2
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "off: act.sh cpwboot is not run" "[ ! -f $T/cpwboot.log ] && ! grep -q 'CarPlay watch' $VS/events.log"
+setup bootC3; mkdir -p $VS; echo "1 0123456789abcdef0123456789abcdef 1000" > $VS/cpw_want; echo "turned off in the app" > $VS/disabled
+runboot 30
+ok "EQ Engine off: the CarPlay watch is not laid over either" "[ ! -f $T/cpwboot.log ]"
+setup bootC4; mkdir -p $VS; echo "1 0123456789abcdef0123456789abcdef 1000" > $VS/cpw_want; echo bootC0 > $VS/runboot
+printf 'state=on
+pid=2300
+' > $VS/cpwatch; echo 2 > $VS/cpw_restarts
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 120 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "a new start: the last start's watch state is cleared before cpwboot, the choice stays" "[ ! -f $VS/cpwatch ] && [ ! -f $VS/cpw_restarts ] && [ -f $VS/cpw_want ] && [ -f $T/cpwboot.log ]"
+
+echo "== 31. the audio server restarted with Android's framework (0.6.12): not counted, the log kept"
+zy() {  # the zygote's stat, as init starts it
+    mkdir -p $T/proc/$1; echo "$1 (zygote) S 1 $1 0 0 -1 4194560 100 0 0 0 10 5 0 0 20 0 9 0 292 30000000 2000 4294967295" > $T/proc/$1/stat
+}
+setup bootZ1; vhqsetup 1 good map; zy 165
+{ echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}'
+  echo 'if [ $u -ge 130 ] && [ ! -f /tmp/eqeboot/zy_done ]; then rm -rf /tmp/eqeboot/proc/165; mkdir -p /tmp/eqeboot/proc/3000; echo "3000 (zygote) S 1 3000 0 0 -1 4194560 100 0 0 0 10 5 0 0 20 0 9 0 13000 30000000 2000 4294967295" > /tmp/eqeboot/proc/3000/stat; p=$(cat /tmp/eqeboot/mspid); rm -rf /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; touch /tmp/eqeboot/zy_done; fi'
+  echo '[ $u -ge 260 ] && touch /tmp/eqeboot/stop'; } > $T/hook
+rununtilstop
+ok "named as a framework restart, with both pids" "grep -q \"audio server restarted with Android's framework (zygote 165 -> 3000, audio server 167 -> 168)\" $VS/events.log"
+ok "not counted: the converter kept, confirmed good" "[ ! -f $VSET/converter ] && [ -f $VS/vhq_load ] && ! grep -q 'restarted unexpectedly' $VS/events.log && ! grep -q 'stepped down' $VS/events.log && grep -q 'confirmed good' $VS/events.log"
+ok "the log at that moment is kept, root only" "head -n1 $VS/crash.log | grep -q \"Android's framework restarted: zygote 165 -> 3000\" && grep -q 'FATAL EXCEPTION IN SYSTEM PROCESS' $VS/crash.log && [ \"\$(stat -c %a $VS/crash.log)\" = 600 ]"
+setup bootZ2; vhqsetup 1 good map; zy 165
+{ echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}'
+  echo 'if [ $u -ge 130 ] && [ ! -f /tmp/eqeboot/c1 ]; then p=$(cat /tmp/eqeboot/mspid); rm -rf /tmp/eqeboot/proc/$p; p=$((p + 1)); mkdir -p /tmp/eqeboot/proc/$p; echo $p > /tmp/eqeboot/mspid; touch /tmp/eqeboot/c1; fi'
+  echo '[ $u -ge 260 ] && touch /tmp/eqeboot/stop'; } > $T/hook
+rununtilstop
+ok "the zygote still running: an audio server crash counts as before" "grep -q 'restarted unexpectedly (1 this start): pid 167 -> 168' $VS/events.log && [ \"\$(cat $VSET/converter)\" = 3 ]"
 
 echo "$SH: $pass passed, $fail failed"

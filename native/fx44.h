@@ -27,6 +27,9 @@
 /* system/audio.h */
 typedef uint32_t audio_channel_mask_t;
 #define AUDIO_FORMAT_PCM_16_BIT   0x1u
+#define AUDIO_FORMAT_PCM_8_BIT    0x2u
+#define AUDIO_FORMAT_PCM_32_BIT   0x3u
+#define AUDIO_FORMAT_PCM_8_24_BIT 0x4u
 #define AUDIO_CHANNEL_OUT_STEREO  0x3u
 
 /* audio_effect.h */

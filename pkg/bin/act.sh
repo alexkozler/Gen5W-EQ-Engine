@@ -12,6 +12,12 @@
 #   act.sh lab <w>         Lab driver watch until the next car start: 1 = a pass-through layer in
 #                          front of Hyundai's audio driver, 0 = removed; switching it needs one
 #                          audio restart
+#   act.sh cpwatch <w>     Lab CarPlay watch, from the next car start: 1 = a pass-through layer in
+#                          place of the factory CarPlay app's JNI library, which watches its
+#                          TinyALSA calls, laid over at every car start until it is turned off;
+#                          0 = off. Nothing is restarted now (see "CarPlay watch" below)
+#   act.sh cpwboot         the boot step's part of the CarPlay watch: lays it over at the car start
+#   act.sh cpwguard        one round of the keeper's check on the CarPlay watch
 #   act.sh keep            the 48 kHz output keeper: runs in the background, started by the boot
 #                          step (see "48 kHz output" below)
 #   act.sh report <usb root> <app files dir> <seconds>
@@ -20,10 +26,16 @@
 #   act.sh on              turn EQ Engine back on and start the boot step
 #   act.sh open <pkg/cls>  open one of Hyundai's Sound Settings screens (Lab page)
 #   act.sh trace <seconds> record the system log and before/after audio snapshots (Lab page)
+#   act.sh curves save|load <usb root>
+#                          the four user slots to or from the stick's EQENGINE_CURVES folder
+#   act.sh factory <usb root>
+#                          copy the factory CarPlay app, the apps it works with, the libraries they
+#                          load and Android's framework to the stick, for study on a PC (private;
+#                          see "Factory files" below)
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
-VER=0.6.6
+VER=0.7.5
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -68,6 +80,8 @@ SENT=$S/rate48_sent
 KEEP_PID=$S/keep.pid
 KEEP_POLL=${EQE_KEEP_POLL:-1}
 KEEP_TRIES=3
+# counts of the link's frames that may get nothing before the rate is left "not measured"
+KEEP_MTRIES=${EQE_KEEP_MTRIES:-5}
 # 0.6.3's marker (a switch made while nothing played did not reach the link); removed by the keeper
 IDLE_BAD=$S/idle48_bad
 # a new audio server gets this long (s) for its clients to reconnect before a switch while idle
@@ -1205,16 +1219,28 @@ keep_check() {
         return 0
     fi
     # Android and the link agree on the rate wanted: count the link's frames once per audio
-    # server and rate
+    # server and rate. Until a count succeeds the rate is not called checked (fps= stays empty,
+    # and the app says so); a count that gets nothing (the link stopped during it) is tried again
+    # at the next rounds, KEEP_MTRIES times, and again at the link's next start.
     if [ "$K_MEASURED" != "$K_PID $_lr" ]; then
         set -- $(link_of $K_TID 3000)
         if [ -n "$3" ]; then
             K_FPS=${3%%.*}
             K_MEASURED="$K_PID $_lr"
+            K_MTRY=0
             if [ $K_FPS -lt $((_lr - _lr / 200)) ] || [ $K_FPS -gt $((_lr + _lr / 200)) ]; then
                 out_log "link $_pcm is set to $_lr Hz but took $K_FPS frames/s"
                 if [ "$_lr" != 44100 ]; then
-                    keep_hold "the link took $K_FPS frames/s at $_lr Hz"
+                    # 44.1 kHz back like every other rate change: with the main output's tracks
+                    # held (keep_change), never straight through keep_hold
+                    keep_note waiting "Link $_pcm runs at $K_FPS frames/s at $_lr Hz: putting 44.1 kHz back"
+                    keep_change "" "the link took $K_FPS frames/s at $_lr Hz"
+                    if [ -n "$K_HOLDFAIL" ]; then
+                        # not put back: counted and put back at the next round, while the tries last
+                        K_MEASURED=""
+                        [ -z "$K_HELD" ] && return 1
+                        keep_note mismatch "Link $_pcm runs at $K_FPS frames/s at $_lr Hz: wrong speed. Restart Android audio (parked)"
+                    fi
                     return 0
                 fi
             else
@@ -1224,6 +1250,18 @@ keep_check() {
                     out_log "Android and link $_pcm agree on $_lr Hz; measured $K_FPS frames/s"
                 fi
             fi
+        else
+            K_FPS=""
+            K_MTRY=$((K_MTRY + 1))
+            if [ $K_MTRY -lt $KEEP_MTRIES ]; then
+                [ $K_MTRY = 1 ] && out_log "link $_pcm at $_lr Hz: its frames could not be counted; counted again while it plays"
+                _ns=44k
+                [ "$_lr" = 48000 ] && _ns=48k
+                keep_note $_ns "$_lr Hz; the link's speed is not measured yet"
+                return 1
+            fi
+            out_log "link $_pcm at $_lr Hz: its frames could not be counted $KEEP_MTRIES times; counted again at its next start"
+            K_MTRY=0
         fi
     fi
     if [ "$_lr" = 48000 ]; then
@@ -1246,7 +1284,7 @@ keep_loop() {
         [ "$(num $4)" -gt 32768 ] && mv $OUTLOG $S/output.old.log
     fi
     K_PID=""; K_IO=""; K_TID=""; K_OUT=""; K_LINK=""; K_LR=""; K_FPS=""; K_STATE=""; K_NOTED=""
-    K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_WANT=""; K_NO48=""
+    K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_WANT=""; K_NO48=""; K_MTRY=0
     K_SINCE=0; K_IDLED=""; K_IDLESW=""; K_UNSAFE=""; K_MISSAID=""; K_HOLDFAIL=""
     K_NOTE=""; K_OTHER=""; K_OTHER_NAME=""; K_OTHER_AT=""; K_PREV_STATE=""; K_PREV_NOTE=""
     LO_TID=""; LO_NTID=""; LO_PID=""; LO_NAME=""; LO_STATE=""; LO_RATE=""; O_FPS=""; HOLD_OTHER=""
@@ -1263,6 +1301,7 @@ keep_loop() {
         _kp=""
         [ -f $KEEP_PID ] && read _kp < $KEEP_PID
         [ "$_kp" = $$ ] || exit 0
+        [ $((_round % 3)) = 0 ] && cpw_guard > /dev/null 2>&1
         _w=$(rate48_wanted)
         if [ "$_w" != "$K_WANT" ]; then
             if [ -n "$K_WANT" ]; then
@@ -1282,7 +1321,7 @@ keep_loop() {
         if [ -z "$K_PID" ] || [ ! -d $PROC/$K_PID ]; then
             K_PID=$(ms_pid)
             K_IO=""; K_TID=""; K_OUT=""; K_LINK=""; K_LR=""; K_FPS=""
-            K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_NOTED=""
+            K_TRIES=0; K_HELD=""; K_LAST=""; K_MEASURED=""; K_NOTED=""; K_MTRY=0
             K_SINCE=$(uptime_s); K_IDLED=""; K_IDLESW=""; K_UNSAFE=""; K_MISSAID=""
             # what was shown for the last audio server is not restored for this one
             K_PREV_STATE=""; K_PREV_NOTE=""
@@ -1383,18 +1422,134 @@ report_props() {
 CP_APP=com.daudio.app.dipo
 CP_TMP=$S/cp_probe
 
-# the pid of the factory CarPlay app's main process, from /proc/<pid>/cmdline (nothing if none)
-cp_pid() {
+# the pid of the process whose command line is $1 (an app's main process: its name), from
+# /proc/<pid>/cmdline (nothing if none)
+pid_named() {
     for _cf in $PROC/[0-9]*/cmdline; do
         [ -f $_cf ] || continue
         _cc=""
         { read -r _cc < $_cf; } 2>/dev/null
-        [ "$_cc" = $CP_APP ] || continue
+        [ "$_cc" = "$1" ] || continue
         _cf=${_cf%/cmdline}
         echo "${_cf##*/}"
         return 0
     done
     return 1
+}
+
+# The zygote's pid (nothing if none), from /proc/<pid>/stat: its name there is "(zygote)" and its
+# parent is init. Its cmdline cannot be compared: app_process writes "zygote" over the start of
+# its first argument only, so the rest of the old arguments follows after a NUL, and the shell's
+# read drops NULs (on the car the probe said "the zygote was not found", 2026-11-21).
+zygote_pid() {
+    for _zf in $PROC/[0-9]*/stat; do
+        [ -f $_zf ] || continue
+        _zl=""
+        { read -r _zl < $_zf; } 2>/dev/null
+        set -f
+        set -- $_zl
+        set +f
+        [ "$2" = "(zygote)" ] && [ "$4" = 1 ] || continue
+        echo "$1"
+        return 0
+    done
+    return 1
+}
+
+# the pid of the factory CarPlay app's main process (nothing if none)
+cp_pid() {
+    pid_named $CP_APP
+}
+
+# the app's running services ("com.daudio.app.dipo/.Name"), from Android's own list
+cp_services() {
+    dumpsys activity services $CP_APP 2>/dev/null | {
+        _so=""
+        while read -r _sl; do
+            case "$_sl" in
+                *ServiceRecord\{*"$CP_APP/"*)
+                    _sw=${_sl#*"$CP_APP/"}
+                    _sw="$CP_APP/${_sw%%\}*}"
+                    case " $_so " in
+                        *" $_sw "*) ;;
+                        *) _so="$_so $_sw" ;;
+                    esac ;;
+            esac
+        done
+        echo $_so
+    }
+}
+
+# the CarPlay app's process (pid $1): its user, when it started, whether the CarPlay watch is in
+# it, how Android keeps it (persistent: started again at once when it stops) and its services
+cp_process_probe() {
+    _pp=$1
+    _pu=""; _pg=""; _ps=""; _ppp=""; _pgr=""; _pce=""; _pper=""
+    if [ -f $PROC/$_pp/status ]; then
+        while read -r _pk _pa _pb; do
+            case "$_pk" in
+                Uid:) _pu=$_pa ;;
+                Gid:) _pg=$_pa ;;
+                PPid:) _ppp=$_pa ;;
+                Groups:) _pgr="$_pa${_pb:+ $_pb}" ;;
+                CapEff:) _pce=$_pa ;;
+            esac
+        done < $PROC/$_pp/status
+    fi
+    [ -f $PROC/$_pp/personality ] && read -r _pper < $PROC/$_pp/personality
+    if [ -f $PROC/$_pp/stat ]; then
+        _pl=""
+        read -r _pl < $PROC/$_pp/stat
+        set -f
+        set -- $_pl
+        set +f
+        [ $# -ge 22 ] && _ps=${22}
+    fi
+    case "$_ps" in
+        ''|*[!0-9]*) _ps="?" ;;
+        *) _ps=$((_ps / 100)) ;;
+    esac
+    echo "  its process: uid ${_pu:-?}, gid ${_pg:-?}, started at uptime $_ps s"
+    # how it was started: a normal start is forked from the zygote (its parent); a start through the
+    # wrap property runs a shell and app_process instead (CarPlay watch)
+    _pz=$(zygote_pid)
+    _ppn=""
+    [ -n "$_ppp" ] && [ "$_ppp" = "$_pz" ] && _ppn=" (the zygote)"
+    echo "  its parent: pid ${_ppp:-?}$_ppn; groups: ${_pgr:-none}; effective capabilities: ${_pce:-?}; personality: ${_pper:-?}"
+    maps_has $_pp ${CPW_COPY##*/} && echo "  EQ Engine's CarPlay watch is loaded in it (in place of libCarPlayAndroid.so; started from the zygote as usual)"
+    dumpsys package $CP_APP 2>/dev/null | {
+        _pn=0
+        while read -r _pl; do
+            case "$_pl" in
+                userId=*|sharedUser=*|pkgFlags=*|flags=*|codePath=*)
+                    _pn=$((_pn + 1))
+                    [ $_pn -le 8 ] && echo "  package: $_pl" ;;
+            esac
+        done
+    }
+    dumpsys activity processes 2>/dev/null > $CP_TMP/procs
+    _pers=no; _pn=0
+    while read -r _pl; do
+        case "$_pl" in
+            *"$_pp:$CP_APP/"*)
+                _pn=$((_pn + 1))
+                [ $_pn -le 4 ] && echo "  process list: $_pl"
+                case "$_pl" in
+                    *PERS*) _pers=yes ;;
+                esac ;;
+        esac
+    done < $CP_TMP/procs
+    echo "  persistent (Android starts it again at once when it stops): $_pers"
+    _psv=$(cp_services)
+    echo "  its running services: ${_psv:-none listed}"
+    # a connected CarPlay session shows as established TCP connections of the app (0.6.10: logged
+    # to check that on the car)
+    cp_session $_pp
+    if [ $CPS_OK = 1 ]; then
+        echo "  its established network connections (a connected CarPlay session has some): $CPS_N"
+    else
+        echo "  its established network connections: could not be read"
+    fi
 }
 
 # the distinct libraries (.so) mapped into the process $1, in the order they appear
@@ -1413,9 +1568,12 @@ cp_libs() {
     done < $PROC/$1/maps
 }
 
-# carplay_probe [list]: the probe, one item per line (with "list", first the plain list of the
-# mapped libraries)
+# carplay_probe [list]: the probe, one item per line (with "list", for All logs: also the plain
+# list of the mapped libraries and the CarPlay, DiPO, iAP and Telechips properties with their
+# values; the report, which is for sharing, gets neither). Only symbol tables, checksums and
+# properties are read: never a factory file's contents.
 carplay_probe() {
+    _cpmode=$1
     rm -rf $CP_TMP
     mkdir -p $CP_TMP
     _cpp=$(cp_pid)
@@ -1436,7 +1594,7 @@ carplay_probe() {
         else
             echo "  HMG-API's AAC decoder libleafiaaac.so is not mapped"
         fi
-        if [ "$1" = list ]; then
+        if [ "$_cpmode" = list ]; then
             echo "  mapped libraries:"
             while read -r _cpl; do
                 echo "    $_cpl"
@@ -1450,6 +1608,11 @@ carplay_probe() {
                 $LABBIN imports "$SYS$_cpl" < /dev/null > $CP_TMP/imp 2>&1
                 _cpr=$?
                 _cpd=""; _cpe=""
+                _cpc=0
+                case "$_cpl" in
+                    */libCarPlay*.so) _cpc=1 ;;
+                esac
+                _cpx2=0
                 : > $CP_TMP/pcm
                 while read -r _cpk _cpv _cpx; do
                     case "$_cpk" in
@@ -1457,10 +1620,20 @@ carplay_probe() {
                         import)
                             case "$_cpv" in
                                 pcm_*|mixer_*) echo "    imports $_cpv" >> $CP_TMP/pcm ;;
+                                *AudioTrack*|*AudioSystem*|*AudioRecord*|*AudioEffect*|*AudioFlinger*|*AudioPolicy*|*IAudio*)
+                                    [ $_cpc = 1 ] && echo "    imports (Android audio) $_cpv" >> $CP_TMP/pcm ;;
+                            esac ;;
+                        export)
+                            [ $_cpc = 1 ] || continue
+                            case "$_cpv" in
+                                *[Tt][Ii][Nn][Yy]*|*[Aa][Ll][Ss][Aa]*|*[Aa]udio[Tt]rack*|*[Aa]udio[Ss]ystem*|*[Bb]ackend*)
+                                    _cpx2=$((_cpx2 + 1))
+                                    [ $_cpx2 -le 40 ] && echo "    exports (audio backend) $_cpv" >> $CP_TMP/pcm ;;
                             esac ;;
                         EQE_LAB_ERR) _cpe="$_cpv $_cpx"; [ "$_cpv" = "imports:" ] && _cpe=$_cpx ;;
                     esac
                 done < $CP_TMP/imp
+                [ $_cpx2 -gt 40 ] && echo "    ($((_cpx2 - 40)) more such exports not listed)" >> $CP_TMP/pcm
                 if [ $_cpr != 0 ]; then
                     echo "    not read (${_cpe:-eqe_lab answered $_cpr})"
                     continue
@@ -1469,6 +1642,7 @@ carplay_probe() {
                 cat $CP_TMP/pcm
             done < $CP_TMP/libs
         fi
+        cp_process_probe $_cpp
     fi
     _cpt=$SYS/system/lib/libtinyalsa.so
     if [ ! -f $_cpt ]; then
@@ -1485,11 +1659,592 @@ carplay_probe() {
             done < $CP_TMP/imp
         fi
     fi
+    # config files named for CarPlay, DiPO or iAP (factory files: checksums only)
+    for _cpf in $SYS/system/etc/* $SYS/system/etc/*/* $SYS/vendor/etc/*; do
+        [ -f "$_cpf" ] || continue
+        case "${_cpf##*/}" in
+            *[Dd][Ii][Pp][Oo]*|*[Cc][Aa][Rr][Pp][Ll][Aa][Yy]*|*[Ii][Aa][Pp]2*|*[Ii][Aa][Pp]_*) ;;
+            *) continue ;;
+        esac
+        echo "  config file ${_cpf#$SYS} (factory file): md5 $(md5of $_cpf)"
+    done
+    if [ "$_cpmode" = list ]; then
+        echo "  properties for CarPlay, DiPO, iAP and Telechips:"
+        getprop 2>/dev/null > $CP_TMP/props
+        _cpn=0
+        while IFS= read -r _cpl; do
+            _cpk=${_cpl%%]*}
+            _cpk=${_cpk#?}
+            case "$_cpk" in
+                *[Dd][Ii][Pp][Oo]*|*[Cc][Aa][Rr][Pp][Ll][Aa][Yy]*|*[Ii][Aa][Pp]*|tcc.*|*.tcc.*|*daudio*|wrap.*)
+                    _cpn=$((_cpn + 1))
+                    [ $_cpn -le 150 ] && echo "    $_cpl" ;;
+            esac
+        done < $CP_TMP/props
+        [ $_cpn = 0 ] && echo "    none"
+        [ $_cpn -gt 150 ] && echo "    ($((_cpn - 150)) more not listed)"
+    fi
+    # Hyundai's libmedia.so needs libbtsound.so, which needs libtinyalsa.so: loaded in the zygote,
+    # every app has it from there (so a file laid over libtinyalsa.so would not reach the app)
+    _zp=$(zygote_pid)
+    if [ -z "$_zp" ]; then
+        echo "  the zygote was not found"
+    elif maps_has $_zp libtinyalsa.so; then
+        echo "  libtinyalsa.so is loaded in the zygote (pid $_zp): every app has it from there"
+    else
+        echo "  libtinyalsa.so is not loaded in the zygote (pid $_zp)"
+    fi
     for _cpk in ro.debuggable ro.secure wrap.$CP_APP; do
         echo "  $_cpk = [$(getprop $_cpk)]"
     done
     rm -rf $CP_TMP
     return 0
+}
+
+# ---- EQ on CarPlay, the CarPlay watch (act.sh cpwatch 1|0, cpwboot, cpwguard; 0.6.9, at the car start
+# from 0.6.10, with the EQ from 0.7.3, on by default from 0.7.4)
+#
+# Wired CarPlay's music does not go through Android's audio server (0.6.4 on the car): the factory
+# CarPlay app writes it to the main link itself, with Telechips' libCarPlayAudio.so and TinyALSA.
+# The watch (native/cpwatch.c) runs EQ Engine's filter on that music from inside the app, and
+# hands every other stream (Siri, calls) on untouched.
+#
+# It stands in for the app's JNI library: it is laid over /system/lib/libCarPlayAndroid.so (an
+# in-memory bind mount; /system is never written), loads an unchanged copy of the car's own file
+# (CPW_COPY, made here and checked by md5) and passes everything to it. The app starts from the
+# zygote as always, so HMG-API's hooks and its checked library patches stay (0.6.9 on the car).
+#
+# 0.6.10: the watch is laid over at the car start (act.sh cpwboot, run by the boot step before the
+# CarPlay app starts), never by restarting the app. 0.6.9 restarted the app to load and unload it,
+# and a restart while a CarPlay session was connected (paused) lost the session (wired: until the
+# cable was plugged in again) or left the car's source on the radio while CarPlay played into the
+# link (wireless). So
+# "cpwatch 1" only checks and records the choice (state/cpw_want) for the next car start, and
+# "cpwatch 0" takes the mount off for the app's next start; the app running then keeps what it has
+# loaded until the car restarts. The choice lasts across car starts until it is turned off.
+#
+# The keeper (cpw_guard) notes each start of the app. A second new start within two minutes takes
+# the watch off (the mount and the choice), and so does a watch that says the factory library did
+# not load; only in that last case is the app restarted (CarPlay cannot work in that start of the
+# app, so no session can be connected), and only if cp_session finds no connection.
+CPW=$D/lib/eqe_cpwatch.so
+CPWSUM=$D/conf/eqe_cpwatch.md5
+CPW_D=$D/cpw
+CPW_ST=$S/cpwatch
+CPW_T=$SYS/system/lib/libCarPlayAndroid.so
+# the copy the watch loads (the same path as CPS_COPY in cpwatch.c)
+CPW_COPY=$D/lib/libCarPlayAndroid.car.so
+CPW_RS=$S/cpw_restarts
+# "1 <md5 of the factory library that was checked> <the app's uid>" while the watch is on
+CPW_WANT=$S/cpw_want
+# 0.6.7's wrap property: not kept across car starts, cleared wherever one could be left
+CPW_WRAP=wrap.$CP_APP
+CPW_WAIT=${EQE_CPW_WAIT:-60}
+# the app's services are started again after this long (s) if Android has not restarted it itself
+CPW_NUDGE=${EQE_CPW_NUDGE:-15}
+
+cpw_result() {
+    echo "EQE_CPW $*"
+    echo "$(uptime_s) $*" >> $S/cpw_result
+    chmod 644 $S/cpw_result
+}
+
+# EQ on CarPlay is on by default (0.7.4). When it turns itself off (a check failed at the car
+# start, the factory library did not load, the CarPlay app kept restarting with it, or the install
+# could not prepare it), state/cpw_failed says when and why, once per occurrence (id), and the app
+# tells the user the next time its screen opens. It is kept across car starts (All logs copies it).
+# the reason in the words the app shows (the logs keep the full text)
+cpw_user_why() {
+    case "$1" in
+        *"twice within 2 minutes"*) echo "the CarPlay app started again twice within 2 minutes with it" ;;
+        *"could not load the factory library"*) echo "it could not load the factory CarPlay library" ;;
+        *"CarPlay watch failed its check"*|*"not installed or failed its check"*)
+            echo "its files failed their check (installing EQ Engine again fixes that)" ;;
+        *"could not be laid over"*) echo "it could not be laid over the CarPlay app's library" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+cpw_fail_note() {
+    _fb=""
+    [ -f $PROC/sys/kernel/random/boot_id ] && read -r _fb < $PROC/sys/kernel/random/boot_id
+    {
+        echo "id=${_fb:-boot}-$(uptime_s)"
+        echo "when=$(date '+%Y-%m-%d %H:%M' 2>/dev/null)"
+        echo "why=$(cpw_user_why "$1")"
+    } > $S/cpw_failed.tmp
+    mv $S/cpw_failed.tmp $S/cpw_failed
+    chmod 644 $S/cpw_failed
+}
+
+# a refusal of "cpwatch 1": said to the app, and noted for it when nobody is looking (the install)
+cpw_refuse() {
+    cpw_result "refused: $1"
+    [ "$EQE_CPW_NOTIFY" = 1 ] && cpw_fail_note "it could not be prepared: $(cpw_user_why "$1")"
+    return 1
+}
+
+# state/cpwatch for the app: cpw_state <state> <pid> <note>. The states: pending (on from the next
+# car start), waiting (laid over at this car start, the app has not loaded it yet), on (loaded in
+# the app <pid>), ending (off from the next car start; the app <pid> keeps it until then), off,
+# failed (the note says why).
+cpw_state() {
+    {
+        echo "state=$1"
+        echo "pid=$2"
+        echo "since=$(uptime_s)"
+        echo "note=$3"
+    } > $CPW_ST.tmp
+    mv $CPW_ST.tmp $CPW_ST
+    chmod 644 $CPW_ST
+}
+
+# a field of state/cpwatch
+cpw_get() {
+    _cg=""
+    if [ -f $CPW_ST ]; then
+        while IFS='=' read -r _ck _cv; do
+            [ "$_ck" = "$1" ] && _cg=$_cv
+        done < $CPW_ST
+    fi
+    echo "$_cg"
+}
+
+cpw_prop_clear() {
+    case "$(getprop $CPW_WRAP)" in
+        *eqe_cpwatch.so*) setprop $CPW_WRAP "" ;;
+    esac
+}
+
+# 0 = one of the process $1's threads has the main link open (CarPlay plays)
+cp_has_link() {
+    for _hf in $PROC/asound/card*/$MAIN_PCM/sub0/status; do
+        [ -f $_hf ] || continue
+        _how=""
+        while read -r _hk _ha _hb _hc; do
+            [ "$_hk" = owner_pid ] && _how=$_hb
+        done < $_hf
+        case "$_how" in
+            ''|0|*[!0-9]*) continue ;;
+        esac
+        [ -d $PROC/$1/task/$_how ] && return 0
+    done
+    return 1
+}
+
+cp_uid() {
+    _cu=""
+    if [ -f $PROC/$1/status ]; then
+        while read -r _ck _ca _crest; do
+            [ "$_ck" = "Uid:" ] && _cu=$_ca
+        done < $PROC/$1/status
+    fi
+    echo "$_cu"
+}
+
+# The CarPlay app's connections to a phone (0.6.10): established TCP connections whose socket is one
+# of the process $1's open files. CarPlay runs over IP both ways (wired: the USB link's network,
+# ncm0; wireless: the projection hotspot), with its session's control and screen on TCP. CPS_N =
+# how many, CPS_OK = 1 when the app's files and the kernel's tables could be read. A connected
+# session counts at least one (presumed from CarPlay's design; 0.6.10 logs it to check on the car).
+cp_session() {
+    CPS_N=0
+    CPS_OK=0
+    [ -d $PROC/$1/fd ] || return 1
+    _sfl=$(ls -l $PROC/$1/fd 2>/dev/null)
+    _sin=" "
+    _sn=0
+    while read -r _sl; do
+        case "$_sl" in
+            *"socket:["*"]"*)
+                _si=${_sl##*"socket:["}
+                _si=${_si%%"]"*}
+                _sin="$_sin$_si "
+                _sn=$((_sn + 1)) ;;
+        esac
+    done <<EOL
+$_sfl
+EOL
+    _sread=0
+    for _stf in $PROC/net/tcp $PROC/net/tcp6; do
+        [ -f $_stf ] || continue
+        _sread=1
+        [ $_sn = 0 ] && continue
+        # sl local remote st tx:rx tr:when retrnsmt uid timeout inode ...; st 01 = established
+        while read -r _s0 _s1 _s2 _s3 _s4 _s5 _s6 _s7 _s8 _s9 _srest; do
+            [ "$_s3" = 01 ] || continue
+            case "$_sin" in
+                *" $_s9 "*) CPS_N=$((CPS_N + 1)) ;;
+            esac
+        done < $_stf
+    done
+    [ $_sread = 1 ] && [ -n "$_sfl" ] && CPS_OK=1
+    return 0
+}
+
+# the connection count of the process $1 as words, for notes
+cp_conn() {
+    cp_session $1
+    if [ $CPS_OK = 1 ]; then
+        echo "$CPS_N established connections"
+    else
+        echo "connections could not be read"
+    fi
+}
+
+# 0 = the process $1 runs the watch (it has the copy of the factory library mapped)
+cpw_in() {
+    maps_has $1 ${CPW_COPY##*/}
+}
+
+# the watch's own state in the process $1 (its status file), "" before it wrote one
+cpw_wstate() {
+    _ws=""
+    if [ -f $CPW_D/status.$1 ]; then
+        while IFS='=' read -r _wk _wv; do
+            [ "$_wk" = state ] && _ws=$_wv
+        done < $CPW_D/status.$1
+    fi
+    echo "$_ws"
+}
+
+# Waits up to CPW_WAIT s for the CarPlay app to run again with a pid other than $1 (CPW_NEW). If
+# Android has not started it again after CPW_NUDGE s, its services (CPW_SVCS) are started.
+cp_wait_new() {
+    CPW_NEW=""
+    _wt0=$(uptime_s)
+    _wn=0
+    while [ $(($(uptime_s) - _wt0)) -lt $CPW_WAIT ]; do
+        sleep 1
+        _wp=$(cp_pid)
+        if [ -n "$_wp" ] && [ "$_wp" != "$1" ]; then
+            CPW_NEW=$_wp
+            return 0
+        fi
+        if [ $_wn = 0 ] && [ $(($(uptime_s) - _wt0)) -ge $CPW_NUDGE ] && [ -n "$CPW_SVCS" ]; then
+            _wn=1
+            for _ws in $CPW_SVCS; do
+                am startservice -n $_ws > /dev/null 2>&1
+            done
+            echo "EQE_CPW_NOTE the app had not started again after $CPW_NUDGE s; started its services: $CPW_SVCS"
+        fi
+    done
+    return 1
+}
+
+# Restarts the app $1 (it runs the watch); with the mount gone it comes back stock. 0 = back
+# without the watch (CPW_NEW); 1 = not back within CPW_WAIT s (CPW_NEW empty) or still with it.
+cpw_restart_stock() {
+    CPW_SVCS=$(cp_services)
+    kill -9 $1
+    cp_wait_new $1 || return 1
+    ! cpw_in $CPW_NEW
+}
+
+# Takes the watch off for good: the mount and the choice, so the app's next start and the next car
+# start are without it. $1 = the app's pid ("" if none), $2 = why. The app is restarted only when
+# the watch in it says the factory library did not load (CarPlayService cannot start in that app
+# start, so CarPlay cannot work there) and nothing is connected or playing.
+cpw_takeoff() {
+    rm -f $CPW_WANT $CPW_RS
+    unmount_at $CPW_T
+    _tn="$2; taken off (the CarPlay app's next start and the next car start are without it)"
+    if [ -n "$1" ] && [ -d $PROC/$1 ] && cpw_in $1 && [ "$(cpw_wstate $1)" = failed ]; then
+        cp_session $1
+        if ! cp_has_link $1 && [ $CPS_OK = 1 ] && [ $CPS_N = 0 ]; then
+            if cpw_restart_stock $1; then
+                _tn="$2; taken off, and the CarPlay app restarted without it (pid $CPW_NEW)"
+            else
+                _tn="$2; taken off, but the CarPlay app did not start again without it; restart the car (parked)"
+            fi
+        else
+            _tn="$2; taken off; the CarPlay app was not restarted ($(cp_conn $1)); restart the car (parked) to bring CarPlay back"
+        fi
+    fi
+    cpw_state failed "" "$_tn"
+    cpw_result "taken off: $_tn"
+    cpw_fail_note "$2"
+}
+
+cpw_lock() {
+    if ! mkdir $S/cpwatch.lock 2>/dev/null; then
+        _lt=""
+        [ -f $S/cpwatch.lock/at ] && read _lt < $S/cpwatch.lock/at
+        _lt=$(num "$_lt")
+        if [ $(($(uptime_s) - _lt)) -lt $((CPW_WAIT + 30)) ]; then
+            echo EQE_WAIT
+            echo "The CarPlay watch is already being switched. Try again in a minute."
+            return 1
+        fi
+        rm -rf $S/cpwatch.lock
+        mkdir $S/cpwatch.lock 2>/dev/null || { echo EQE_WAIT; echo "The CarPlay watch is already being switched."; return 1; }
+    fi
+    uptime_s > $S/cpwatch.lock/at
+    trap 'rm -rf $S/cpwatch.lock' EXIT
+    return 0
+}
+
+# the watch installed and unchanged since the install (its md5 then): 0, else 1
+cpw_file_ok() {
+    [ -f $CPW ] && [ -f $CPWSUM ] || return 1
+    _cw=""
+    read _cw < $CPWSUM
+    [ -n "$_cw" ] && [ "$(md5of $CPW)" = "$_cw" ]
+}
+
+# Makes CPW_COPY the same as the factory file, whose md5 is $1: 0 when it is
+cpw_copy() {
+    if [ ! -f $CPW_COPY ] || [ "$(md5of $CPW_COPY)" != "$1" ]; then
+        cat $CPW_T > $CPW_COPY.tmp 2>/dev/null && mv $CPW_COPY.tmp $CPW_COPY
+        rm -f $CPW_COPY.tmp
+    fi
+    [ -f $CPW_COPY ] && [ "$(md5of $CPW_COPY)" = "$1" ] || return 1
+    chmod 644 $CPW_COPY $CPW
+}
+
+# Lays the watch over the CarPlay app's JNI library and checks that what is there now is the watch
+# (its md5 from the install): 0, else the mount is taken off again and 1.
+cpw_mount() {
+    _cw=""
+    read _cw < $CPWSUM
+    if ! mount -o bind $CPW $CPW_T || ! mounted_at $CPW_T || [ "$(md5of $CPW_T)" != "$_cw" ]; then
+        unmount_at $CPW_T
+        return 1
+    fi
+    return 0
+}
+
+# act.sh cpwatch 1: checks the watch and the copy now, and records the choice for the next car start.
+# Nothing is restarted and nothing is laid over now.
+cpwatch_on() {
+    [ -f $S/disabled ] && { cpw_result "refused: EQ Engine is off; turn it on first"; return 1; }
+    cpw_prop_clear
+    cpe_share
+    # a unit without the factory CarPlay app: nothing to do, and nothing failed
+    if [ ! -f $CPW_T ] && ! mounted_at $CPW_T; then
+        cpw_state absent "" "this unit has no factory CarPlay app ($CPW_T)"
+        cpw_result "refused: this unit has no $CPW_T"
+        return 1
+    fi
+    cpw_file_ok || { cpw_refuse "the CarPlay watch is not installed or failed its check"; return 1; }
+    [ -x $LABBIN ] || { cpw_refuse "eqe_lab is not installed"; return 1; }
+    _cpp=$(cp_pid)
+    if mounted_at $CPW_T; then
+        # laid over at this car start and still there (the choice is kept or written again)
+        [ -f $CPW_WANT ] || {
+            _cu=1000
+            [ -n "$_cpp" ] && _cu=$(cp_uid $_cpp)
+            echo "1 $(md5of $CPW_COPY) ${_cu:-1000}" > $CPW_WANT
+            chmod 644 $CPW_WANT
+        }
+        cpw_result "already on"
+        return 0
+    fi
+    # the unchanged copy of the car's own file that the watch loads in the app
+    _fm=$(md5of $CPW_T)
+    cpw_copy $_fm || { cpw_refuse "the copy of the factory CarPlay library could not be made"; return 1; }
+    # checked before use, in a process of its own: the watch loads, finds TinyALSA's functions, and
+    # reads the copy as a file
+    _cc=$($LABBIN cpcheck $CPW $CPW_COPY 2>&1)
+    case "$_cc" in
+        "cpcheck ok "*) ;;
+        *) cpw_refuse "the CarPlay watch did not pass its check before use (${_cc#cpcheck })"; return 1 ;;
+    esac
+    # the app's user: the notes folder is made its own at the car start (the CarPlay app runs as
+    # the system user, 1000, on this unit)
+    _cu=""
+    [ -n "$_cpp" ] && _cu=$(cp_uid $_cpp)
+    case "$_cu" in
+        ''|*[!0-9]*) _cu=1000 ;;
+    esac
+    echo "1 $_fm $_cu" > $CPW_WANT.tmp && mv $CPW_WANT.tmp $CPW_WANT
+    chmod 644 $CPW_WANT
+    if [ -n "$_cpp" ] && cpw_in $_cpp; then
+        # 0.7.5: turned off and on again within one car start (or EQ Engine off and on): the CarPlay
+        # app running now still has the watch loaded, and its EQ follows the switch at once. It is
+        # laid over again for that app's next start, as at the car start, and the guard watches it.
+        [ -n "$_cpp" ] && echo "EQE_CPW_NOTE the CarPlay app (pid $_cpp) has $(cp_conn $_cpp) now"
+        rm -f $CPW_RS
+        if cpw_mount; then
+            cpw_state on $_cpp "watching (still loaded since the car start; turned on again)"
+            cpw_result "on: still loaded in the CarPlay app (pid $_cpp); laid over again for its next start. Nothing was restarted"
+        else
+            cpw_state on $_cpp "watching (still loaded since the car start); laid over again from the next car start"
+            cpw_result "on: still loaded in the CarPlay app (pid $_cpp); laid over again from the next car start. Nothing was restarted"
+        fi
+        return 0
+    else
+        cpw_state pending "" "on from the next car start"
+    fi
+    [ -n "$_cpp" ] && echo "EQE_CPW_NOTE the CarPlay app (pid $_cpp) has $(cp_conn $_cpp) now"
+    cpw_result "on from the next car start; restart the car (parked) to start it. Nothing was restarted now"
+}
+
+# act.sh cpwatch 0: the choice and the mount off. The app running now keeps the watch until the car
+# restarts (with the EQ on CarPlay's music, unless its switch is off); its next start, and the next car start, are without it.
+cpwatch_off() {
+    cpw_prop_clear
+    rm -f $CPW_WANT $CPW_RS
+    _cpp=$(cp_pid)
+    [ -n "$_cpp" ] && echo "EQE_CPW_NOTE the CarPlay app (pid $_cpp) has $(cp_conn $_cpp) now"
+    if ! unmount_at $CPW_T; then
+        cpw_state ending "$_cpp" "off from the next car start (the mount could not be removed now)"
+        cpw_result "off from the next car start; the watch's mount could not be removed now"
+        return 1
+    fi
+    if [ -n "$_cpp" ] && cpw_in $_cpp; then
+        cpw_state ending $_cpp "off from the next car start; the CarPlay app running now keeps it until then (the EQ on CarPlay's music too, unless its switch is off)"
+        cpw_result "off from the next car start; the CarPlay app running now keeps it until then (the EQ on CarPlay's music too, unless its switch is off). Nothing was restarted"
+    else
+        cpw_state off "" "off"
+        cpw_result "off"
+    fi
+    return 0
+}
+
+# act.sh cpwboot (the boot step, at the car start, before the CarPlay app starts): lays the watch
+# over the app's JNI library when it is on, after checking that the watch, the factory file and the
+# copy are the ones checked when it was turned on.
+cpw_boot_fail() {
+    rm -f $CPW_WANT
+    cpw_state failed "" "$1; it stays off until it is turned on again"
+    cpw_result "not laid over at this start: $1"
+    cpw_fail_note "$1"
+}
+
+# EQ on CarPlay's music (0.7.3): the folder the app writes the CarPlay watch's settings to
+# (share/cp_eq.bin, native/cpeq.h): the app's own, readable by the CarPlay app (another user)
+cpe_share() {
+    mkdir -p $D/share
+    _so=$(owner_of $D/settings)
+    [ -n "$_so" ] && chown $_so:$_so $D/share 2>/dev/null
+    chmod 755 $D/share
+}
+
+cpw_boot() {
+    [ -f $CPW_WANT ] || return 0
+    _bw=""; _bm=""; _bu=""
+    read -r _bw _bm _bu < $CPW_WANT
+    [ "$_bw" = 1 ] || return 0
+    [ -f $S/disabled ] && return 0
+    case "$_bu" in
+        ''|*[!0-9]*) _bu=1000 ;;
+    esac
+    # already laid over at this car start (the boot step runs again when EQ Engine is turned on)
+    mounted_at $CPW_T && return 0
+    _bp=$(cp_pid)
+    # (an app that already runs the watch, from an earlier mount that was taken off, is laid over
+    # for as usual: the watch is what it has; its maps show the watch under the factory name or,
+    # once the mount was detached, under none)
+    if [ -n "$_bp" ] && ! cpw_in $_bp && maps_has $_bp ${CPW_T##*/}; then
+        cpw_state pending "" "on from the next car start (the CarPlay app had already loaded its library at this start)"
+        cpw_result "not laid over at this start: the CarPlay app (pid $_bp) had already loaded its library; on from the next car start"
+        return 0
+    fi
+    cpw_file_ok || { cpw_boot_fail "the CarPlay watch failed its check"; return 1; }
+    [ -f $CPW_T ] || { cpw_boot_fail "this unit has no $CPW_T"; return 1; }
+    _fm=$(md5of $CPW_T)
+    cpw_copy $_fm || { cpw_boot_fail "the copy of the factory CarPlay library could not be made"; return 1; }
+    if [ "$_fm" != "$_bm" ]; then
+        # 0.7.4: the factory library changed since it was checked (a software update): the new one
+        # is checked the same way before use, and the choice follows it
+        _cc=$($LABBIN cpcheck $CPW $CPW_COPY 2>&1)
+        case "$_cc" in
+            "cpcheck ok "*) ;;
+            *) cpw_boot_fail "the factory CarPlay library changed (a software update?) and the new one did not pass the check before use (${_cc#cpcheck })"; return 1 ;;
+        esac
+        echo "1 $_fm $_bu" > $CPW_WANT.tmp && mv $CPW_WANT.tmp $CPW_WANT
+        chmod 644 $CPW_WANT
+        cpw_result "the factory CarPlay library changed (a software update?); the new one passed the check before use"
+    fi
+    # the last start's notes are kept once; the watch writes its notes as the app's own user. Not
+    # while the app runs the watch: its notes and its live file (mapped by path) stay where they are
+    if [ -z "$_bp" ] || ! cpw_in $_bp; then
+        rm -rf $CPW_D.prev
+        [ -d $CPW_D ] && mv $CPW_D $CPW_D.prev
+    fi
+    mkdir -p $CPW_D
+    cpe_share
+    if chown $_bu:$_bu $CPW_D 2>/dev/null; then
+        chmod 755 $CPW_D
+    else
+        chmod 777 $CPW_D
+    fi
+    rm -f $CPW_RS
+    if ! cpw_mount; then
+        cpw_boot_fail "the CarPlay watch could not be laid over $CPW_T"
+        return 1
+    fi
+    cpw_state waiting "" "laid over at the car start; waiting for the CarPlay app to load it"
+    cpw_result "laid over the CarPlay app's JNI library at the car start (uptime $(uptime_s))"
+}
+
+# The keeper's check (every few seconds; act.sh cpwguard runs it once) while the watch is laid
+# over: the app's first start with it is noted (on), a later start too (it keeps the watch, the
+# mount is still there), a second later start within two minutes takes it off, and so does a watch
+# that says the factory library did not load.
+cpw_guard() {
+    case "$(cpw_get state)" in
+        waiting|on) ;;
+        *) return 0 ;;
+    esac
+    mounted_at $CPW_T || return 0
+    _gp=$(cpw_get pid)
+    _gn=$(cp_pid)
+    [ -n "$_gn" ] || return 0
+    if [ "$_gn" = "$_gp" ]; then
+        [ "$(cpw_wstate $_gn)" = failed ] && cpw_takeoff $_gn "the watch could not load the factory library (pid $_gn)"
+        return 0
+    fi
+    # a start of the app that has not loaded its JNI library yet: looked at again next round
+    cpw_in $_gn || return 0
+    if [ -n "$_gp" ]; then
+        _now=$(uptime_s)
+        echo $_now >> $CPW_RS
+        chmod 644 $CPW_RS
+        _gc=0
+        while read -r _gt; do
+            case "$_gt" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            [ $((_now - _gt)) -le 120 ] && _gc=$((_gc + 1))
+        done < $CPW_RS
+        if [ $_gc -ge 2 ]; then
+            cpw_takeoff $_gn "the factory CarPlay app started again twice within 2 minutes with the watch"
+            return 0
+        fi
+        cpw_state on $_gn "watching (the app started again: pid $_gp -> $_gn)"
+        cpw_result "the factory CarPlay app started again (pid $_gp -> $_gn); the watch stays on"
+        return 0
+    fi
+    cpw_state on $_gn "watching"
+    cpw_result "loaded in the factory CarPlay app (pid $_gn), started from the zygote as usual"
+    [ "$(cpw_wstate $_gn)" = failed ] && cpw_takeoff $_gn "the watch could not load the factory library (pid $_gn)"
+    return 0
+}
+
+# EQ Engine off, and the start of an uninstall: the choice and the mount off; the app running then
+# keeps the watch until the car restarts (its EQ passes the music through untouched: EQ Engine is off). Nothing is restarted.
+cpw_all_off() {
+    cpw_prop_clear
+    [ -f $CPW_WANT ] || mounted_at $CPW_T || [ "$(cpw_get state)" = on ] || return 0
+    rm -f $CPW_WANT $CPW_RS
+    unmount_at $CPW_T
+    _ap=$(cp_pid)
+    if [ -n "$_ap" ] && cpw_in $_ap; then
+        cpw_state ending $_ap "off (EQ Engine turned off); the CarPlay app running now keeps it until the next car start"
+    else
+        cpw_state off "" "off (EQ Engine turned off)"
+    fi
+}
+
+cpwatch_action() {
+    case "$1" in
+        0|1) ;;
+        *) echo "usage: act.sh cpwatch <watch 0|1>"; return 2 ;;
+    esac
+    cpw_lock || return 3
+    if [ $1 = 1 ]; then cpwatch_on; else cpwatch_off; fi
 }
 
 # "<section>: <rates>" for each part of an audio policy file that declares sampling rates
@@ -1795,6 +2550,13 @@ report() {
             cat $DRV/status
             [ -f $DRV/drv.log ] && safe < $DRV/drv.log
         fi
+        if [ -f $CPW_ST ] || [ -d $CPW_D ]; then
+            echo "-- CarPlay watch"
+            cat $CPW_ST $S/cpw_result 2>/dev/null
+            for _f in $CPW_D/status.* $CPW_D/cpw_*.log; do
+                [ -f $_f ] && { echo "== ${_f##*/}"; safe < $_f; }
+            done
+        fi
         report_section "EQ Engine: app log"
         [ -f "$A/eqengine.log" ] && safe < "$A/eqengine.log"
         report_section "Kernel log: audio lines"
@@ -2060,6 +2822,114 @@ state_now() {
     echo "$_st"
 }
 
+# ------------------------------------------------------------------ curves on USB
+#
+# act.sh curves save|load <usb root> (the EQ page's Curves on USB, 0.6.11): the four user slots
+# (settings/preset1..4.txt, which Easy and Expert share) to or from <usb>/EQENGINE_CURVES as
+# user1..user4.txt, to keep them or to share them with other owners. A slot file is one line:
+# "preamp,10 slider values" (Easy) or "x;preamp;type:frequency:gain:width;..." (Expert), in
+# 0.01 dB and 0.01 Hz. Load takes a file only when it looks like that (one short line of digits,
+# signs, commas, colons, semicolons and the x; a PC's line ending is allowed), and leaves alone a
+# slot the stick has no file for. The files written as root get the app's owner, as the
+# installer gives the settings folder's.
+CURVES_DIR=EQENGINE_CURVES
+# a carriage return, for a PC's line endings: the car's mksh has print but no printf (and the car
+# has no printf program; 0.6.11 on the car: "printf: not found"); dash and bash have printf
+CR=$(print -n '\r' 2>/dev/null)
+[ ${#CR} = 1 ] || CR=$(printf '\r' 2>/dev/null)
+
+# the owner of $1 (toolbox ls -ld: mode, owner, group ...; a PC's ls has the link count first)
+owner_of() {
+    set -- $(ls -ld "$1" 2>/dev/null)
+    case "$2" in
+        ''|*[!0-9]*) echo "$2" ;;
+        *) echo "$3" ;;
+    esac
+}
+
+# 0 when $1 holds one slot line; it is left in CURVE_LINE
+curve_ok() {
+    CURVE_LINE=""
+    [ -f "$1" ] || return 1
+    _cn=0
+    while IFS= read -r _cx || [ -n "$_cx" ]; do
+        _cx=${_cx%"$CR"}
+        _cn=$((_cn + 1))
+        if [ $_cn = 1 ]; then
+            CURVE_LINE=$_cx
+        elif [ -n "$_cx" ]; then
+            return 1
+        fi
+    done < "$1"
+    [ -n "$CURVE_LINE" ] && [ ${#CURVE_LINE} -le 1200 ] || return 1
+    case "$CURVE_LINE" in
+        *[!0-9x,:\;-]*) return 1 ;;
+        x\;*) ;;
+        *x*) return 1 ;;
+    esac
+    return 0
+}
+
+curves_action() {
+    _cw=$1
+    _cu=$2
+    [ -n "$_cu" ] && [ -d "$_cu" ] || { echo "no USB stick at $_cu"; return 1; }
+    _cd="$_cu/$CURVES_DIR"
+    case "$_cw" in
+    save)
+        mkdir -p "$_cd" || { echo "cannot write to $_cd"; return 1; }
+        _cnum=0
+        for _ci in 1 2 3 4; do
+            [ -f $D/settings/preset$_ci.txt ] || continue
+            cat $D/settings/preset$_ci.txt > "$_cd/user$_ci.txt" || { echo "cannot write $_cd/user$_ci.txt (the stick may be full)"; return 1; }
+            _cnum=$((_cnum + 1))
+        done
+        {
+            echo "EQ Engine curves: User 1 to 4 as user1.txt .. user4.txt, saved $(date +%Y-%m-%d) by EQ Engine $VER."
+            echo "To use them: EQ page, Curves on USB, Load from stick (it replaces User 1 to 4)."
+            echo "Each file is one line: the preamp and the ten sliders, in 0.01 dB (Easy), or"
+            echo "x;preamp;type:frequency:gain:width;... (Expert: type 1 peak, 2 low shelf, 3 high shelf, 4 low cut;"
+            echo "frequency in 0.01 Hz, gain in 0.01 dB; width: a peak's bandwidth in 0.001 octave, a low cut's Q x 1000)."
+        } > "$_cd/README.txt"
+        sync
+        if [ $_cnum = 0 ]; then
+            echo "EQE_CURVES No user slot is saved yet, so there was nothing to copy (press and hold User 1 to 4 to save one)."
+        else
+            echo "EQE_CURVES Saved $_cnum of the 4 user slots to the stick ($CURVES_DIR)."
+        fi
+        ;;
+    load)
+        [ -d "$_cd" ] || { echo "the stick has no $CURVES_DIR folder (Save to stick makes one)"; return 1; }
+        _cown=$(owner_of $D/settings)
+        _cnum=0
+        _cbad=""
+        for _ci in 1 2 3 4; do
+            [ -f "$_cd/user$_ci.txt" ] || continue
+            if ! curve_ok "$_cd/user$_ci.txt"; then
+                _cbad="${_cbad:+$_cbad, }User $_ci"
+                continue
+            fi
+            # echo is safe here: the line holds only digits, x , : ; and - (curve_ok), and no
+            # echo takes a word like "-500,..." for an option
+            echo "$CURVE_LINE" > $D/settings/preset$_ci.txt.tmp || { echo "cannot write the settings folder"; return 1; }
+            [ -n "$_cown" ] && chown $_cown:$_cown $D/settings/preset$_ci.txt.tmp 2>/dev/null
+            chmod 600 $D/settings/preset$_ci.txt.tmp
+            mv $D/settings/preset$_ci.txt.tmp $D/settings/preset$_ci.txt
+            _cnum=$((_cnum + 1))
+        done
+        _cmsg="Loaded $_cnum curve(s) from the stick into the user slots."
+        [ -n "$_cbad" ] && _cmsg="$_cmsg Left alone, not a curve file: $_cbad."
+        [ $_cnum = 0 ] && [ -z "$_cbad" ] && _cmsg="The stick's $CURVES_DIR folder has no user1..user4.txt."
+        echo "EQE_CURVES $_cmsg"
+        ;;
+    *)
+        echo "usage: act.sh curves save|load <usb root>"
+        return 2
+        ;;
+    esac
+    return 0
+}
+
 case "$1" in
 save)
     U=$2
@@ -2077,6 +2947,14 @@ save)
     done
     for f in $DRV/*; do
         [ -f "$f" ] && cat "$f" > "drv_${f##*/}.txt"
+    done
+    for f in $CPW_D/* $CPW_D.prev/*; do
+        [ -f "$f" ] || continue
+        case "$f" in
+            *.bin) continue ;; # the live file (levels for the app's meter), not text
+            $CPW_D.prev/*) cat "$f" > "cpw_prev_${f##*/}.txt" ;;
+            *) cat "$f" > "cpw_${f##*/}.txt" ;;
+        esac
     done
     cat /data/nemesis/logs/eqengine/boot.log > boot_step.log 2>&1
     for f in /data/nemesis/logs/*.log; do
@@ -2118,6 +2996,15 @@ save)
         echo "copied here (written since this install of EQ Engine):${TN:- none}" >> tombstones_list.txt
         # the factory CarPlay app's libraries and their TinyALSA and mixer imports
         carplay_probe list > carplay_probe.txt 2>&1
+        # the CarPlay app's process as it runs (to compare a start with the CarPlay watch, through
+        # the wrap property, with a normal one): its status, personality, command line,
+        # environment and maps
+        _sp=$(cp_pid)
+        if [ -n "$_sp" ]; then
+            for f in status personality cmdline environ maps; do
+                cat $PROC/$_sp/$f > "dipo_$f.txt" 2>/dev/null
+            done
+        fi
         /system/bin/dumpsys media.audio_flinger > audioflinger.txt 2>&1
         /system/bin/dumpsys meminfo > meminfo_apps.txt 2>&1
         /system/bin/logcat -d -v time > logcat.txt 2>&1
@@ -2145,6 +3032,17 @@ lab)
     # act.sh lab <watch 0|1>: the driver watch, in memory until the next car start.
     lab_action "$2" || exit $?
     ;;
+cpwatch)
+    # act.sh cpwatch <watch 0|1>: the CarPlay watch, from the next car start.
+    cpwatch_action "$2" || exit $?
+    ;;
+cpwboot)
+    # the boot step, at the car start: lays the CarPlay watch over the app's JNI library if it is on
+    cpw_boot || exit 1
+    ;;
+cpwguard)
+    cpw_guard
+    ;;
 keep)
     # the 48 kHz output keeper (started by the boot step); runs until EQ Engine is turned off
     keep_loop
@@ -2167,6 +3065,7 @@ off)
         mounted && sleep 1
     done
     lab_unmount_all
+    cpw_all_off
     mounted && { echo "the overlay could not be removed; it goes away at the next start"; exit 1; }
     echo "off"
     ;;
@@ -2269,8 +3168,14 @@ shot)
     sync
     echo "EQE_SHOT EQENGINE/$F"
     ;;
+curves)
+    # act.sh curves save|load <usb root>: the user slots to or from the stick (see "curves on USB")
+    curves_action "$2" "$3"
+    _crc=$?
+    [ $_crc = 0 ] || exit $_crc
+    ;;
 *)
-    echo "usage: act.sh save|restart|conv|lab|keep|report|off|on|open|trace|shot"
+    echo "usage: act.sh save|restart|conv|lab|cpwatch|cpwboot|cpwguard|keep|report|off|on|open|trace|shot|curves"
     exit 2
     ;;
 esac

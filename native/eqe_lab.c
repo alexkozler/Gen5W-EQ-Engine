@@ -1,5 +1,5 @@
 /*
- * eqe_lab: root helper for the 48 kHz output (act.sh keep), the car report and diagnostics, 0.6.6.
+ * eqe_lab: root helper for the 48 kHz output (act.sh keep), the car report and diagnostics, 0.6.7.
  *
  *   eqe_lab check              are Android's AudioSystem functions there? Looks them up and calls
  *                              nothing: "symbols 4 of 4"
@@ -17,10 +17,17 @@
  *                              from the link's start). "link none" if nothing plays.
  *   eqe_lab get <io> <keys>    Android's AudioSystem::getParameters(io, keys): prints the answer
  *   eqe_lab set <io> <kv>      Android's AudioSystem::setParameters(io, kv): prints "status <n>"
- *   eqe_lab umount <path>      detaches one of EQ Engine's bind mounts (the driver watch, or the
- *                              effects list) even while the audio server still has the file open:
- *                              a plain umount says "busy" then. The running audio server keeps the
- *                              copy it has loaded; the next one opens the file underneath.
+ *   eqe_lab umount <path>      detaches one of EQ Engine's bind mounts (the driver watch, the
+ *                              effects list, or the CarPlay watch) even while a process still has
+ *                              the file open: a plain umount says "busy" then. A running process
+ *                              keeps the copy it has loaded; the next one opens the file underneath.
+ *   eqe_lab cpcheck <watch> <copy>
+ *                              the CarPlay watch's check before use (act.sh cpwatch): loads the
+ *                              watch in this process (not in the CarPlay app), asks it to find the
+ *                              car's TinyALSA functions and to read the copy of the factory
+ *                              libCarPlayAndroid.so as a file (nothing of it runs here): "cpcheck ok
+ *                              the factory library exports JNI_OnLoad and needs libCarPlayAudio.so;
+ *                              TinyALSA: 7 of 7 functions"
  *
  * The rate comes from /proc/asound/cardN/pcmMp/sub0/status: hw_ptr is the number of frames the
  * hardware has taken since the link started and tstamp is when the kernel last updated it, so the
@@ -474,14 +481,41 @@ out:
 }
 
 static int usage(void) {
-    fprintf(stderr, "usage: eqe_lab rate [ms] | get <io> <keys> | set <io> <key=value> | check | umount <path> | imports <file>\n");
+    fprintf(stderr, "usage: eqe_lab rate [ms] | get <io> <keys> | set <io> <key=value> | check | umount <path> | imports <file>"
+                    " | cpcheck <watch> <copy>\n");
     return 2;
+}
+
+/* "cpcheck <watch> <copy>": the CarPlay watch loads here, finds all 7 of the car's TinyALSA functions
+   it hands its calls on to, and checks the copy of the factory library it loads in the CarPlay app
+   (eqe_cpw_check). 0 = all good. */
+static int cmd_cpcheck(const char *path, const char *copy) {
+    if (path[0] != '/' || copy[0] != '/') return usage();
+    void *h = dlopen(path, RTLD_NOW);
+    if (h == NULL) {
+        const char *e = dlerror();
+        printf("cpcheck failed: it does not load: %s\n", e ? e : "?");
+        return 1;
+    }
+    void *p = dlsym(h, "eqe_cpw_check");
+    int (*check)(const char *, char *, int);
+    if (p == NULL) {
+        printf("cpcheck failed: it is not the CarPlay watch (no eqe_cpw_check)\n");
+        return 1;
+    }
+    memcpy(&check, &p, sizeof(p));
+    char msg[400];
+    msg[0] = 0;
+    int good = check(copy, msg, (int)sizeof(msg));
+    printf("cpcheck %s %s\n", good ? "ok" : "failed:", msg);
+    return good ? 0 : 1;
 }
 
 /* "umount <path>": only the files EQ Engine lays bind mounts over (tests put them under a root). */
 static int cmd_umount(const char *path) {
     static const char *const kOurs[] = {"/system/lib/hw/audio.primary.tcc803x.so",
-                                        "/system/etc/audio_effects.conf", "/system/etc/audio_policy.conf"};
+                                        "/system/etc/audio_effects.conf", "/system/etc/audio_policy.conf",
+                                        "/system/lib/libCarPlayAndroid.so"};
     size_t n = strlen(path), i;
     int ours = 0;
     if (path[0] != '/' || strstr(path, "..") != NULL) return usage();
@@ -502,6 +536,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "check") == 0) return cmd_check();
     if (argc == 3 && strcmp(argv[1], "umount") == 0) return cmd_umount(argv[2]);
     if (argc == 3 && strcmp(argv[1], "imports") == 0) return cmd_imports(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "cpcheck") == 0) return cmd_cpcheck(argv[2], argv[3]);
     if (argc >= 2 && strcmp(argv[1], "rate") == 0) {
         int ms = argc >= 3 ? atoi(argv[2]) : 3000;
         if (ms < 0 || ms > 60000) return usage();

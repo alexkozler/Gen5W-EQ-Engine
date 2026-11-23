@@ -37,6 +37,10 @@ D
 
 setup() {
     rm -rf $T; mkdir -p $T/data/eqengine/state $T/proc $T/stubs $T/props
+    # the car has no printf: neither its mksh nor its toolbox (0.6.11's curves load failed on it).
+    # dash and bash have their own, so this stands in for the car under mksh only.
+    printf '#!/bin/sh\necho "printf: not found" >&2\nexit 127\n' > $T/stubs/printf
+    chmod +x $T/stubs/printf
     echo "700.25 50.00" > $T/proc/uptime
     echo 5056 > $T/mspid; mkdir -p $T/proc/5056 $T/proc/987
     : > $T/as.log
@@ -279,7 +283,7 @@ labsetup() {  # a unit with Hyundai's driver, EQ Engine's watch layer and Lab he
     mkdir -p $T/proc/5056/task/4258 $T/proc/4258 $T/data/app
     printf 'Name:\tmediaserver\nTgid:\t5056\n' > $T/proc/4258/status
     echo "b6c00000-b6c06000 r-xp 00000000 b3:19 4243   /data/eqengine/lib/libeqengine.so" > $T/proc/5056/maps
-    rm -f $T/waking $T/wake_fail $T/newtrack $T/hold_fail_once $T/start_in
+    rm -f $T/waking $T/wake_fail $T/newtrack $T/hold_fail_once $T/hold_fail_after $T/start_in $T/rate_none
     rm -f $T/other $T/other_at $T/other_stops_music $T/other_then_play $T/other_on_wake $T/imports.log
     # the factory CarPlay app (pid 2290; thread 2291 plays to the main link when "other" is set),
     # with the libraries it has mapped
@@ -296,6 +300,11 @@ b2000000-b2001000 rw-p 00000000 00:00 0          [anon:libc_malloc]
 b1000000-b1100000 r--p 00000000 b3:19 500        /system/framework/framework.jar
 M
     echo "factory tinyalsa" > $T/system/lib/libtinyalsa.so
+    # the CarPlay code and config files the probe reads texts and checksums from
+    echo "factory carplay audio" > $T/system/lib/libCarPlayAudio.so
+    mkdir -p $T/system/app; echo "dipo code" > $T/system/app/DiPO.odex; echo "other code" > $T/system/app/Other.odex
+    printf 'audio_out=tinyalsa\nlatency=40\n' > $T/system/etc/dipo_audio.conf; echo x > $T/system/etc/unrelated.conf
+    rm -f $T/strings.log
     # the system log's clock (the driver's lines are read from the time of a switch on)
     cat > $T/stubs/date <<'S'
 #!/bin/sh
@@ -352,6 +361,11 @@ umount)
     grep -v " $2 " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
     echo "detached $2" ;;
 rate)
+    # rate_none: that many counts get nothing (the link stopped during the count)
+    if [ -f $T/rate_none ] && [ "$(cat $T/rate_none)" -gt 0 ]; then
+        echo $(($(cat $T/rate_none) - 1)) > $T/rate_none
+        echo "link none"; exit 0
+    fi
     if [ -f $T/other ]; then
         echo "link pcm2p card0 state=RUNNING owner=$(cat $T/other) rate=44100 fps=44100.0"
     elif [ -f $T/playing ] || [ -f $T/waking ]; then
@@ -361,11 +375,18 @@ imports)
     # stand-ins for the CarPlay app's libraries (the real reader is tested in tests/lab)
     echo "imports $2" >> $T/imports.log
     case "$2" in
-        */libCarPlayAudio.so) printf 'needed libc.so\nneeded libtinyalsa.so\nneeded libCarPlayUtils.so\nimport malloc\nimport pcm_open\nimport pcm_writei\nimport mixer_open\nimport mixer_get_ctl_by_name\nexport CarPlayAudioStart\n' ;;
+        */libCarPlayAudio.so) printf 'needed libc.so\nneeded libtinyalsa.so\nneeded libCarPlayUtils.so\nimport malloc\nimport pcm_open\nimport pcm_writei\nimport mixer_open\nimport mixer_get_ctl_by_name\nexport CarPlayAudioStart\nimport _ZN7android10AudioTrackC1Ev\nimport _ZN7android11AudioSystem13getParametersEiRKNS_7String8E\nexport TccCarPlayAudioTinyALSA_Open\nexport TccCarPlayAudioTrack_Write\n' ;;
         */libtinyalsa.so) printf 'needed libc.so\nimport ioctl\nexport pcm_open\nexport pcm_writei\nexport mixer_open\nexport mixer_ctl_get_name\n' ;;
         */libbroken.so) echo "EQE_LAB_ERR imports: unexpected program header size"; exit 1 ;;
-        */libc.so) printf 'import __stack_chk_guard\nexport malloc\nexport pcm_fake_export\n' ;;
+        */libc.so) printf 'import __stack_chk_guard\nexport malloc\nexport pcm_fake_export\nimport _ZN7android10AudioTrackC1Ev\nexport tinyalsa_like_export\n' ;;
         *) printf 'needed libc.so\nimport memcpy\n' ;;
+    esac ;;
+strings)
+    # stand-ins for the texts in the CarPlay code (the real scanner is tested in tests/lab)
+    echo "strings $2" >> $T/strings.log
+    case "$2" in
+        */libCarPlayAudio.so) printf 'string persist.dipo.audio.output\nstring [TccCarPlayAudioTinyALSA] Main audio setting up PCM/%%d/%%d/%%d for %%s\n' ;;
+        */DiPO.odex) printf 'string /system/etc/dipo_audio.conf\nstring-limit 3 more not printed\n' ;;
     esac ;;
 set)
     echo "set $2 $3" >> $T/lab_calls.log
@@ -385,6 +406,8 @@ set)
         keep) hal "Set sampling_rate error, out->pcm_config->rate (44100)"; echo "status -22" ;;
         convert) echo "48000 44100" > $T/rates; echo "status 0" ;;
         mismatch) hal "start_output_stream(0/2), channel(2), samplerate(48000), pcm(0xb7695898)"; echo 48000 > $T/link_rate; echo 48000 > $T/link_fps; echo "status 0" ;;
+        # everyone says 48000, but the link is still clocked at 44.1 kHz (wrong speed)
+        slowclock) hal "start_output_stream(0/2), channel(2), samplerate(48000), pcm(0xb7695898)"; echo "48000 44100" > $T/rates; echo 48000 > $T/link_rate; echo 44100 > $T/link_fps; echo "status 0" ;;
         crash) p=$(cat $T/mspid); rm -rf $T/proc/$p; n=$((p + 1)); mkdir -p $T/proc/$n/task/4258; echo $n > $T/mspid; echo "44100 44100" > $T/rates; echo 44100 > $T/link_rate; $T/stubs/afsim reset; echo "status -32" ;;
         esac ;;
     sampling_rate=44100)
@@ -508,7 +531,13 @@ d=$3; shift 4
 w=""; [ "$1" = wake ] && { w=1; shift; }
 echo "${w:+wake }$*" >> $T/hold.log
 mkdir -p $T/proc/$$; echo app_process > $T/proc/$$/cmdline
-if [ -f $T/hold_fail ] || [ -f $T/hold_fail_once ]; then
+# hold_fail_after N: N holds work, every later one fails
+_fa=""
+if [ -f $T/hold_fail_after ]; then
+    _n=$(cat $T/hold_fail_after)
+    if [ "$_n" -le 0 ]; then _fa=1; else echo $((_n - 1)) > $T/hold_fail_after; fi
+fi
+if [ -f $T/hold_fail ] || [ -f $T/hold_fail_once ] || [ -n "$_fa" ]; then
     rm -f $T/hold_fail_once
     echo "failed session $1: java.lang.RuntimeException: Cannot initialize effect engine for type: 1de0ea4c Error: -1" > $d/state.tmp; mv $d/state.tmp $d/state
     rm -rf $T/proc/$$; exit 1
@@ -546,7 +575,7 @@ HALT=$T/system/lib/hw/audio.primary.tcc803x.so
 nkills() { [ -f $T/kill.log ] && wc -l < $T/kill.log || echo 0; }
 later() { echo "$(( $(cut -d. -f1 $T/proc/uptime) + ${1:-11} )).00 50.00" > $T/proc/uptime; }
 nsets() { [ -f $T/lab_calls.log ] && wc -l < $T/lab_calls.log || echo 0; }
-keep() { ( cd /; EQE_TEST_ROOT=$T EQE_KEEP_ROUNDS=${1:-4} EQE_IDLE_AFTER=${IDLE:-8} EQE_OTHER_QUIET=${QUIET:-60} EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 60 $SH $ACT keep > $T/out.txt 2>&1; echo $? > $T/rc ); }
+keep() { ( cd /; EQE_TEST_ROOT=$T EQE_KEEP_ROUNDS=${1:-4} EQE_IDLE_AFTER=${IDLE:-8} EQE_OTHER_QUIET=${QUIET:-60} EQE_KEEP_MTRIES=${MTRIES:-5} EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 60 $SH $ACT keep > $T/out.txt 2>&1; echo $? > $T/rc ); }
 keepi() { IDLE=2 keep "$@"; }
 tracks_on_mix() { [ "$(cut -d' ' -f4 $T/af/tracks | sort -u)" = "$(cat $T/af/mix)" ]; }
 ost() { sed -n "s/^$1=//p" $LS/output; }
@@ -699,6 +728,24 @@ ok "idle: not before the audio server has settled (8 s)" "[ $(nsets) = 0 ] && [ 
 labsetup; rm -f $T/playing; $T/stubs/asound; touch $T/wake_fail; echo 6 > $T/start_in
 keepi 12
 ok "idle: the silent track does not start the link: nothing is sent while idle; switched once the music plays" "grep -q \"the main output's link did not start with the silent track\" $LS/output.log && [ ! -f $T/standby_sets.log ] && [ \"\$(cat $T/lab_calls.log)\" = 'set 101 sampling_rate=48000' ] && [ \"\$(ost state)\" = 48k ] && tracks_on_mix"
+# the link's frames counted when the music starts after a switch made while nothing played
+labsetup; rm -f $T/playing; $T/stubs/asound
+keepi 7
+ok "measured: before the music the switch is not called checked (fps empty)" "[ \"\$(ost state)\" = 48k ] && [ -z \"\$(ost fps)\" ]"
+labsetup; rm -f $T/playing; $T/stubs/asound; echo slowclock > $T/driver48; touch $T/start_after_set
+keepi 12
+ok "measured: the link says 48 kHz but runs at 44.1 kHz: 44100 put back with the main output's sessions held, like every rate change" "[ \"\$(cat $T/lab_calls.log)\" = 'set 101 sampling_rate=48000
+set 101 sampling_rate=44100' ] && grep -q 'link pcm2p is set to 48000 Hz but took 44100 frames/s' $LS/output.log && [ \$(grep -c \"holding the main output's audio sessions\" $LS/output.log) = 2 ] && [ \"\$(sed -n 2p $T/hold.log)\" = '13 107 21 111' ] && tracks_on_mix && [ ! -s $T/af/chains ]"
+ok "measured: back at 44.1 kHz and held there for this audio server, said why" "[ \"\$(ost state)\" = held ] && [ \"\$(cat $T/rates)\" = '44100 44100' ] && grep -q 'note=the link took 44100 frames/s at 48000 Hz; back at 44.1 kHz' $LS/output && [ ! -f $LS/rate48 ] && [ $(nsets) = 2 ]"
+labsetup; rm -f $T/playing; $T/stubs/asound; echo slowclock > $T/driver48; touch $T/start_after_set; echo 1 > $T/hold_fail_after
+keepi 12
+ok "measured: the tracks cannot be held for the put-back: nothing is sent unheld, and the wrong speed is said" "[ \"\$(cat $T/lab_calls.log)\" = 'set 101 sampling_rate=48000' ] && [ \"\$(ost state)\" = mismatch ] && grep -q 'note=Link pcm2p runs at 44100 frames/s at 48000 Hz: wrong speed' $LS/output"
+labsetup; rm -f $T/playing; $T/stubs/asound; touch $T/start_after_set; echo 1 > $T/rate_none
+keepi 12
+ok "measured: a count that gets nothing is made again at the next round" "grep -q 'its frames could not be counted; counted again while it plays' $LS/output.log && grep -q 'the music started at 48000 Hz (switched while nothing played); measured 48000 frames/s' $LS/output.log && [ \"\$(ost fps)\" = 48000 ] && [ \"\$(ost state)\" = 48k ]"
+labsetup; rm -f $T/playing; $T/stubs/asound; touch $T/start_after_set; echo 99 > $T/rate_none
+MTRIES=2 keepi 12; unset MTRIES
+ok "measured: counts that keep getting nothing: left not measured (fps empty), not called checked" "grep -q 'its frames could not be counted 2 times; counted again at its next start' $LS/output.log && [ \"\$(ost state)\" = 48k ] && [ -z \"\$(ost fps)\" ]"
 labsetup; rm -f $T/playing; $T/stubs/asound; echo keep > $T/driver48
 keepi 6
 ok "idle: the driver keeps 44.1 kHz with the silent track running: nothing to put back, held" "[ $(nsets) = 1 ] && [ \"\$(ost state)\" = held ] && grep -q 'the driver kept 44.1 kHz' $LS/output && [ ! -f $T/waking ]"
@@ -803,6 +850,9 @@ ok "report: CarPlay probe: the app found by its command line, its distinct libra
 ok "report: CarPlay probe: each library with what it needs and only its pcm_ and mixer_ imports" "grep -A6 -x '  library /system/lib/libCarPlayAudio.so' $T/probe.txt | grep -qx '    needs: libc.so libtinyalsa.so libCarPlayUtils.so' && grep -qx '    imports pcm_open' $T/probe.txt && grep -qx '    imports pcm_writei' $T/probe.txt && grep -qx '    imports mixer_get_ctl_by_name' $T/probe.txt && ! grep -q 'imports malloc' $T/probe.txt && ! grep -q 'CarPlayAudioStart' $T/probe.txt && ! grep -q 'pcm_fake_export' $T/probe.txt && grep -A1 -x '  library /system/lib/libc.so' $T/probe.txt | grep -qx '    needs: nothing'"
 ok "report: CarPlay probe: a library that cannot be read says why; libraries are read under the unit's root" "grep -A1 -x '  library /system/lib/libbroken.so' $T/probe.txt | grep -qx '    not read (unexpected program header size)' && grep -qx \"imports $T/system/lib/libCarPlayAudio.so\" $T/imports.log && ! grep -q 'framework.jar' $T/imports.log"
 ok "report: CarPlay probe: libtinyalsa.so by md5 and exported names only, and the three properties" "grep -qx \"  /system/lib/libtinyalsa.so (factory file, not copied): md5 $TAMD5\" $T/probe.txt && grep -qx '    exports pcm_open' $T/probe.txt && grep -qx '    exports mixer_ctl_get_name' $T/probe.txt && ! grep -q 'import ioctl' $T/probe.txt && ! grep -q 'factory tinyalsa' \"$RF\" && grep -qx '  ro.debuggable = \[1\]' $T/probe.txt && grep -qx '  ro.secure = \[1\]' $T/probe.txt && grep -qx '  wrap.com.daudio.app.dipo = \[\]' $T/probe.txt"
+ok "report: CarPlay probe: the CarPlay libraries' imports of Android's audio classes and exports named for an audio backend" "grep -qx '    imports (Android audio) _ZN7android10AudioTrackC1Ev' $T/probe.txt && grep -qx '    imports (Android audio) _ZN7android11AudioSystem13getParametersEiRKNS_7String8E' $T/probe.txt && grep -qx '    exports (audio backend) TccCarPlayAudioTinyALSA_Open' $T/probe.txt && grep -qx '    exports (audio backend) TccCarPlayAudioTrack_Write' $T/probe.txt && [ \$(grep -c 'imports (Android audio)' $T/probe.txt) = 2 ] && ! grep -q tinyalsa_like_export $T/probe.txt"
+DCMD5=$(md5sum < $T/system/etc/dipo_audio.conf | cut -c1-32)
+ok "report: CarPlay probe: config files named for CarPlay by md5 only; no texts, properties or file content (those are for All logs)" "grep -qx \"  config file /system/etc/dipo_audio.conf (factory file): md5 $DCMD5\" $T/probe.txt && ! grep -q 'unrelated.conf' $T/probe.txt && ! grep -q -e 'audio_out=tinyalsa' -e 'texts in the CarPlay code' -e 'persist.dipo.audio.output' -e 'properties for CarPlay' \"$RF\" && [ ! -f $T/strings.log ]"
 ok "report: the properties section lists ro.debuggable and ro.secure (allowlist), not others" "grep -q '^\[ro.debuggable\]: \[1\]' \"$RF\" && grep -q '^\[ro.secure\]: \[1\]' \"$RF\" && ! grep -q 'ro.some.other' \"$RF\""
 rm -rf $T/proc/2290; mkdir -p $T/usb2
 run report $T/usb2 $T/app 1
@@ -814,6 +864,15 @@ ok "report: no stick: refused" "[ $(rc) = 1 ] && grep -q 'no USB stick' $T/out.t
 
 echo "== All logs (save) and the Lab trace under $SH"
 labsetup
+cat > $T/stubs/getprop <<'S'
+#!/bin/sh
+if [ -z "$1" ]; then
+    printf '[persist.dipo.audio.output]: [tinyalsa]\n[ro.build.product]: [NEEV]\n[tcc.audio.sampling_rate]: [4]\n[persist.sys.iap2.enable]: [1]\n[wrap.com.daudio.app.dipo]: []\n'
+    exit 0
+fi
+cat /tmp/eqeact/prop
+S
+chmod +x $T/stubs/getprop
 mkdir -p $T/usb3 $T/app $T/data/tombstones
 for n in 00 01 02 03; do echo "tombstone $n" > $T/data/tombstones/tombstone_$n; done
 touch -d '2026-11-01 10:00' $T/data/tombstones/tombstone_00 $T/data/tombstones/tombstone_01
@@ -823,7 +882,10 @@ run save $T/usb3 $T/app 1
 SD=$(ls -d $T/usb3/EQENGINE/*/ 2>/dev/null | head -n1)
 ok "save: only the tombstones written since the install are copied" "[ $(rc) = 0 ] && [ -f ${SD}tombstone_02.txt ] && [ -f ${SD}tombstone_03.txt ] && [ ! -f ${SD}tombstone_00.txt ] && [ ! -f ${SD}tombstone_01.txt ]"
 ok "save: tombstones_list.txt lists all of them, and which were copied" "[ \$(grep -c '^-.* tombstone_0[0-3]\$' ${SD}tombstones_list.txt) = 4 ] && grep -qx 'copied here (written since this install of EQ Engine): tombstone_02 tombstone_03' ${SD}tombstones_list.txt"
+ok "save: carplay_probe.txt reads no text out of the CarPlay code and no factory config file's content (0.7.4)" "! grep -q '^    libCarPlay[A-Za-z]*.so: \|^    DiPO.odex: \|^    | \|texts in the CarPlay code\|audio_out=tinyalsa' ${SD}carplay_probe.txt && [ ! -s $T/strings.log ] && grep -q 'config file /system/etc/dipo_audio.conf (factory file): md5' ${SD}carplay_probe.txt"
+ok "save: carplay_probe.txt has the CarPlay, iAP and Telechips properties with their values" "grep -qx '    \[persist.dipo.audio.output\]: \[tinyalsa\]' ${SD}carplay_probe.txt && grep -qx '    \[tcc.audio.sampling_rate\]: \[4\]' ${SD}carplay_probe.txt && grep -qx '    \[persist.sys.iap2.enable\]: \[1\]' ${SD}carplay_probe.txt && ! grep -q 'ro.build.product' ${SD}carplay_probe.txt"
 ok "save: carplay_probe.txt has the plain list of mapped libraries and the filtered imports" "grep -q 'runs as pid 2290, with 4 libraries mapped' ${SD}carplay_probe.txt && grep -qx '    /system/lib/libc.so' ${SD}carplay_probe.txt && grep -qx '    /data/hmgapi/lib/libleafiaaac.so' ${SD}carplay_probe.txt && grep -qx '    imports pcm_open' ${SD}carplay_probe.txt && ! grep -q 'imports malloc' ${SD}carplay_probe.txt && [ ! -d $LS/cp_probe ]"
+ok "save: the CarPlay app's process as it runs (maps, command line)" "cmp -s ${SD}dipo_maps.txt $T/proc/2290/maps && cmp -s ${SD}dipo_cmdline.txt $T/proc/2290/cmdline && [ -f ${SD}dipo_environ.txt ]"
 labsetup
 mkdir -p $T/usb4 $T/data/tombstones; echo t > $T/data/tombstones/tombstone_05
 run save $T/usb4 $T/app 0
@@ -852,6 +914,44 @@ rm -f $T/system/bin/screencap
 run shot $T/usb5 0
 ok "shot: no screencap on the unit: says so" "[ $(rc) = 1 ] && grep -q 'no screencap' $T/out.txt"
 
+echo "== curves on USB (curves) under $SH"
+labsetup
+CS2=$T/data/eqengine/settings
+mkdir -p $T/usb6 $CS2
+rm -f $CS2/preset*.txt
+printf '%s\n' '-500,500,400,200,-100,-200,-100,100,300,400,400' > $CS2/preset1.txt
+printf '%s\n' 'x;-600;2:6000:-500:0;1:63000:-700:333;4:3000:0:707' > $CS2/preset3.txt
+run curves save $T/usb6
+ok "curves save: the saved slots go to EQENGINE_CURVES as user1..4.txt, with a README, and the app is told" "[ $(rc) = 0 ] && cmp -s $CS2/preset1.txt $T/usb6/EQENGINE_CURVES/user1.txt && cmp -s $CS2/preset3.txt $T/usb6/EQENGINE_CURVES/user3.txt && [ ! -f $T/usb6/EQENGINE_CURVES/user2.txt ] && [ -s $T/usb6/EQENGINE_CURVES/README.txt ] && grep -q '^EQE_CURVES Saved 2 of the 4 user slots' $T/out.txt && grep -q EQE_OK $T/out.txt"
+rm -f $CS2/preset*.txt
+printf '%s\n' '0,0,0,0,0,0,0,0,0,0,0' > $CS2/preset2.txt
+printf 'x;-300;1:100000:250:1000\r\n' > $T/usb6/EQENGINE_CURVES/user2.txt
+printf 'rm -rf /;echo pwned\n' > $T/usb6/EQENGINE_CURVES/user4.txt
+run curves load $T/usb6
+ok "curves load: the stick's curves into the slots (a PC's line ending taken), a slot without a file kept" "[ $(rc) = 0 ] && cmp -s $T/usb6/EQENGINE_CURVES/user1.txt $CS2/preset1.txt && [ \"\$(cat $CS2/preset2.txt)\" = 'x;-300;1:100000:250:1000' ] && cmp -s $T/usb6/EQENGINE_CURVES/user3.txt $CS2/preset3.txt"
+ok "curves load: a file that is not a curve is left out and named" "[ ! -f $CS2/preset4.txt ] && grep -q '^EQE_CURVES Loaded 3 curve(s) from the stick into the user slots. Left alone, not a curve file: User 4.' $T/out.txt"
+ok "curves load: the slot files are the app's own, read-write for it only" "[ -z \"\$(find $CS2 -name 'preset*.txt' ! -perm 600)\" ] && [ ! -f $CS2/preset1.txt.tmp ]"
+ok "curves: nothing the car lacks is called (0.6.11: printf, in mksh)" "! grep -q 'not found' $T/out.txt"
+printf 'x;0;1:100000:0:1000\nsecond line\n' > $T/usb6/EQENGINE_CURVES/user4.txt
+printf '1,2,x,4\n' > $T/usb6/EQENGINE_CURVES/user1.txt
+run curves load $T/usb6
+ok "curves load: two lines, or an x out of place: not a curve" "[ $(rc) = 0 ] && grep -q 'Left alone, not a curve file: User 1, User 4.' $T/out.txt && [ ! -f $CS2/preset4.txt ]"
+rm -rf $T/usb6/EQENGINE_CURVES
+run curves load $T/usb6
+ok "curves load: no folder on the stick: refused, says how to make one" "[ $(rc) = 1 ] && grep -q 'has no EQENGINE_CURVES folder' $T/out.txt"
+run curves save $T/nousb
+ok "curves: no stick: refused" "[ $(rc) = 1 ] && grep -q 'no USB stick' $T/out.txt"
+run curves send $T/usb6
+ok "curves: an unknown word is rejected" "[ $(rc) = 2 ]"
+rm -f $CS2/preset*.txt
+run curves save $T/usb6
+ok "curves save: nothing saved yet: says so" "[ $(rc) = 0 ] && grep -q 'No user slot is saved yet' $T/out.txt"
+# the car runs these on mksh with toolbox only: no command-position use of a program it lacks
+# (comment lines skipped; the CR line's printf is the dash/bash fallback after mksh's print)
+CARLESS=$(grep -nE "(^|[;&|({\`]|\bthen|\bdo|\belse)[[:space:]]*(printf|tr|sed|awk|grep|egrep|head|tail|cut|sort|uniq|wc|xargs|basename|dirname|seq|expr|find|readlink|stat|tee|od|hexdump|which|timeout|nohup|pgrep|pkill|killall)([[:space:]]|\$|\))" \
+    $R/pkg/bin/*.sh $R/pkg/scripts/*.sh $R/rescue/*.sh | grep -vE "^[^:]+:[0-9]+:[[:space:]]*#" | grep -v "CR=\$(printf '.r' 2>/dev/null)")
+ok "the car's scripts call no program the car lacks (printf, grep, sed, head and the like)" "[ -z \"\$CARLESS\" ] || { echo \"\$CARLESS\" > $T/out.txt; false; }"
+
 echo "== converter choice without a restart (conv) under $SH"
 setup; vhqsetup good map
 run conv 4
@@ -866,6 +966,335 @@ ok "conv 4 with damaged tables: refused, nothing set" "[ $(rc) = 1 ] && [ ! -f $
 setup
 run conv 7
 ok "conv with a wrong value is rejected" "[ $(rc) = 2 ]"
+
+echo "== CarPlay watch 2 (cpwatch, cpwboot, cpwguard) and the CarPlay probe's process lines under $SH"
+CS=$T/data/eqengine/state
+CW=$T/data/eqengine/cpw
+JNI=$T/system/lib/libCarPlayAndroid.so
+COPY=$T/data/eqengine/lib/libCarPlayAndroid.car.so
+cpwsetup() {  # labsetup, plus the CarPlay watch installed and the factory CarPlay app as Android runs it
+    labsetup
+    echo "the CarPlay watch" > $T/data/eqengine/lib/eqe_cpwatch.so
+    md5sum < $T/data/eqengine/lib/eqe_cpwatch.so | cut -c1-32 > $T/data/eqengine/conf/eqe_cpwatch.md5
+    # the factory CarPlay app's JNI library, which the watch is laid over
+    echo "the factory CarPlay JNI library" > $JNI
+    rm -f $COPY $CS/cpw_want $CS/cpwatch $CS/cpw_result $CS/cpw_restarts $CS/cpw_failed
+    mkdir -p $T/proc/2290/task/2291 $T/props
+    rm -rf $T/props/* $CW $CW.prev
+    printf 'Name:\tcom.daudio.app\nTgid:\t2290\nPPid:\t150\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t1015 3002 3003 \nCapEff:\t0000000000000000\n' > $T/proc/2290/status
+    echo 00200000 > $T/proc/2290/personality
+    echo "2290 (com.daudio.app) S 150 149 0 0 -1 1077936448 9000 0 4 0 300 120 0 0 20 0 60 0 2350 812000000 30000 4294967295" > $T/proc/2290/stat
+    cp $T/proc/2290/maps $T/dipo_maps
+    echo 2290 > $T/dipo_pid
+    rm -f $T/dipo_no_restart $T/dipo_nudge_only $T/am.log $T/cpcheck_fail $T/cpcheck.log $T/dipo_starts.log
+    rm -f $T/cps_noload $T/cps_fail $T/cps_nowatch $T/cps_nostatus $T/cp_connected $T/cp_jni_loaded
+    # the kernel's TCP tables: a listening socket of the app, another process's established
+    # connection, and (cp_connected) the app's established connection to a phone
+    mkdir -p $T/proc/net
+    cat > $T/stubs/nettcp <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+{
+echo "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+echo "   0: 00000000:1B58 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 7000 1 00000000 100 0 0 10 0"
+echo "   1: 0100007F:A1B2 0100007F:13AD 01 00000000:00000000 00:00000000 00000000  1000        0 7100 1 00000000 20 4 30 10 -1"
+} > $T/proc/net/tcp
+{
+echo "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+[ -f $T/cp_connected ] && echo "   0: 000080FE00000000FF0234A2E100F23C:1B58 000080FE00000000FF0234A2E1000B3D:C4F1 01 00000000:00000000 00:00000000 00000000  1000        0 7001 1 00000000 20 4 30 10 -1"
+} > $T/proc/net/tcp6
+S
+    chmod +x $T/stubs/nettcp; $T/stubs/nettcp
+    # the app's open files: the listening socket (7000), the one a phone connects on (7001), a file
+    cat > $T/stubs/dipo_fd <<'S'
+#!/bin/sh
+mkdir -p /tmp/eqeact/proc/$1/fd; cd /tmp/eqeact/proc/$1/fd || exit 1
+ln -sf /dev/null 0; ln -sf 'socket:[7000]' 31; ln -sf 'socket:[7001]' 32
+S
+    chmod +x $T/stubs/dipo_fd; $T/stubs/dipo_fd 2290
+    # the zygote, with TinyALSA loaded (through libmedia and libbtsound). As on the car, its
+    # command line is "zygote" written over the start of the old first argument, the rest of the
+    # old arguments after it; its stat names it.
+    mkdir -p $T/proc/150
+    printf 'zygote\0bin/app_process\0-Xzygote\0/system/bin\0--zygote\0' > $T/proc/150/cmdline
+    echo "150 (zygote) S 1 150 0 0 -1 4194560 9000 0 4 0 300 120 0 0 20 0 60 0 300 893760000 18277 4294967295" > $T/proc/150/stat
+    printf 'b6e00000-b6e08000 r-xp 00000000 b3:19 77   /system/lib/libtinyalsa.so\nb6f00000-b6f40000 r-xp 00000000 b3:19 100        /system/lib/libc.so\n' > $T/proc/150/maps
+    # a process that calls itself zygote but is not init's child
+    mkdir -p $T/proc/149
+    echo "149 (zygote) S 700 149 0 0 -1 4194560 9000 0 4 0 300 120 0 0 20 0 60 0 300 893760000 18277 4294967295" > $T/proc/149/stat
+    # Android's properties, by name
+    cat > $T/stubs/setprop <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+echo "$1=$2" >> $T/setprop.log
+if [ -z "$2" ]; then rm -f "$T/props/$1"; else printf '%s' "$2" > "$T/props/$1"; fi
+S
+    cat > $T/stubs/getprop <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+[ -n "$1" ] && [ -f "$T/props/$1" ] && cat "$T/props/$1"
+echo
+S
+    # stopping the factory CarPlay app: Android starts it again (unless dipo_no_restart)
+    mv $T/stubs/kill $T/stubs/kill.audio
+    cat > $T/stubs/kill <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+a=$*
+[ "$1" = "-9" ] && shift
+d=$(cat $T/dipo_pid)
+if [ "$1" = "$d" ]; then
+    echo "kill $1" >> $T/dipo_kill.log
+    rm -rf $T/proc/$d
+    [ -f $T/dipo_no_restart ] || $T/stubs/dipo_start
+    exit 0
+fi
+exec $T/stubs/kill.audio $a
+S
+    # Android starting the factory CarPlay app from the zygote: CarPlayService loads its JNI library;
+    # when the watch is laid over it, the watch maps the copy of the factory library and writes its
+    # status (watching, or what cps_fail / cps_nowatch / cps_nostatus / cps_noload ask for)
+    cat > $T/stubs/dipo_start <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+n=$(($(cat $T/dipo_pid) + 10)); echo $n > $T/dipo_pid
+mkdir -p $T/proc/$n/task/$((n + 1))
+printf 'com.daudio.app.dipo\0\0\0' > $T/proc/$n/cmdline
+printf 'Name:\tcom.daudio.app\nTgid:\t%s\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n' $n > $T/proc/$n/status
+cp $T/dipo_maps $T/proc/$n/maps
+$T/stubs/dipo_fd $n
+echo "b2800000-b2810000 r-xp 00000000 b3:19 88   /system/lib/libCarPlayAndroid.so" >> $T/proc/$n/maps
+m=0
+grep -q " $T/system/lib/libCarPlayAndroid.so " $T/proc/mounts && m=1
+if [ $m = 1 ] && [ ! -f $T/cps_noload ]; then
+    echo "b2700000-b2710000 r-xp 00000000 b3:19 89   /data/eqengine/lib/libCarPlayAndroid.car.so" >> $T/proc/$n/maps
+    st=watching
+    [ -f $T/cps_fail ] && st=failed
+    [ -f $T/cps_nowatch ] && st="not watching"
+    [ -f $T/cps_nostatus ] || printf 'version=2\npid=%s\nstate=%s\nimports=4 of 4\nhmgapi=yes\n' $n "$st" > $T/data/eqengine/cpw/status.$n
+fi
+echo "start $n mounted=$m" >> $T/dipo_starts.log
+S
+    cat > $T/stubs/am <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+echo "am $*" >> $T/am.log
+[ "$1" = startservice ] && [ -f $T/dipo_nudge_only ] && [ ! -d $T/proc/$(cat $T/dipo_pid) ] && $T/stubs/dipo_start
+exit 0
+S
+    # Android's lists of the app's services, its processes and its package entry
+    mv $T/stubs/dumpsys $T/stubs/dumpsys.af
+    cat > $T/stubs/dumpsys <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+d=$(cat $T/dipo_pid)
+case "$*" in
+    "activity services com.daudio.app.dipo")
+        [ -d $T/proc/$d ] || exit 0
+        echo "ACTIVITY MANAGER SERVICES (dumpsys activity services)"
+        echo "  User 0 active services:"
+        echo "  * ServiceRecord{42a8c1d0 u0 com.daudio.app.dipo/.telechips.CarPlayService}"
+        echo "    intent={cmp=com.daudio.app.dipo/.telechips.CarPlayService}"
+        echo "    app=ProcessRecord{41b8a3a0 $d:com.daudio.app.dipo/1000}"
+        echo "  * ServiceRecord{42a8c2d0 u0 com.daudio.app.dipo/.DiPOService}" ;;
+    "activity processes")
+        echo "  *PERS* UID 1000 ProcessRecord{41b8a3a0 $d:com.daudio.app.dipo/1000}"
+        echo "    PERS #44: sys   F/ /P  trm: 0 $d:com.daudio.app.dipo/1000 (fixed)"
+        echo "    Proc # 3: fore  F/ /SB trm: 0 3210:com.android.phone/1001 (service)" ;;
+    "package com.daudio.app.dipo")
+        printf 'Packages:\n  Package [com.daudio.app.dipo] (41c2e1a0):\n    userId=1000 gids=[3003, 1028, 1015]\n    sharedUser=SharedUserSetting{41c0e8f8 android.uid.system/1000}\n    codePath=/system/app/DiPO.apk\n    versionCode=1 targetSdk=19\n    versionName=1.0\n    pkgFlags=[ SYSTEM HAS_CODE PERSISTENT ALLOW_CLEAR_USER_DATA ]\n' ;;
+    *) exec $T/stubs/dumpsys.af "$@" ;;
+esac
+S
+    # eqe_lab's check before use
+    mv $T/data/eqengine/bin/eqe_lab $T/data/eqengine/bin/eqe_lab.base
+    cat > $T/data/eqengine/bin/eqe_lab <<'S'
+#!/bin/sh
+T=/tmp/eqeact
+if [ "$1" = cpcheck ]; then
+    echo "cpcheck $2 $3" >> $T/cpcheck.log
+    [ -f $T/cpcheck_fail ] && { echo "cpcheck failed: the factory library does not export JNI_OnLoad; TinyALSA: 7 of 7 functions"; exit 1; }
+    echo "cpcheck ok the factory library exports JNI_OnLoad and needs libCarPlayAudio.so; TinyALSA: 7 of 7 functions"
+    exit 0
+fi
+exec $T/data/eqengine/bin/eqe_lab.base "$@"
+S
+    chmod +x $T/stubs/* $T/data/eqengine/bin/eqe_lab
+    rm -f $T/setprop.log $T/dipo_kill.log
+}
+cst() { sed -n "s/^$1=//p" $CS/cpwatch; }
+jmounted() { grep -q " $JNI " $T/proc/mounts; }
+nkill() { [ -f $T/dipo_kill.log ] && wc -l < $T/dipo_kill.log | tr -d ' ' || echo 0; }
+nstart() { [ -f $T/dipo_starts.log ] && wc -l < $T/dipo_starts.log | tr -d ' ' || echo 0; }
+# a car start: nothing is mounted any more, the boot step runs cpwboot before Android starts the
+# CarPlay app, then the app starts (from the zygote) and the keeper's guard has a look
+carstart() {
+    rm -rf $T/proc/$(cat $T/dipo_pid)
+    [ -f $JNI.under ] && cp $JNI.under $JNI && rm -f $JNI.under
+    grep -v " $JNI " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
+    rm -f $CS/cpwatch $CS/cpw_restarts
+    run cpwboot
+    cp $T/out.txt $T/boot_out.txt
+    $T/stubs/dipo_start
+}
+CPWF=$T/data/eqengine/lib/eqe_cpwatch.so
+FMD5=$(echo "the factory CarPlay JNI library" | md5sum | cut -c1-32)
+
+echo "-- on (from the next car start)"
+cpwsetup; mkdir -p $CW; echo old > $CW/cpw_1.log
+run cpwatch 1
+ok "cpwatch on: checked before use with the copy, the copy is the car's file, the choice recorded for the next car start" "[ $(rc) = 0 ] && grep -q 'EQE_CPW on from the next car start; restart the car (parked) to start it. Nothing was restarted now' $T/out.txt && grep -qx 'cpcheck $CPWF $COPY' $T/cpcheck.log && [ \"\$(md5sum < $COPY | cut -c1-32)\" = $FMD5 ] && [ \"\$(cat $CS/cpw_want)\" = \"1 $FMD5 1000\" ]"
+ok "cpwatch on: nothing laid over, the app not stopped, no wrap property" "! jmounted && [ $(nkill) = 0 ] && [ $(nstart) = 0 ] && [ -d $T/proc/2290 ] && [ ! -f $T/setprop.log ] && [ -z \"\$(ls $T/props)\" ]"
+ok "cpwatch on: the state for the app (on from the next car start), and the app's connections noted" "[ \"\$(cst state)\" = pending ] && [ -z \"\$(cst pid)\" ] && grep -q 'EQE_CPW_NOTE the CarPlay app (pid 2290) has 0 established connections now' $T/out.txt"
+carstart
+ok "car start: the boot step lays the watch over the JNI library before the app starts; the last notes kept once" "[ $(rc) = 0 ] && grep -q 'EQE_CPW laid over the CarPlay app.s JNI library at the car start' $T/boot_out.txt && jmounted && cmp -s $JNI $CPWF && [ -d $CW ] && [ -f $CW.prev/cpw_1.log ] && [ \"\$(cst state)\" = waiting ]"
+ok "car start: the app starts with the watch (from the zygote, nothing restarted by EQ Engine)" "grep -qx 'start 2300 mounted=1' $T/dipo_starts.log && [ -f $CW/status.2300 ] && [ $(nkill) = 0 ]"
+ok "car start: the folder for the CarPlay EQ's settings is there, the app's, readable by the CarPlay app (0.7.3)" "[ -d $T/data/eqengine/share ] && [ \"\$(stat -c %a $T/data/eqengine/share)\" = 755 ] && [ \"\$(stat -c %U $T/data/eqengine/share)\" = \"\$(stat -c %U $T/data/eqengine/settings)\" ]"
+run cpwguard
+ok "guard: the app's first start with the watch is noted: on" "[ $(rc) = 0 ] && [ \"\$(cst state)\" = on ] && [ \"\$(cst pid)\" = 2300 ] && grep -q 'loaded in the factory CarPlay app (pid 2300), started from the zygote as usual' $CS/cpw_result && [ ! -f $CS/cpw_restarts ]"
+run cpwatch 1
+ok "cpwatch on while it is laid over: already on, nothing changed" "[ $(rc) = 0 ] && grep -q 'EQE_CPW already on' $T/out.txt && [ \$(grep -c \" $JNI \" $T/proc/mounts) = 1 ] && [ \"\$(cst state)\" = on ] && [ $(nstart) = 1 ]"
+# what the watch writes in the app
+printf 'version=2\npid=2300\nname=com.daudio.app.dipo\nstate=watching\nimports=4 of 4\nhmgapi=yes\nmain=s1 card=0 device=2 dir=out rate=44100 ch=2 fmt=s16 period=1024x4 state=open calls=812 idle_s=0 fps=44101 errs=0 peak_db=-1.2\n' > $CW/status.2300
+echo "12:00:00.000 up 300.0 open s1: card 0 device 2 out, 44100 Hz 2 ch s16, period 1024 x 4, start 4096 stop 4096 -> ok" > $CW/cpw_2300.log
+mkdir -p $T/usb6 $T/app
+run save $T/usb6 $T/app 0
+SD=$(ls -d $T/usb6/EQENGINE/*/ 2>/dev/null | head -n1)
+ok "save: the watch's notes, and the last watch's" "[ $(rc) = 0 ] && [ -f ${SD}cpw_status.2300.txt ] && [ -f ${SD}cpw_cpw_2300.log.txt ] && [ -f ${SD}cpw_prev_cpw_1.log.txt ] && [ -f ${SD}state_cpwatch.txt ]"
+touch $T/cp_connected; $T/stubs/nettcp
+run report $T/usb6 $T/app 1
+RF=$(ls $T/usb6/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+sed -n '/^-- CarPlay app.s audio code (symbol tables only)$/,/^====/p' "$RF" > $T/probe3.txt
+ok "report: the watch's state and notes, filtered (no name line)" "grep -q '^-- CarPlay watch' \"$RF\" && grep -q '^== cpw_2300.log' \"$RF\" && grep -q 'open s1: card 0 device 2 out' \"$RF\" && grep -q '^main=s1 card=0 device=2' \"$RF\" && ! grep -q '^name=com.daudio' \"$RF\""
+ok "probe: the app's user and start time, and that the watch is in it" "grep -qx '  its process: uid 1000, gid 1000, started at uptime ? s' $T/probe3.txt && grep -qx \"  EQ Engine's CarPlay watch is loaded in it (in place of libCarPlayAndroid.so; started from the zygote as usual)\" $T/probe3.txt"
+ok "probe: the package's user and flags, persistent, its services" "grep -qx '  package: pkgFlags=\[ SYSTEM HAS_CODE PERSISTENT ALLOW_CLEAR_USER_DATA \]' $T/probe3.txt && grep -qx '  package: userId=1000 gids=\[3003, 1028, 1015\]' $T/probe3.txt && grep -qx '  package: codePath=/system/app/DiPO.apk' $T/probe3.txt && grep -qx '  persistent (Android starts it again at once when it stops): yes' $T/probe3.txt && grep -qx '  its running services: com.daudio.app.dipo/.telechips.CarPlayService com.daudio.app.dipo/.DiPOService' $T/probe3.txt && grep -q '  process list: \*PERS\* UID 1000' $T/probe3.txt && ! grep -q 'versionName\|com.android.phone' $T/probe3.txt"
+ok "probe: its established connections: only its own, only established ones (not its listening socket, not another process's)" "grep -qx '  its established network connections (a connected CarPlay session has some): 1' $T/probe3.txt"
+ok "probe: TinyALSA is in the zygote" "grep -qx '  libtinyalsa.so is loaded in the zygote (pid 150): every app has it from there' $T/probe3.txt"
+ok "probe: a process whose status has none of the parent, groups or capabilities: question marks" "grep -qx '  its parent: pid ?; groups: none; effective capabilities: ?; personality: ?' $T/probe3.txt"
+rm -f $T/cp_connected; $T/stubs/nettcp
+
+echo "-- the keeper's guard (cpwguard)"
+run cpwguard
+ok "guard: the same app process: nothing done" "[ $(rc) = 0 ] && [ \"\$(cst pid)\" = 2300 ] && [ ! -f $CS/cpw_restarts ] && [ $(nkill) = 0 ]"
+$T/stubs/kill -9 2300
+run cpwguard
+ok "guard: the app started again (a crash, an install): noted, the watch stays on (the mount is still there)" "[ $(rc) = 0 ] && [ \"\$(cst state)\" = on ] && [ \"\$(cst pid)\" = 2310 ] && [ \$(wc -l < $CS/cpw_restarts) = 1 ] && jmounted && grep -q 'started again (pid 2300 -> 2310); the watch stays on' $CS/cpw_result"
+$T/stubs/kill -9 2310
+run cpwguard
+ok "guard: a second start within 2 minutes: taken off (the mount and the choice), the app not restarted by EQ Engine" "[ $(rc) = 0 ] && [ \"\$(cst state)\" = failed ] && ! jmounted && [ ! -f $CS/cpw_want ] && [ $(nstart) = 3 ] && grep -q 'taken off: the factory CarPlay app started again twice within 2 minutes with the watch; taken off (the CarPlay app.s next start and the next car start are without it)' $CS/cpw_result && [ ! -f $CS/cpw_restarts ]"
+ok "guard: the take-off is noted for the app (state/cpw_failed: id, when, why; readable by it) (0.7.4)" "grep -q '^id=.*-[0-9]*$' $CS/cpw_failed && grep -q '^when=' $CS/cpw_failed && grep -qx 'why=the CarPlay app started again twice within 2 minutes with it' $CS/cpw_failed && [ \"\$(stat -c %a $CS/cpw_failed)\" = 644 ]"
+carstart
+ok "guard: after a take-off, the next car start is without the watch" "! jmounted && grep -qx 'start 2330 mounted=0' $T/dipo_starts.log && ! grep -q EQE_CPW $T/boot_out.txt"
+cpwsetup; run cpwatch 1; touch $T/cps_fail; carstart; run cpwguard
+ok "guard: the watch says the factory library did not load (nothing connected): taken off, the app restarted without it" "[ \"\$(cst state)\" = failed ] && ! jmounted && [ ! -f $CS/cpw_want ] && grep -qx 'start 2310 mounted=0' $T/dipo_starts.log && grep -q 'taken off: the watch could not load the factory library (pid 2300); taken off, and the CarPlay app restarted without it (pid 2310)' $CS/cpw_result"
+cpwsetup; run cpwatch 1; touch $T/cps_fail $T/cp_connected; $T/stubs/nettcp; carstart; run cpwguard
+ok "guard: the factory library did not load, but the app has a connection: taken off, not restarted, says to restart the car" "[ \"\$(cst state)\" = failed ] && ! jmounted && [ $(nstart) = 1 ] && grep -q 'the CarPlay app was not restarted (1 established connections); restart the car (parked)' $CS/cpw_result"
+cpwsetup; run cpwatch 1; touch $T/cps_fail $T/dipo_no_restart $T/dipo_nudge_only; carstart; run cpwguard
+ok "guard: the app restarted without the watch, Android slow to start it: its services are started after 15 s" "grep -q 'EQE_CPW_NOTE the app had not started again after 15 s; started its services' $T/out.txt && grep -qx 'am startservice -n com.daudio.app.dipo/.telechips.CarPlayService' $T/am.log && grep -qx 'start 2310 mounted=0' $T/dipo_starts.log"
+cpwsetup; run cpwatch 1; touch $T/cps_nowatch; carstart; run cpwguard
+ok "guard: loaded, but it left TinyALSA's functions alone: on (the app says so from the watch's status)" "[ \"\$(cst state)\" = on ] && jmounted && grep -q 'state=not watching' $CW/status.2300"
+cpwsetup; run cpwatch 1; touch $T/cps_noload; carstart; run cpwguard
+ok "guard: the app runs but has not loaded the watch: still waiting, nothing done" "[ \"\$(cst state)\" = waiting ] && jmounted && [ $(nkill) = 0 ]"
+
+echo "-- off (from the next car start)"
+cpwsetup; run cpwatch 1; carstart; run cpwguard
+run cpwatch 0
+ok "cpwatch off: the choice and the mount gone, the app not restarted (it keeps the watch until the car restarts)" "[ $(rc) = 0 ] && grep -q 'EQE_CPW off from the next car start; the CarPlay app running now keeps it until then (the EQ on CarPlay.s music too, unless its switch is off). Nothing was restarted' $T/out.txt && [ \"\$(cst state)\" = ending ] && [ \"\$(cst pid)\" = 2300 ] && ! jmounted && [ ! -f $CS/cpw_want ] && grep -q 'factory CarPlay JNI' $JNI && [ $(nkill) = 0 ] && [ $(nstart) = 1 ]"
+touch $T/busy
+run cpwatch 0
+ok "cpwatch off again: nothing to take off, nothing restarted" "[ $(rc) = 0 ] && [ \"\$(cst state)\" = ending ] && [ $(nkill) = 0 ]"
+rm -f $T/busy
+carstart
+ok "cpwatch off: the next car start is without it" "! jmounted && grep -qx 'start 2310 mounted=0' $T/dipo_starts.log && ! grep -q EQE_CPW $T/boot_out.txt"
+run cpwatch 0
+ok "cpwatch off with nothing in the app: off" "[ $(rc) = 0 ] && grep -q '^EQE_CPW off\$' $T/out.txt && [ \"\$(cst state)\" = off ]"
+cpwsetup; run cpwatch 1; carstart; run cpwguard; echo 2301 > $T/other; $T/stubs/asound; touch $T/busy
+run cpwatch 0
+ok "cpwatch off while CarPlay plays (the app has the file loaded): detached, the app keeps running" "[ $(rc) = 0 ] && ! jmounted && grep -qx 'umount $JNI' $T/umount.log && [ $(nkill) = 0 ] && [ \"\$(cst state)\" = ending ]"
+rm -f $T/other $T/busy; $T/stubs/asound
+
+echo "-- off and on again within one car start (0.7.5)"
+cpwsetup; run cpwatch 1; carstart; run cpwguard; run cpwatch 0; run cpwatch 1
+ok "off and on again: the running app still has it: on for that app, laid over again for its next start, nothing restarted" "[ $(rc) = 0 ] && grep -q 'EQE_CPW on: still loaded in the CarPlay app (pid 2300); laid over again for its next start. Nothing was restarted' $T/out.txt && [ \"\$(cst state)\" = on ] && [ \"\$(cst pid)\" = 2300 ] && jmounted && [ -f $CS/cpw_want ] && [ $(nkill) = 0 ] && [ $(nstart) = 1 ]"
+run cpwguard
+ok "off and on again: the guard watches it again (the same app: nothing done)" "[ $(rc) = 0 ] && [ \"\$(cst state)\" = on ] && [ \"\$(cst pid)\" = 2300 ] && jmounted && [ $(nkill) = 0 ]"
+carstart
+ok "off and on again: the next car start lays it over as usual" "jmounted && grep -q 'EQE_CPW laid over the CarPlay app.s JNI library at the car start' $T/boot_out.txt"
+cpwsetup; run cpwatch 1; carstart; run cpwguard; run cpwatch 0
+echo "1 $FMD5 1000" > $CS/cpw_want; echo "the watch's notes" > $CW/keep.txt
+run cpwboot
+ok "the boot step while the app runs the watch from an earlier mount: laid over, the app's notes and live file left where they are" "[ $(rc) = 0 ] && jmounted && grep -q 'EQE_CPW laid over the CarPlay app.s JNI library at the car start' $T/out.txt && [ -f $CW/keep.txt ] && [ ! -f $CW.prev/keep.txt ]"
+
+echo "-- refusals and failures"
+cpwsetup; touch $CS/disabled
+run cpwatch 1
+ok "cpwatch on with EQ Engine off: refused, nothing recorded" "[ $(rc) = 1 ] && grep -q 'EQE_CPW refused: EQ Engine is off' $T/out.txt && [ ! -f $CS/cpw_want ] && ! jmounted"
+cpwsetup; echo changed >> $CPWF
+run cpwatch 1
+ok "cpwatch on: a watch file that fails its md5: refused" "[ $(rc) = 1 ] && grep -q 'EQE_CPW refused: the CarPlay watch is not installed or failed its check' $T/out.txt && [ ! -f $CS/cpw_want ]"
+cpwsetup; touch $T/cpcheck_fail
+run cpwatch 1
+ok "cpwatch on: the check before use fails: refused, with its reason" "[ $(rc) = 1 ] && grep -q 'did not pass its check before use (failed: the factory library does not export JNI_OnLoad; TinyALSA: 7 of 7 functions)' $T/out.txt && [ ! -f $CS/cpw_want ]"
+ok "cpwatch on from the app's switch: a refusal is said, not noted (the app shows it at once)" "[ ! -f $CS/cpw_failed ]"
+cpwsetup; touch $T/cpcheck_fail; export EQE_CPW_NOTIFY=1
+run cpwatch 1
+unset EQE_CPW_NOTIFY
+ok "cpwatch on at the install (EQE_CPW_NOTIFY=1): a refusal is noted for the app, with its reason" "[ $(rc) = 1 ] && [ ! -f $CS/cpw_want ] && grep -q '^why=it could not be prepared: the CarPlay watch did not pass its check before use (failed: ' $CS/cpw_failed"
+cpwsetup; echo 2291 > $T/other; $T/stubs/asound
+run cpwatch 1
+ok "cpwatch on while CarPlay plays: recorded for the next car start, the app not stopped" "[ $(rc) = 0 ] && [ -f $CS/cpw_want ] && [ $(nkill) = 0 ] && ! jmounted"
+rm -f $T/other; $T/stubs/asound
+cpwsetup; rm -rf $T/proc/2290
+run cpwatch 1
+ok "cpwatch on with the app not running: recorded (the app's user taken as 1000)" "[ $(rc) = 0 ] && [ \"\$(cat $CS/cpw_want)\" = \"1 $FMD5 1000\" ]"
+cpwsetup; rm -f $JNI
+run cpwatch 1
+ok "cpwatch on: no factory JNI library on the unit: refused" "[ $(rc) = 1 ] && grep -q 'EQE_CPW refused: this unit has no $JNI' $T/out.txt && [ ! -f $CS/cpw_want ]"
+cpwsetup; rm -f $JNI; export EQE_CPW_NOTIFY=1
+run cpwatch 1
+unset EQE_CPW_NOTIFY
+ok "cpwatch on, a unit without the factory CarPlay app: state absent, never noted as a failure (also at the install)" "[ $(rc) = 1 ] && [ \"\$(cst state)\" = absent ] && [ ! -f $CS/cpw_failed ] && [ ! -f $CS/cpw_want ]"
+cpwsetup; mkdir -p $COPY
+run cpwatch 1
+ok "cpwatch on: the copy cannot be made: refused" "[ $(rc) = 1 ] && grep -q 'EQE_CPW refused: the copy of the factory CarPlay library could not be made' $T/out.txt && [ ! -f $CS/cpw_want ]"
+cpwsetup; run cpwatch 1; echo "an updated factory library" > $JNI; NMD5=$(md5sum < $JNI | cut -c1-32); carstart
+ok "car start: the factory library changed (a software update): checked again before use, laid over, the choice follows it (0.7.4)" "grep -q 'EQE_CPW the factory CarPlay library changed (a software update?); the new one passed the check before use' $T/boot_out.txt && jmounted && [ \"\$(cat $CS/cpw_want)\" = \"1 $NMD5 1000\" ] && [ \"\$(md5sum < $COPY | cut -c1-32)\" = $NMD5 ] && [ \$(grep -c '^cpcheck ' $T/cpcheck.log) = 2 ] && [ ! -f $CS/cpw_failed ] && grep -qx 'start 2300 mounted=1' $T/dipo_starts.log"
+cpwsetup; run cpwatch 1; echo "an updated factory library" > $JNI; touch $T/cpcheck_fail; carstart
+ok "car start: the changed factory library fails the check: not laid over, off, and the app is told why" "grep -q 'not laid over at this start: the factory CarPlay library changed (a software update?) and the new one did not pass the check before use' $T/boot_out.txt && ! jmounted && [ ! -f $CS/cpw_want ] && [ \"\$(cst state)\" = failed ] && grep -q '^why=the factory CarPlay library changed' $CS/cpw_failed && grep -qx 'start 2300 mounted=0' $T/dipo_starts.log"
+cpwsetup; run cpwatch 1; echo changed >> $CPWF; carstart
+ok "car start: the watch file fails its md5: not laid over" "grep -q 'not laid over at this start: the CarPlay watch failed its check' $T/boot_out.txt && ! jmounted && [ ! -f $CS/cpw_want ]"
+cpwsetup; run cpwatch 1; rm -f $COPY; carstart
+ok "car start: the copy is gone: made again from the factory file, then laid over" "jmounted && [ \"\$(md5sum < $COPY | cut -c1-32)\" = $FMD5 ] && grep -qx 'start 2300 mounted=1' $T/dipo_starts.log"
+cpwsetup; run cpwatch 1; echo "b2800000-b2810000 r-xp 00000000 b3:19 88   /system/lib/libCarPlayAndroid.so" >> $T/proc/2290/maps
+run cpwboot
+ok "car start too late: the app had already loaded its library: not laid over now, on from the next car start" "grep -q 'not laid over at this start: the CarPlay app (pid 2290) had already loaded its library; on from the next car start' $T/out.txt && ! jmounted && [ -f $CS/cpw_want ] && [ \"\$(cst state)\" = pending ]"
+cpwsetup; run cpwatch 1; touch $CS/disabled
+run cpwboot
+ok "car start with EQ Engine off: nothing laid over" "[ $(rc) = 0 ] && ! grep -q EQE_CPW $T/out.txt && ! jmounted"
+cpwsetup; run cpwatch 1; carstart; run cpwboot
+ok "the boot step again in the same car start (EQ Engine turned on): nothing laid over twice" "[ $(rc) = 0 ] && ! grep -q EQE_CPW $T/out.txt && [ \$(grep -c \" $JNI \" $T/proc/mounts) = 1 ]"
+cpwsetup; run cpwatch 1; carstart; run cpwguard; printf '%s' "LD_PRELOAD=$CPWF" > $T/props/wrap.com.daudio.app.dipo
+run off
+ok "EQ Engine off: the watch's choice and mount gone, the app not restarted, 0.6.7's wrap property cleared" "! jmounted && [ ! -f $CS/cpw_want ] && [ \"\$(cst state)\" = ending ] && [ $(nstart) = 1 ] && [ ! -f $T/props/wrap.com.daudio.app.dipo ]"
+cpwsetup; mkdir -p $CS/cpwatch.lock; cut -d. -f1 $T/proc/uptime > $CS/cpwatch.lock/at
+run cpwatch 1
+ok "cpwatch: one switch at a time" "[ $(rc) = 3 ] && grep -q 'already being switched' $T/out.txt && [ ! -f $CS/cpw_want ]"
+run cpwatch 2
+ok "cpwatch with a wrong value: usage" "[ $(rc) = 2 ]"
+
+cpwsetup
+mkdir -p $T/usb7
+sed -i 's/PERS/Proc/g; s/\*Proc\*/*APP*/' $T/stubs/dumpsys
+run report $T/usb7 $T/app 1
+RF=$(ls $T/usb7/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+sed -n '/^-- CarPlay app.s audio code (symbol tables only)$/,/^====/p' "$RF" > $T/probe4.txt
+ok "probe: started at uptime 23 s (its stat), no watch in it, not persistent, no connection" "grep -qx '  its process: uid 1000, gid 1000, started at uptime 23 s' $T/probe4.txt && ! grep -q 'CarPlay watch is loaded' $T/probe4.txt && grep -qx '  persistent (Android starts it again at once when it stops): no' $T/probe4.txt && grep -qx '  its established network connections (a connected CarPlay session has some): 0' $T/probe4.txt"
+ok "probe: its parent (the zygote, not the decoy), groups, capabilities and personality" "grep -qx '  its parent: pid 150 (the zygote); groups: 1015 3002 3003; effective capabilities: 0000000000000000; personality: 00200000' $T/probe4.txt"
+
+echo "== no factory files copy in the release (0.7.4) under $SH"
+mkdir -p $T/usbF
+run factory $T/usbF
+ok "factory: not an action any more: usage, nothing on the stick" "[ $(rc) != 0 ] && grep -q '^usage: act.sh' $T/out.txt && ! grep -q 'factory' $T/out.txt && [ ! -d $T/usbF/EQENGINE_FACTORY ]"
 
 echo "$pass passed, $fail failed"
 [ $fail = 0 ]

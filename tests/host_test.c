@@ -4,6 +4,7 @@
 #define VHQ_MARK "/tmp/eqe_host_vhq_load"
 #define VHQ_LIB "/tmp/vhqhost_40_9/o2/libaudio-resampler.so"
 #include "../native/eqengine.c"
+#include "ref_process_073.inc"
 
 #include <stdio.h>
 
@@ -51,7 +52,7 @@ static int32_t get_param(effect_handle_t h, int32_t id, void *value, uint32_t vs
 static eqe_settings mk(int eq_on, int pre, int guard, const int *bands) {
     eqe_settings s;
     memset(&s, 0, sizeof(s));
-    s.layout = 2;
+    s.layout = 3;
     s.eq_on = eq_on;
     s.preamp_cdb = pre;
     s.guard_on = guard;
@@ -70,7 +71,7 @@ static int32_t apply(effect_handle_t h, eqe_settings s) { return set_param_raw(h
 /* the designed response at f, dB */
 static double resp_at(eqe_ctx *c, double f) {
     double r = 0.0;
-    for (int j = 0; j < EQE_NB; j++) r += coefs_db(&c->band[j].tgt, f, c->rate);
+    for (int j = 0; j < EQE_NBAND; j++) r += coefs_db(&c->band[j].tgt, f, c->rate);
     return r;
 }
 
@@ -182,7 +183,7 @@ int main(void) {
 
     /* ---- parameter checks */
     int32_t ver = 0;
-    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x320);
+    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x323);
     {
         /* very high quality loader: the marker was there at the first call, so the PC build of
            libaudio-resampler.so is loaded and its status is readable */
@@ -193,22 +194,36 @@ int main(void) {
         CHECK(dlopen("libaudio-resampler.so", RTLD_NOW | RTLD_NOLOAD) != NULL);
     }
     eqe_settings bad = mk(1, 0, 1, NULL);
-    bad.layout = 1; /* layout 1 is 16 values, not 17 */
+    bad.layout = 1; /* layout 1 is 16 values, not the whole struct */
     CHECK(apply(h, bad) == -EINVAL);
-    bad.layout = 3;
+    bad.layout = 2; /* layout 2 is 17 values */
+    CHECK(apply(h, bad) == -EINVAL);
+    bad.layout = 4;
     CHECK(apply(h, bad) == -EINVAL);
     bad = mk(1, 0, 1, NULL);
     bad.ends = 4;
     CHECK(apply(h, bad) == -EINVAL);
-    bad = mk(1, 0, 1, NULL); /* layout 2 sent as 16 values */
+    bad = mk(1, 0, 1, NULL); /* layout 3 sent as 16 or 17 values */
     CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &bad, EQE_SET1_BYTES) == -EINVAL);
+    CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &bad, EQE_SET2_BYTES) == -EINVAL);
+    {
+        /* an app from 0.6.6 .. 0.6.10 sends layout 2 (17 values): accepted as Easy mode */
+        eqe_settings o2 = mk_ends(1, 0, 1, NULL, EQE_ENDS_HIGH);
+        o2.layout = 2;
+        o2.band_cdb[2] = -400;
+        o2.mode = 1;     /* past the 17 values: not sent, so not seen */
+        o2.nx = 5;
+        CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &o2, EQE_SET2_BYTES) == 0);
+        eqe_ctx *cc = (eqe_ctx *)h;
+        CHECK(cc->set.layout == 3 && cc->set.mode == 0 && cc->set.nx == 0 && cc->set.ends == EQE_ENDS_HIGH && cc->set.band_cdb[2] == -400);
+    }
     {
         /* an app from before 0.6.6 sends layout 1 (16 values): accepted, both ends peaks */
         eqe_settings old = mk(1, 0, 1, NULL);
         old.layout = 1;
         old.band_cdb[0] = 300;
         CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &old, EQE_SET1_BYTES) == 0);
-        CHECK(((eqe_ctx *)h)->set.layout == 2 && ((eqe_ctx *)h)->set.ends == 0 && ((eqe_ctx *)h)->set.band_cdb[0] == 300);
+        CHECK(((eqe_ctx *)h)->set.layout == 3 && ((eqe_ctx *)h)->set.mode == 0 && ((eqe_ctx *)h)->set.ends == 0 && ((eqe_ctx *)h)->set.band_cdb[0] == 300);
     }
     bad = mk(1, 0, 1, NULL);
     bad.band_cdb[3] = 1501;
@@ -353,7 +368,7 @@ int main(void) {
         CHECK(c->clipped > 0);
         int32_t st[EQE_STATS_COUNT];
         CHECK(get_param(h, EQE_PARAM_STATS, st, sizeof(st), &got) == 0 && got == sizeof(st));
-        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x320 && st[6] == 70 && st[16] > 0 && st[23] == 1);
+        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x323 && st[6] == 70 && st[16] > 0 && st[23] == 1);
         AELI.release_effect(h);
     }
 
@@ -578,6 +593,202 @@ int main(void) {
         }
     }
 
+    /* ---- Expert mode (settings layout 3): up to 20 bands of its own, each what it says */
+    {
+        int16_t *buf = calloc(N * 2, sizeof(int16_t));
+        h = make(48000, buf, buf, N, 0);
+        c = (eqe_ctx *)h;
+        cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+        eqe_settings x = mk(1, 0, 1, NULL);
+        x.mode = 1;
+        /* validation */
+        int32_t okb[4] = {EQE_X_PEAK, 63000, -700, 333};
+        x.nx = 1; memcpy(x.x[0], okb, sizeof(okb));
+        CHECK(apply(h, x) == 0);
+        struct { int i; int32_t v; } badv[] = {{0, 0}, {0, 5}, {1, 1999}, {1, 2000001}, {2, 1501}, {2, -1501}, {3, 99}, {3, 4001}};
+        for (size_t k = 0; k < sizeof(badv) / sizeof(badv[0]); k++) {
+            eqe_settings b = x;
+            b.x[0][badv[k].i] = badv[k].v;
+            CHECK(apply(h, b) == -EINVAL);
+        }
+        {
+            eqe_settings b = x;
+            b.x[0][0] = EQE_X_LOW_CUT; b.x[0][3] = 499;
+            CHECK(apply(h, b) == -EINVAL);
+            b.x[0][3] = 707; b.x[0][2] = 9999;            /* a low cut has no gain: not checked */
+            CHECK(apply(h, b) == 0);
+            b.nx = 21;
+            CHECK(apply(h, b) == -EINVAL);
+            b.nx = 1; b.mode = 2;
+            CHECK(apply(h, b) == -EINVAL);
+            /* slots past nx may hold anything: ignored and cleared */
+            b = x; b.x[5][0] = 77; b.x[5][1] = -3;
+            CHECK(apply(h, b) == 0 && c->set.x[5][0] == 0 && c->set.x[5][1] == 0);
+        }
+        /* each type's shape at 48 kHz */
+        CHECK(apply(h, x) == 0);
+        double e1 = fabs(resp_at(c, 630.0) + 7.0);
+        double lo = resp_at(c, 630.0 / pow(2.0, 0.333 / 2)), hi = resp_at(c, 630.0 * pow(2.0, 0.333 / 2));
+        printf("Expert peak 630 Hz -7 dB 0.333 octave: %.3f dB at 630 Hz, %.2f / %.2f dB at the band edges (half gain -3.5)\n",
+               resp_at(c, 630.0), lo, hi);
+        CHECK(e1 < 0.01 && fabs(lo + 3.5) < 0.2 && fabs(hi + 3.5) < 0.2 && fabs(resp_at(c, 63.0)) < 0.05);
+        x.x[0][0] = EQE_X_LOW_CUT; x.x[0][1] = 6000; x.x[0][2] = 0; x.x[0][3] = 707;
+        CHECK(apply(h, x) == 0);
+        printf("Expert low cut 60 Hz Q 0.707: %.2f dB at 60 Hz, %.2f dB at 30 Hz, %.3f dB at 1 kHz, %.1f dB at 0 Hz\n",
+               resp_at(c, 60.0), resp_at(c, 30.0), resp_at(c, 1000.0), resp_at(c, 0.0));
+        CHECK(fabs(resp_at(c, 60.0) + 3.01) < 0.05 && fabs(resp_at(c, 30.0) + 12.3) < 0.3 && fabs(resp_at(c, 1000.0)) < 0.01 && resp_at(c, 0.0) < -100.0);
+        x.x[0][0] = EQE_X_LOW_SHELF; x.x[0][1] = 6000; x.x[0][2] = -500; x.x[0][3] = 0;
+        x.nx = 2; x.x[1][0] = EQE_X_HIGH_SHELF; x.x[1][1] = 1000000; x.x[1][2] = 400; x.x[1][3] = 0;
+        CHECK(apply(h, x) == 0);
+        CHECK(fabs(resp_at(c, 0.0) + 5.0) < 0.01 && fabs(resp_at(c, 60.0) + 2.5) < 0.05 && fabs(resp_at(c, 1000.0)) < 0.2 &&
+              fabs(resp_at(c, 10000.0) - 2.0) < 0.05 && fabs(resp_at(c, 24000.0) - 4.0) < 0.05);
+        /* Copy Easy EQ: the Easy page's solved filters as Expert bands give the same sound */
+        double worstc = 0.0;
+        int clamped = 0;
+        for (int t = 0; t < 80; t++) {
+            int bands[EQE_NB];
+            for (int j = 0; j < EQE_NB; j++) bands[j] = (int)((rnd() * 2.0 - 1.0) * (t < 40 ? 600.0 : 1200.0));
+            int ends = t % 4;
+            CHECK(apply(h, mk_ends(1, 0, 1, bands, ends)) == 0);
+            int32_t gq[EQE_NB];
+            CHECK(get_param(h, EQE_PARAM_GAINS, gq, sizeof(gq), &got) == 0);
+            double easy[EQE_NRESP];
+            for (int k = 0; k < EQE_NRESP; k++) easy[k] = resp_at(c, eqe_resp_hz(k));
+            eqe_settings e = mk(1, 0, 1, NULL);
+            e.mode = 1; e.nx = EQE_NB;
+            int cl = 0;
+            for (int j = 0; j < EQE_NB; j++) {
+                int lowsh = j == 0 && (ends & EQE_ENDS_LOW), highsh = j == EQE_NB - 1 && (ends & EQE_ENDS_HIGH);
+                e.x[j][0] = lowsh ? EQE_X_LOW_SHELF : highsh ? EQE_X_HIGH_SHELF : EQE_X_PEAK;
+                e.x[j][1] = lowsh ? 5000 : highsh ? 1130000 : (int32_t)lrint(kCenters[j] * 100.0);
+                int g = gq[j];
+                if (g > EQE_BAND_LIMIT) { g = EQE_BAND_LIMIT; cl = 1; }
+                if (g < -EQE_BAND_LIMIT) { g = -EQE_BAND_LIMIT; cl = 1; }
+                e.x[j][2] = g;
+                e.x[j][3] = (lowsh || highsh) ? 0 : 1000;
+            }
+            CHECK(apply(h, e) == 0);
+            if (cl) { clamped++; continue; }
+            for (int k = 0; k < EQE_NRESP; k++) {
+                double d = fabs(resp_at(c, eqe_resp_hz(k)) - easy[k]);
+                if (d > worstc) worstc = d;
+            }
+        }
+        printf("Copy Easy EQ: 80 random settings (all four end-band types): worst difference %.4f dB (%d set aside: a solved "
+               "gain past +-15 dB)\n", worstc, clamped);
+        CHECK(worstc < 0.01);
+        /* the largest boost of Expert settings: never below a fine sweep */
+        double under = 0.0;
+        for (int t = 0; t < 60; t++) {
+            eqe_settings r = mk(1, 0, 1, NULL);
+            r.mode = 1; r.nx = 1 + (int)(rnd() * 19.99);
+            for (int j = 0; j < r.nx; j++) {
+                r.x[j][0] = 1 + (int)(rnd() * 3.99);
+                r.x[j][1] = (int32_t)(2000.0 * pow(1000.0, rnd()));
+                r.x[j][2] = (int32_t)((rnd() * 2.0 - 1.0) * 1500.0);
+                r.x[j][3] = r.x[j][0] == EQE_X_PEAK ? 100 + (int)(rnd() * 3900) : r.x[j][0] == EQE_X_LOW_CUT ? 500 + (int)(rnd() * 1500) : 0;
+            }
+            int32_t pk[3];
+            CHECK(set_param_raw(h, EQE_PARAM_PEAK, &r, sizeof(r)) == 0);
+            CHECK(get_param(h, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0);
+            CHECK(apply(h, r) == 0);
+            double m = resp_at(c, 0.0);
+            for (double f = 0.5; f < 24000.0; f *= 1.001) { double d = resp_at(c, f); if (d > m) m = d; }
+            if (m - pk[0] / 100.0 > under) under = m - pk[0] / 100.0;
+        }
+        printf("Expert largest boost, 60 random settings: at most %.3f dB under a fine sweep\n", under);
+        CHECK(under <= 0.005);
+        /* Easy -> Expert -> Easy while music plays: the ramps stay finite, and every band of the
+         * other mode goes quiet */
+        {
+            int bands[EQE_NB] = {600, 300, 0, -300, 0, 200, 0, -200, 400, 600};
+            CHECK(apply(h, mk_ends(1, -600, 1, bands, 3)) == 0);
+            double g1 = sine_gain_db(h, 48000, 1000.0, 0.25, 0.3, buf, N);
+            eqe_settings r = mk(1, -600, 1, NULL);
+            r.mode = 1; r.nx = 20;
+            for (int j = 0; j < 20; j++) { r.x[j][0] = EQE_X_PEAK; r.x[j][1] = (int32_t)(2500.0 * pow(1.4, j)); r.x[j][2] = (j & 1) ? 300 : -300; r.x[j][3] = 500; }
+            r.x[19][0] = EQE_X_LOW_CUT; r.x[19][1] = 3000; r.x[19][3] = 707;
+            CHECK(apply(h, r) == 0);
+            double g2 = sine_gain_db(h, 48000, 1000.0, 0.25, 0.3, buf, N);
+            int act = 0, finite = 1;
+            for (int j = 0; j < EQE_NBAND; j++) {
+                if (c->band[j].active) act++;
+                for (int ch = 0; ch < 2; ch++) if (!isfinite(c->band[j].z1[ch]) || !isfinite(c->band[j].z2[ch])) finite = 0;
+            }
+            CHECK(apply(h, mk_ends(1, -600, 1, bands, 3)) == 0);
+            double g3 = sine_gain_db(h, 48000, 1000.0, 0.25, 0.3, buf, N);
+            int left = 0;
+            for (int j = EQE_NB; j < EQE_NBAND; j++) if (!is_identity(&c->band[j].tgt)) left++;
+            printf("Easy -> Expert (20 bands) -> Easy at 1 kHz: %.2f, %.2f, %.2f dB; %d filters active in Expert, %d Expert-only "
+                   "filters left in Easy\n", g1, g2, g3, act, left);
+            CHECK(finite && act == 20 && left == 0 && fabs(g1 - g3) < 0.05 && isfinite(g2));
+        }
+        AELI.release_effect(h);
+        free(buf);
+    }
+
+    /* ---- the largest boost (EQE_PARAM_PEAK): from the solved filters, 0 Hz to half the rate, for
+     * settings the filter is asked about and does not apply (Auto preamp and the presets) */
+    {
+        int16_t *buf = calloc(N * 2, sizeof(int16_t));
+        h = make(48000, buf, buf, N, 0);
+        c = (eqe_ctx *)h;
+        int32_t pk[3] = {0};
+        CHECK(get_param(h, EQE_PARAM_PEAK, pk, sizeof(pk), &got) != 0); /* nothing asked yet */
+        CHECK(apply(h, mk(1, 0, 1, NULL)) == 0);
+        /* the worst case found on the PC: 31 Hz shelf +12 next to 63 Hz -12 and 125 Hz +12 */
+        int worst[EQE_NB] = {1200, -1200, 1200, 0, 0, 0, 0, 0, 0, 0};
+        eqe_settings q = mk_ends(1, 0, 1, worst, EQE_ENDS_LOW);
+        CHECK(set_param_raw(h, EQE_PARAM_PEAK, &q, sizeof(q)) == 0);
+        CHECK(get_param(h, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0 && got == sizeof(pk));
+        /* nothing was applied: the flat settings still play */
+        int flat = 1;
+        for (int j = 0; j < EQE_NB; j++) if (c->set.band_cdb[j] != 0 || !is_identity(&c->band[j].tgt)) flat = 0;
+        CHECK(flat && c->set.ends == 0);
+        /* the same settings applied: the answer matches a fine sweep of what then plays, and the
+         * graph's 96 points (20 Hz .. 20 kHz) see more than 3 dB less */
+        CHECK(apply(h, q) == 0);
+        double tmax = resp_at(c, 0.0), tat = 0.0;
+        for (double f = 0.5; f < 24000.0; f *= 1.001) { double d = resp_at(c, f); if (d > tmax) { tmax = d; tat = f; } }
+        double gmax = -1e9;
+        for (int k = 0; k < EQE_NRESP; k++) { double d = resp_at(c, eqe_resp_hz(k)); if (d > gmax) gmax = d; }
+        printf("largest boost: 31 Hz shelf +12, 63 Hz -12, 125 Hz +12 at 48 kHz: %+.2f dB at %d Hz (fine sweep %+.2f dB at "
+               "%.1f Hz; the graph's points %+.2f dB)\n", pk[0] / 100.0, pk[1], tmax, tat, gmax);
+        CHECK(pk[0] / 100.0 >= tmax - 0.005 && pk[0] / 100.0 <= tmax + 0.02 && pk[1] == 0 && pk[2] == 48000);
+        CHECK(pk[0] / 100.0 > gmax + 3.0 && pk[0] > 2100 && pk[0] < 2400);
+        /* random settings, all four end-band types, both rates: never below a fine sweep */
+        double rates2[] = {44100, 48000};
+        double under = 0.0, over = 0.0;
+        for (int ri = 0; ri < 2; ri++) {
+            AELI.release_effect(h);
+            h = make(rates2[ri], buf, buf, N, 0);
+            c = (eqe_ctx *)h;
+            for (int t = 0; t < 60; t++) {
+                int bands[EQE_NB];
+                for (int j = 0; j < EQE_NB; j++) bands[j] = (int)((rnd() * 2.0 - 1.0) * 1200.0);
+                eqe_settings r = mk_ends(1, 0, 1, bands, t % 4);
+                CHECK(set_param_raw(h, EQE_PARAM_PEAK, &r, sizeof(r)) == 0);
+                CHECK(get_param(h, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0);
+                apply(h, r);
+                double m = resp_at(c, 0.0);
+                for (double f = 0.5; f < 0.5 * rates2[ri]; f *= 1.001) { double d = resp_at(c, f); if (d > m) m = d; }
+                double d = resp_at(c, 0.5 * rates2[ri]); if (d > m) m = d;
+                double e = pk[0] / 100.0 - m;
+                if (-e > under) under = -e;
+                if (e > over) over = e;
+            }
+        }
+        printf("largest boost, 120 random settings: at most %.3f dB under and %.3f dB over a fine sweep\n", under, over);
+        CHECK(under <= 0.005 && over <= 0.02);
+        /* settings that are not valid: refused, and no answer left over */
+        eqe_settings bad = mk(1, 0, 1, NULL);
+        bad.band_cdb[3] = 5000;
+        CHECK(set_param_raw(h, EQE_PARAM_PEAK, &bad, sizeof(bad)) != 0);
+        CHECK(get_param(h, EQE_PARAM_PEAK, pk, sizeof(pk), &got) != 0);
+        AELI.release_effect(h);
+        free(buf);
+    }
+
     /* ---- accumulate mode and unsupported formats */
     {
         int16_t *in = calloc(N * 2, sizeof(int16_t)), *out = calloc(N * 2, sizeof(int16_t));
@@ -588,16 +799,74 @@ int main(void) {
         (*h)->process(h, &bi, &bo);
         CHECK(out[0] == 50 && out[2 * (N - 1)] == 1050);
         AELI.release_effect(h);
-        h = make(44100, in, out, N, 0);
-        eqe_ctx *cc = (eqe_ctx *)h;
-        cc->config.inputCfg.channels = 0x1; /* mono */
-        cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
-        for (int i = 0; i < N * 2; i++) { in[i] = (int16_t)i; out[i] = 0; }
-        (*h)->process(h, &bi, &bo);
-        CHECK(memcmp(in, out, N * 4) == 0 && cc->unsupported == 1);
-        AELI.release_effect(h);
         free(in);
         free(out);
+    }
+
+    /* ---- layouts other than 16-bit stereo: refused at SET_CONFIG, handed on unchanged and sized
+     * by the layout given (each buffer exactly the size Android would pass, so AddressSanitizer
+     * catches any read or write past it) */
+    {
+        const uint32_t MONO = 0x1;
+        struct { uint32_t inch, infmt, outch, outfmt; int acc; size_t inb, outb; const char *what; } cases[] = {
+            {MONO, AUDIO_FORMAT_PCM_16_BIT, MONO, AUDIO_FORMAT_PCM_16_BIT, 0, 2, 2, "mono 16-bit"},
+            {MONO, AUDIO_FORMAT_PCM_16_BIT, MONO, AUDIO_FORMAT_PCM_16_BIT, 1, 2, 2, "mono 16-bit, accumulate"},
+            {AUDIO_CHANNEL_OUT_STEREO, AUDIO_FORMAT_PCM_32_BIT, AUDIO_CHANNEL_OUT_STEREO, AUDIO_FORMAT_PCM_32_BIT, 0, 8, 8, "stereo 32-bit"},
+            {MONO, AUDIO_FORMAT_PCM_8_BIT, MONO, AUDIO_FORMAT_PCM_8_BIT, 0, 1, 1, "mono 8-bit"},
+            {AUDIO_CHANNEL_OUT_STEREO, AUDIO_FORMAT_PCM_16_BIT, MONO, AUDIO_FORMAT_PCM_16_BIT, 0, 4, 2, "stereo in, mono out"},
+            {0xF, AUDIO_FORMAT_PCM_16_BIT, 0xF, AUDIO_FORMAT_PCM_16_BIT, 0, 8, 8, "4 channels 16-bit"},
+        };
+        for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+            uint8_t *in = malloc(N * cases[ci].inb), *out = malloc(N * cases[ci].outb);
+            for (size_t i = 0; i < N * cases[ci].inb; i++) in[i] = (uint8_t)(i * 7 + 1);
+            for (size_t i = 0; i < N * cases[ci].outb; i++) out[i] = (uint8_t)(i * 3 + 5);
+            uint8_t *before = malloc(N * cases[ci].outb);
+            memcpy(before, out, N * cases[ci].outb);
+            h = make(44100, NULL, NULL, N, cases[ci].acc);
+            eqe_ctx *cc = (eqe_ctx *)h;
+            effect_config_t cfg = cc->config;
+            cfg.inputCfg.channels = cases[ci].inch;
+            cfg.inputCfg.format = cases[ci].infmt;
+            cfg.outputCfg.channels = cases[ci].outch;
+            cfg.outputCfg.format = cases[ci].outfmt;
+            reply = 99;
+            cmd_int(h, EFFECT_CMD_SET_CONFIG, sizeof(cfg), &cfg, &reply);
+            CHECK(reply == -EINVAL && !cc->cfg_ok);
+            cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+            audio_buffer_t bi = { N, { in } }, bo = { N, { out } };
+            (*h)->process(h, &bi, &bo);
+            int ok;
+            if (cases[ci].inch != cases[ci].outch) {
+                ok = memcmp(out, before, N * cases[ci].outb) == 0;      /* layouts differ: untouched */
+            } else if (cases[ci].acc) {
+                ok = 1;
+                for (int i = 0; i < N; i++) {
+                    int16_t a, b, o;
+                    memcpy(&a, in + 2 * i, 2); memcpy(&b, before + 2 * i, 2); memcpy(&o, out + 2 * i, 2);
+                    int32_t v = a + b;
+                    if (o != (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v)) ok = 0;
+                }
+            } else {
+                ok = memcmp(out, in, N * cases[ci].inb) == 0;           /* handed on, every byte */
+            }
+            CHECK(ok && cc->unsupported == 1);
+            if (!ok) fprintf(stderr, "  layout case: %s\n", cases[ci].what);
+            /* a 16-bit stereo config afterwards is taken again and processed */
+            int16_t *s_in = calloc(N * 2, sizeof(int16_t)), *s_out = calloc(N * 2, sizeof(int16_t));
+            cfg = cc->config;
+            cfg.inputCfg.channels = cfg.outputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
+            cfg.inputCfg.format = cfg.outputCfg.format = AUDIO_FORMAT_PCM_16_BIT;
+            reply = 99;
+            cmd_int(h, EFFECT_CMD_SET_CONFIG, sizeof(cfg), &cfg, &reply);
+            audio_buffer_t si = { N, { s_in } }, so = { N, { s_out } };
+            (*h)->process(h, &si, &so);
+            CHECK(reply == 0 && cc->cfg_ok && cc->unsupported == 1);
+            free(s_in); free(s_out);
+            AELI.release_effect(h);
+            free(in); free(out); free(before);
+        }
+        printf("layouts other than 16-bit stereo: refused and handed on unchanged, sized by their layout (%d cases)\n",
+               (int)(sizeof(cases) / sizeof(cases[0])));
     }
 
     /* ---- end bands as shelves (0.6.6) and the one-octave bells */
@@ -780,14 +1049,20 @@ int main(void) {
     /* ---- cost on this PC (the car's CPU is slower; the car app measures it there) */
     {
         const char *names[] = {"flat EQ (passes through)", "EQ with 10 bands, guard idle", "10 bands, guard limiting",
-                               "10 bands and the live view"};
-        for (int mode = 0; mode < 4; mode++) {
+                               "10 bands and the live view", "Expert, 20 bands, guard idle"};
+        for (int mode = 0; mode < 5; mode++) {
             h = make(44100, mix, mix, N, 0);
             cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
             int bands[EQE_NB] = {300, 200, 100, -100, -200, 100, 200, 300, 400, 500};
             int loud[EQE_NB] = {1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200};
             if (mode == 0) apply(h, mk(1, 0, 1, NULL));
             else if (mode == 2) apply(h, mk(1, 0, 1, loud));
+            else if (mode == 4) {
+                eqe_settings r = mk(1, -500, 1, NULL);
+                r.mode = 1; r.nx = EQE_NX;
+                for (int j = 0; j < EQE_NX; j++) { r.x[j][0] = EQE_X_PEAK; r.x[j][1] = (int32_t)(2500.0 * pow(1.4, j)); r.x[j][2] = (j & 1) ? 300 : -300; r.x[j][3] = 500; }
+                apply(h, r);
+            }
             else apply(h, mk(1, -500, 1, bands));
             int32_t sv[4 + EQE_NSPEC];
             if (mode == 3) get_param(h, EQE_PARAM_SPECTRUM, sv, sizeof(sv), &got);
@@ -805,6 +1080,91 @@ int main(void) {
                    per / (N / 44100.0 * 1e6) * 100.0);
             AELI.release_effect(h);
         }
+    }
+
+    /* ---- bands a chunk at a time (0.7.4, bands_block) against 0.7.3's one-sample-at-a-time
+     * process_frames (tests/ref_process_073.inc): the same output bit for bit, and the same filter
+     * state after every buffer, through random Easy and Expert settings, changes while playing (ramps
+     * across chunk and buffer edges), EQ off and on (the crossfade and the bit-exact path), flat
+     * (transparent), loud input (the clip guard), silence, seat delays, preamp moves, both buffer
+     * modes, odd buffer sizes. */
+    {
+        enum { NMAX = 3000 };
+        int16_t *in = (int16_t *)malloc(NMAX * 4), *oa = (int16_t *)malloc(NMAX * 4), *ob = (int16_t *)malloc(NMAX * 4);
+        effect_handle_t ha = make(48000, in, oa, NMAX, 0), hb = make(48000, in, ob, NMAX, 0);
+        eqe_ctx *ca = (eqe_ctx *)ha, *cb = (eqe_ctx *)hb;
+        cb->rng = ca->rng;
+        long buffers = 0, frames_all = 0, diff = 0, state_diff = 0, blocked = 0, ramps = 0, limited = 0;
+        double ph = 0.0;
+        for (int round = 0; round < 1500; round++) {
+            if (round % 6 == 0) {
+                /* new settings: Easy or Expert, sometimes flat or off */
+                int bands[EQE_NB];
+                for (int i = 0; i < EQE_NB; i++) bands[i] = (int)floor((rnd() * 2 - 1) * 1200) / 50 * 50;
+                double kind = rnd();
+                if (kind < 0.12) for (int i = 0; i < EQE_NB; i++) bands[i] = 0;
+                eqe_settings s = mk_ends(rnd() < 0.85, kind < 0.12 && rnd() < 0.5 ? 0 : (int)(-rnd() * 1200) / 50 * 50,
+                                         rnd() < 0.8, bands, (int)(rnd() * 4));
+                if (rnd() < 0.3) {
+                    s.delay_us[0] = (int)(rnd() * 5000);
+                    s.delay_us[1] = rnd() < 0.5 ? 0 : (int)(rnd() * 5000);
+                }
+                if (kind > 0.45) {
+                    s.mode = 1;
+                    s.nx = (int)(rnd() * (EQE_NX + 1));
+                    for (int j = 0; j < s.nx; j++) {
+                        int t = 1 + (int)(rnd() * 4);
+                        s.x[j][0] = t;
+                        s.x[j][1] = 2000 + (int)(pow(rnd(), 2) * 1998000);
+                        s.x[j][2] = t == EQE_X_LOW_CUT ? 0 : (int)((rnd() * 2 - 1) * 1500);
+                        s.x[j][3] = t == EQE_X_PEAK ? 100 + (int)(rnd() * 3900) : t == EQE_X_LOW_CUT ? 500 + (int)(rnd() * 1500) : 0;
+                    }
+                }
+                int ra = apply(ha, s), rb = apply(hb, s);
+                CHECK(ra == 0 && rb == 0);
+                ramps += ca->ramp_left > 0;
+            }
+            int n = 1 + (int)(rnd() * (NMAX - 1));
+            if (rnd() < 0.3) n = 1 + (int)(rnd() * 300);
+            double amp = rnd() < 0.15 ? 0.0 : rnd() < 0.3 ? 32767.0 : 2000.0 + rnd() * 20000.0;
+            for (int i = 0; i < n; i++) {
+                ph += 0.031 + 0.002 * sin(i * 0.001);
+                double v = amp * (0.6 * sin(ph) + 0.4 * (rnd() * 2 - 1));
+                in[2 * i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+                in[2 * i + 1] = (int16_t)(amp * (rnd() * 2 - 1) * 0.9);
+            }
+            int acc = rnd() < 0.2;
+            for (int i = 0; i < 2 * n; i++) oa[i] = ob[i] = acc ? (int16_t)(rnd() * 2000 - 1000) : 0;
+            int would_block = 0;
+            {
+                int nb = 0;
+                for (int j = 0; j < EQE_NBAND; j++) nb += ca->band[j].active;
+                would_block = nb > 0 && ca->processing && ca->w_tgt > 0.0;
+            }
+            uint32_t lim0 = ca->limited;
+            process_frames(ca, in, oa, (size_t)n, acc, NULL);
+            process_frames_ref(cb, in, ob, (size_t)n, acc, NULL);
+            buffers++;
+            frames_all += n;
+            blocked += would_block;
+            limited += ca->limited != lim0;
+            if (memcmp(oa, ob, (size_t)n * 4) != 0) diff++;
+            if (memcmp(ca->band, cb->band, sizeof(ca->band)) != 0 || ca->ramp_left != cb->ramp_left || ca->pre_cur != cb->pre_cur ||
+                ca->w != cb->w || ca->g2 != cb->g2 || ca->rng != cb->rng || ca->processing != cb->processing ||
+                ca->limited != cb->limited || ca->clipped != cb->clipped || ca->dpos != cb->dpos ||
+                memcmp(ca->dbuf, cb->dbuf, sizeof(ca->dbuf)) != 0 || memcmp(ca->dl, cb->dl, sizeof(ca->dl)) != 0)
+                state_diff++;
+        }
+        printf("bands a chunk at a time: %ld buffers (%ld frames; %ld through bands_block, %ld with a ramp started, %ld limited) "
+               "against 0.7.3's code: %ld differ, %ld with a different state\n",
+               buffers, frames_all, blocked, ramps, limited, diff, state_diff);
+        CHECK(diff == 0 && state_diff == 0);
+        CHECK(blocked > 300 && ramps > 100 && limited > 50);
+        AELI.release_effect(ha);
+        AELI.release_effect(hb);
+        free(in);
+        free(oa);
+        free(ob);
     }
 
     CHECK(AELI.release_effect(NULL) == -EINVAL);

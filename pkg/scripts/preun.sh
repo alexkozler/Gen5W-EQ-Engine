@@ -32,8 +32,11 @@ while mounted && [ $i -lt 5 ]; do
     i=$((i + 1))
     mounted && sleep 1
 done
-# Lab tests (the driver watch, or 0.6.0's 48 kHz policy copy), if one is on
-for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf; do
+# The other bind mounts, if one is there: EQ on CarPlay's layer over the CarPlay app's JNI library
+# (a CarPlay app that runs it keeps it until it next starts; with the app's files gone it passes the
+# music through untouched), and older versions' Lab tests (the driver watch, 0.6.0's 48 kHz policy
+# copy)
+for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf /system/lib/libCarPlayAndroid.so; do
     i=0
     while [ $i -lt 5 ]; do
         m=0
@@ -48,7 +51,12 @@ for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf; 
         i=$((i + 1))
     done
 done
-rm -f $D/state/lab_active
+rm -f $D/state/lab_active $D/state/cpw_want
+# 0.6.7's wrap property for the CarPlay app's next start, if an old install left it (it lasts one
+# start)
+case "$(getprop wrap.com.daudio.app.dipo)" in
+    *eqe_cpwatch.so*) setprop wrap.com.daudio.app.dipo "" ;;
+esac
 # The 48 kHz keeper (act.sh keep) puts the main output back to 44.1 kHz and stops once it sees
 # "disabled"; it gets some seconds for that (a change holds the output's tracks first), then it
 # is stopped. Its helper (Hold.java) is stopped too: Android then releases the helper's filters.

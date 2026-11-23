@@ -50,6 +50,20 @@ python3 "$HERE/gen_tramp.py" "$HERE/drvwatch_exports.txt" "$OUT/drvwatch_tramp.S
     -Wl,--no-undefined -Wl,--build-id=sha1 -Wl,--no-rosegment -Wl,--fatal-warnings -ldl -llog -lm
 "$BIN/llvm-strip" --strip-unneeded "$OUT/eqe_drvwatch.so"
 echo "built $OUT/eqe_drvwatch.so"
+# CarPlay watch 2 (Lab test): laid over the factory CarPlay app's libCarPlayAndroid.so (an in-memory
+# bind mount); its JNI_OnLoad loads an unchanged copy of the car's file and hands on to it, then
+# points libCarPlayAudio.so's imports of TinyALSA's pcm_open, pcm_close, pcm_write and pcm_read at
+# pass-through functions that hand each call on, unchanged, to the car's libtinyalsa.so. Exports
+# JNI_OnLoad and its check, nothing else.
+"$BIN/armv7a-linux-androideabi19-clang" \
+    -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-sign-compare \
+    -fPIC -fvisibility=hidden -fno-stack-protector \
+    -march=armv7-a -mfloat-abi=softfp -mfpu=vfpv3-d16 -mthumb \
+    -shared -o "$OUT/eqe_cpwatch.so" "$HERE/cpwatch.c" \
+    -Wl,-soname,eqe_cpwatch.so -Wl,--hash-style=both -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,text \
+    -Wl,--no-undefined -Wl,--build-id=sha1 -Wl,--no-rosegment -Wl,--fatal-warnings -ldl -llog -lm
+"$BIN/llvm-strip" --strip-unneeded "$OUT/eqe_cpwatch.so"
+echo "built $OUT/eqe_cpwatch.so"
 # Lab helper for the 48 kHz test (0.6.1): measures the hardware links' real rate from the kernel's
 # counters, and sends Android's own per-output settings through the car's libmedia (found by name
 # at run time, so nothing of Android's is linked in).

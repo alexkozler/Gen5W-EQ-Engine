@@ -3,8 +3,14 @@ package com.eqengine.app;
 import android.content.Context;
 import android.graphics.Color;
 import android.os.Handler;
+import android.text.InputType;
+import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -155,6 +161,91 @@ final class Overlay extends FrameLayout {
         addView(scrim, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
         dialog = scrim;
         scrim.animate().alpha(1f).setDuration(150).start();
+    }
+
+    interface Answer {
+        void answer(String text);
+    }
+
+    /** A modal question with a number field (Expert's frequency): Cancel and the action button. */
+    void prompt(String title, String body, String initial, String action, final Answer onAnswer) {
+        if (dialog != null) removeView(dialog);
+        final FrameLayout scrim = new FrameLayout(getContext());
+        scrim.setBackgroundColor(Color.argb(150, 0, 0, 0));
+        scrim.setClickable(true);
+        LinearLayout card = new LinearLayout(getContext());
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(Ui.round(Ui.SURFACE_HI, dp(24)));
+        card.setPadding(dp(24), dp(22), dp(16), dp(14));
+        card.setClickable(true);
+        card.addView(Ui.text(getContext(), title, 24, Ui.ON_SURFACE, true));
+        if (body != null) {
+            TextView b = Ui.text(getContext(), body, 18, Ui.ON_SURFACE_VAR, false);
+            b.setPadding(0, dp(12), dp(8), 0);
+            card.addView(b);
+        }
+        final EditText field = new EditText(getContext());
+        field.setText(initial);
+        field.setSelectAllOnFocus(true);
+        field.setSingleLine(true);
+        field.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        field.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        field.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        field.setTextColor(Ui.ON_SURFACE);
+        field.setBackground(Ui.outlined(Ui.SURFACE, Ui.PRIMARY, dp(2), dp(10)));
+        field.setPadding(dp(14), dp(10), dp(14), dp(10));
+        LinearLayout.LayoutParams fl = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        fl.setMargins(0, dp(16), dp(8), dp(16));
+        card.addView(field, fl);
+        final Runnable done = new Runnable() {
+            public void run() {
+                hideKeyboard(field);
+                closeDialog(scrim);
+                onAnswer.answer(field.getText().toString());
+            }
+        };
+        field.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            public boolean onEditorAction(TextView v, int id, KeyEvent ev) {
+                if (id == EditorInfo.IME_ACTION_DONE || (ev != null && ev.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
+                    done.run();
+                    return true;
+                }
+                return false;
+            }
+        });
+        LinearLayout buttons = new LinearLayout(getContext());
+        buttons.setGravity(Gravity.RIGHT);
+        buttons.addView(Ui.button(getContext(), "Cancel", Ui.TEXT, new OnClickListener() {
+            public void onClick(View v) {
+                hideKeyboard(field);
+                closeDialog(scrim);
+            }
+        }));
+        View gap = new View(getContext());
+        buttons.addView(gap, new LinearLayout.LayoutParams(dp(8), 1));
+        buttons.addView(Ui.button(getContext(), action, Ui.FILLED, new OnClickListener() {
+            public void onClick(View v) {
+                done.run();
+            }
+        }));
+        card.addView(buttons);
+        scrim.addView(card, new LayoutParams(dp(520), LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL | Gravity.TOP));
+        ((LayoutParams) card.getLayoutParams()).topMargin = dp(40);
+        addView(scrim, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+        dialog = scrim;
+        field.requestFocus();
+        field.postDelayed(new Runnable() {
+            public void run() {
+                InputMethodManager im = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (im != null) im.showSoftInput(field, InputMethodManager.SHOW_IMPLICIT);
+            }
+        }, 150);
+    }
+
+    private void hideKeyboard(View v) {
+        InputMethodManager im = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (im != null) im.hideSoftInputFromWindow(v.getWindowToken(), 0);
     }
 
     private void closeDialog(View scrim) {

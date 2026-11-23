@@ -12,14 +12,33 @@ import android.view.View;
 import java.util.Locale;
 
 /**
- * Drawn behind EqPanel, at the same size: the output meter (column 11) and, when the Live switch
- * is on, the live view: how loud each part of the range is (48 bands, 20 Hz .. 20 kHz) as a filled
- * shape on the sliders' frequency axis. Only this view is redrawn as the music moves (about 20-25
- * times a second); the sliders and the curve in EqPanel are not.
+ * Drawn behind the EQ face, at the same size (EqPanel in Easy mode, XPanel in Expert mode): the
+ * output meter (Easy's column 11) and, when the Live switch is on, the live view: how loud each
+ * part of the range is (48 bands, 20 Hz .. 20 kHz) as a filled shape on the face's frequency
+ * axis. Only this view is redrawn as the music moves (about 20-25 times a second); the sliders
+ * and curves in front of it are not.
  * The readings come lined up with what is heard (Delay); here they get meter-like movement: a
  * quick rise and a slower fall, so the shape does not flicker.
  */
 final class LiveLayer extends View {
+    /** Where the face in front draws: the live view's area and frequency axis, and the meter's column. */
+    interface Geometry {
+        float specLeft();
+        float specRight();
+        float specTop();
+        float specBottom();
+        float xForHz(double hz);
+        boolean hasMeter();
+        float meterCx();
+        float colWidth();
+        float trackTop();
+        float trackBottom();
+        float textSize();
+        float valueY();
+        float labelY();
+        float sub2Y();
+    }
+
     private static final float METER_MIN_DB = -36f;
     /**
      * The live view's scale: band level in dBFS from the bottom of the slider tracks to the top.
@@ -28,7 +47,7 @@ final class LiveLayer extends View {
     private static final float SPEC_BOT_DB = -72f, SPEC_TOP_DB = -6f;
     private static final float RISE_MS = 25f, FALL_MS = 300f, SPEC_FALL_MS = 350f;
 
-    private final EqPanel panel;
+    private final Geometry panel;
     private final Paint pTrack = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pMeter = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pHold = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -52,7 +71,7 @@ final class LiveLayer extends View {
     private long specAt;
     private boolean specVisible;
 
-    LiveLayer(Context c, EqPanel panel) {
+    LiveLayer(Context c, Geometry panel) {
         super(c);
         this.panel = panel;
         pTrack.setColor(Ui.SURFACE_TOP);
@@ -140,20 +159,20 @@ final class LiveLayer extends View {
     }
 
     private float specY(float db) {
-        float top = panel.trackTop(), bot = panel.trackBottom();
+        float top = panel.specTop(), bot = panel.specBottom();
         float t = (Math.max(SPEC_BOT_DB, Math.min(SPEC_TOP_DB, db)) - SPEC_BOT_DB) / (SPEC_TOP_DB - SPEC_BOT_DB);
         return bot - t * (bot - top);
     }
 
     private void drawSpectrum(Canvas c) {
-        float gl = panel.colLeft(1) - panel.gapWidth() * 0.4f, gr = panel.colLeft(10) + panel.colWidth() + panel.gapWidth() * 0.4f;
-        float bot = panel.trackBottom();
+        float gl = panel.specLeft(), gr = panel.specRight();
+        float bot = panel.specBottom();
         fill.reset();
         line.reset();
         int first = -1, last = -1;
         for (int b = 0; b < spec.length; b++) {
             if (!specHas[b]) continue;
-            float x = panel.bandXForHz(20.0 * Math.pow(1000.0, b / (double) (spec.length - 1)));
+            float x = panel.xForHz(20.0 * Math.pow(1000.0, b / (double) (spec.length - 1)));
             specX[b] = x;
             float y = specY(spec[b]);
             if (first < 0) {
@@ -171,14 +190,15 @@ final class LiveLayer extends View {
         fill.lineTo(specX[last], bot);
         fill.close();
         c.save();
-        c.clipRect(gl, panel.trackTop(), gr, bot);
+        c.clipRect(gl, panel.specTop(), gr, bot);
         c.drawPath(fill, pSpecFill);
         c.drawPath(line, pSpecLine);
         c.restore();
     }
 
     private void drawMeter(Canvas c) {
-        float cx = panel.colCx(11), mw = panel.colWidth() * 0.34f;
+        if (!panel.hasMeter()) return;
+        float cx = panel.meterCx(), mw = panel.colWidth() * 0.34f;
         float top = panel.trackTop(), bot = panel.trackBottom(), ts = panel.textSize();
         if (bot <= top) return;
         pText.setTextSize(ts);

@@ -68,11 +68,14 @@ cp "$HERE/pkg/NEMESIS.data" "$P/"
 # characters) before running anything; check with the same rules here.
 python3 "$HERE/tests/meta/check_meta.py" "$P/NEMESIS.data"
 cp "$B/EQEngine.apk" "$P/app/"
-cp "$HERE/native/out/libeqengine.so" "$HERE/native/out/libaudio-resampler.so" "$HERE/native/out/eqe_drvwatch.so" "$P/lib/"
+cp "$HERE/native/out/libeqengine.so" "$HERE/native/out/libaudio-resampler.so" "$HERE/native/out/eqe_drvwatch.so" \
+    "$HERE/native/out/eqe_cpwatch.so" "$P/lib/"
 set -- $(md5sum "$HERE/native/out/libaudio-resampler.so")
 echo "$1" > "$P/lib/libaudio-resampler.md5"
 set -- $(md5sum "$HERE/native/out/eqe_drvwatch.so")
 echo "$1" > "$P/lib/eqe_drvwatch.md5"
+set -- $(md5sum "$HERE/native/out/eqe_cpwatch.so")
+echo "$1" > "$P/lib/eqe_cpwatch.md5"
 cp "$HERE/pkg/conf/audio_effects.conf" "$P/conf/"
 cp "$HERE/pkg/bin/boot.sh" "$HERE/pkg/bin/act.sh" "$HERE/native/out/alsactl_dump" "$HERE/native/out/eqe_lab" "$P/bin/"
 cp "$HERE/pkg/scripts/"*.sh "$P/scripts/"

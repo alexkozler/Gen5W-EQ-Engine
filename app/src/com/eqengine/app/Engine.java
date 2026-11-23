@@ -21,13 +21,17 @@ final class Engine {
     static final UUID TYPE = UUID.fromString("1de0ea4c-d55d-460b-a1e5-4a8c2e95c191");
     static final UUID IMPL = UUID.fromString("64b3439e-9662-4040-9fd1-83f116f74988");
     static final int P_STATS = 2, P_VERSION = 3, P_SETTINGS = 10, P_RESPONSE = 11, P_GAINS = 12, P_VHQ = 13,
-            P_SPECTRUM = 14, P_LEVEL = 15;
+            P_SPECTRUM = 14, P_LEVEL = 15, P_PEAK = 16;
     /**
+     * 0x323 = this filter (0.7.4: the bands run a chunk at a time; the same sound as 0x322);
+     * 0x322 = 0.7.1-0.7.3's filter (settings layout 3: Expert mode, up to 20 bands of its own);
+     * 0x321 = 0.6.10's filter (adds P_PEAK, the largest boost of any settings from the solved filters);
      * 0x320 = 0.6.6 filter (settings layout 2 with the end-band types, P_SPECTRUM, P_LEVEL);
      * 0x310 = 0.5 filter (adds P_VHQ); 0x300 = 0.4 filter. The older ones stay in the audio server
      * after an update until it restarts, so they are still driven (without the new parts).
      */
-    static final int LIB_VERSION = 0x320, LIB_VERSION_05 = 0x310, LIB_VERSION_04 = 0x300;
+    static final int LIB_VERSION = 0x323, LIB_VERSION_0611 = 0x322, LIB_VERSION_0610 = 0x321, LIB_VERSION_066 = 0x320, LIB_VERSION_05 = 0x310,
+            LIB_VERSION_04 = 0x300;
     static final int NRESP = 96, NSTATS = 28, NSPEC = 48;
     static final int RESP_NONE = 0x80000000;
     private static final long TICK_MS = 3000, STATS_MS = 250, SUMMARY_MS = 30000, SUMMARY_QUIET_MS = 600000;
@@ -77,6 +81,7 @@ final class Engine {
     private boolean freshlyLoaded;
     private long lastStatsAt;
     private int[] level, spectrum;
+    private int[] cpLive;
 
     private Engine(Context ctx) {
         this.ctx = ctx;
@@ -114,6 +119,7 @@ final class Engine {
         freshlyLoaded = false;
         EqLog.detailed = settings.detailedLog;
         EqLog.i("engine started; settings: " + settings.describe());
+        CarPlayEq.push(settings);
         h.post(tick);
     }
 
@@ -156,6 +162,7 @@ final class Engine {
             if (!running) return;
             check();
             if (listener == null) readStats();
+            CarPlayEq.tick(settings);
             h.postDelayed(this, TICK_MS);
         }
     };
@@ -173,14 +180,28 @@ final class Engine {
                 readStats();
                 lastStatsAt = now;
             }
-            boolean nw = fx != null && libVersion == LIB_VERSION;
+            boolean nw = newFilter();
             level = nw && pollMode >= POLL_METER ? readInts(P_LEVEL, 6) : null;
             spectrum = nw && pollMode == POLL_LIVE ? readInts(P_SPECTRUM, 4 + NSPEC) : null;
+            // CarPlay's music through the CarPlay watch's EQ (0.7.3): its level and live view instead
+            // (while CarPlay has the speaker link, Android's output cannot play)
+            if (pollMode == POLL_LIVE) CarPlayEq.keepLive();
+            int[] cv = CarPlayEq.snapshot();
+            cpLive = cv;
+            if (CarPlayEq.playing(cv)) {
+                if (pollMode >= POLL_METER) level = CarPlayEq.level(cv);
+                if (pollMode == POLL_LIVE) spectrum = CarPlayEq.spectrum(cv);
+            }
             Listener l = listener;
             if (l != null) l.onEngine();
             h.postDelayed(this, POLL_MS[pollMode]);
         }
     };
+
+    /** The CarPlay watch's live file as last read (CarPlayEq.snapshot), or null; read now when the screen polls nothing. */
+    int[] cpLive() {
+        return listener != null ? cpLive : CarPlayEq.snapshot();
+    }
 
     /** The last buffer's output level from the 0.6.6 filter (see eqengine.c level_read), or null. */
     int[] level() {
@@ -192,14 +213,57 @@ final class Engine {
         return spectrum;
     }
 
-    /** The running audio server has the 0.6.6 filter (end-band shelves, live view, buffer level). */
+    /** The running audio server has the 0.6.6 filter or a later one (end-band shelves, live view, buffer level). */
     boolean newFilter() {
-        return fx != null && libVersion == LIB_VERSION;
+        return fx != null && (expertLib(libVersion) || libVersion == LIB_VERSION_0610 || libVersion == LIB_VERSION_066);
     }
 
-    /** Attached to an older filter (the audio server started before the update). */
+    /** The running audio server has a filter that plays Expert mode (this version's or 0.7.1-0.7.3's). */
+    boolean expertFilter() {
+        return fx != null && expertLib(libVersion);
+    }
+
+    /** Filters that take settings layout 3 (Expert mode): 0x323 and 0x322 behave the same to the app. */
+    static boolean expertLib(int v) {
+        return v == LIB_VERSION || v == LIB_VERSION_0611;
+    }
+
+    /** The settings layout the running filter takes: 3 (Expert mode), 2 (end-band types) or 1. */
+    private int layout() {
+        return expertLib(libVersion) ? 3 : newFilter() ? 2 : 1;
+    }
+
+    /** The Easy page's solved filter gains in 0.01 dB (what the ten bands really do), or null. */
+    int[] gains() {
+        return newFilter() ? readInts(P_GAINS, EqSettings.NB) : null;
+    }
+
+    /** The output's sample rate as the filter has it, or 0. */
+    int rate() {
+        int[] st = stats();
+        return st != null && st.length > 1 ? st[1] : 0;
+    }
+
+    /**
+     * The largest boost of settings x's solved band filters, 0 Hz to half the sample rate, as
+     * {0.01 dB, Hz (0 = 0 Hz), sample rate}; null when the filter cannot tell (an older one, not
+     * attached, or no rate yet). Nothing is applied: the filter works it out on the side.
+     */
+    int[] peakFor(EqSettings x) {
+        if (fx == null || (!expertLib(libVersion) && libVersion != LIB_VERSION_0610) || setP == null) return null;
+        try {
+            int rc = (Integer) setP.invoke(fx, intsToBytes(new int[] {P_PEAK}), x.toParam(layout()));
+            if (rc != 0) return null;
+        } catch (Throwable t) {
+            EqLog.e("asking the filter for the largest boost failed", unwrap(t));
+            return null;
+        }
+        return readInts(P_PEAK, 3);
+    }
+
+    /** Attached to a filter older than Expert mode (the audio server started before the update). */
     boolean olderFilter() {
-        return fx != null && libVersion != LIB_VERSION;
+        return fx != null && !expertLib(libVersion);
     }
 
     private void check() {
@@ -248,7 +312,7 @@ final class Engine {
     }
 
     private static boolean known(int v) {
-        return v == LIB_VERSION || v == LIB_VERSION_05 || v == LIB_VERSION_04;
+        return expertLib(v) || v == LIB_VERSION_0610 || v == LIB_VERSION_066 || v == LIB_VERSION_05 || v == LIB_VERSION_04;
     }
 
     private void check2() {
@@ -386,10 +450,13 @@ final class Engine {
 
     private int pushNow() {
         lastPushAt = System.currentTimeMillis();
+        // the CarPlay watch's EQ gets the same settings, whether Android's filter is attached or not
+        CarPlayEq.push(settings);
         if (fx == null) return -1;
         int rc;
         try {
-            rc = (Integer) setP.invoke(fx, intsToBytes(new int[] {P_SETTINGS}), settings.toParam(libVersion == LIB_VERSION));
+            // an older filter (until the next car start) gets the Easy settings in its own layout
+            rc = (Integer) setP.invoke(fx, intsToBytes(new int[] {P_SETTINGS}), settings.toParam(layout()));
         } catch (Throwable t) {
             EqLog.e("sending settings failed", unwrap(t));
             return -2;
@@ -427,7 +494,8 @@ final class Engine {
      * [4] taps per side, [5] phase bits, [6] table version.
      */
     int[] vhqStatus() {
-        if (fx == null || (libVersion != LIB_VERSION && libVersion != LIB_VERSION_05)) return null;
+        if (fx == null || (!expertLib(libVersion) && libVersion != LIB_VERSION_0610 && libVersion != LIB_VERSION_066
+                && libVersion != LIB_VERSION_05)) return null;
         return readInts(P_VHQ, 8);
     }
 
