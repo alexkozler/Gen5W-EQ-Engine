@@ -27,7 +27,8 @@ alongside it, including HMG-API's wireless CarPlay and Android Auto package
 ([how](#eq-on-carplay-and-other-add-ons)).
 
 **Current version: 0.7.6**: 0.7.4, tested on the Ioniq 5 below, plus fixes from code reviews (0.7.5
-and 0.7.6). What changed: [CHANGELOG.md](CHANGELOG.md).
+and 0.7.6); 0.7.6 itself is tested on the Genesis G70 below. What changed:
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Verified vehicles
 
@@ -36,11 +37,12 @@ and 0.7.6). What changed: [CHANGELOG.md](CHANGELOG.md).
 | 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 | 0.7.4: Android Auto, CarPlay (wired and wireless) |
 | 2024 Hyundai Ioniq 6 Preferred AWD | Canada | Bose | 260903 | 0.6.6: Android Auto |
 | 2025 Hyundai Ioniq 6 Limited | USA | Bose | 260903 | 0.6.6: Android Auto |
+| 2022 Genesis G70 3.3T Sport AWD | Canada | Lexicon | 260903 | 0.7.6: Android Auto, CarPlay (wired and wireless) |
 
-No other car or software version has been tested, including Kia and Genesis cars with the same
-head unit. Other cars may have a different amplifier, audio driver, audio settings or CarPlay
-software. The package is marked for US Ioniq 5 software (`os="NEEV.USA.*"`); on other software
-NEMESIS shows it as a partial match. If you try it on another car, please send a
+No other car or software version has been tested, including Kia cars and other Genesis models with
+the same head unit. Other cars may have a different amplifier, audio driver, audio settings or
+CarPlay software. The package is marked for US Ioniq 5 software (`os="NEEV.USA.*"`); on other
+software NEMESIS shows it as a partial match. If you try it on another car, please send a
 [car report](#reporting-a-problem).
 
 ## What it does
