@@ -48,8 +48,8 @@ only run on the test car. Version numbers now have one digit per part: after 0.6
 ### New: EQ on CarPlay
 
 - CarPlay's music, wired and wireless, gets EQ Engine's EQ (Easy or Expert), preamp, clip guard and
-  listening position, with the same filter code as Android Auto, at CarPlay's own 44.1 kHz and with
-  nothing converted. Added delay: 1.4 ms, plus the seat delay if set.
+  listening position, with the same filter code as Android Auto, at CarPlay's own rate (44.1 or
+  48 kHz) and with nothing converted. Added delay: 1.4 ms, plus the seat delay if set.
 - On by default: Settings > EQ on CarPlay. Off makes CarPlay flat at once; on takes effect at the
   next car start, or at once when it was on at this car start.
 - It works from inside the factory CarPlay app: at each car start, before that app starts, a small

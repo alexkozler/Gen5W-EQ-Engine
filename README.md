@@ -14,7 +14,7 @@ EQ Engine is a [NEMESIS](https://github.com/xwtk/hmg_nemesis) package for the Ge
 1. **Sound quality, with no EQ needed.** It runs Android's main audio output at 48 kHz instead of
    the factory 44.1 kHz, so Android Auto's 48 kHz music reaches the audio hardware without being
    resampled. What still has to be resampled (Bluetooth audio, voice prompts) goes through a better
-   converter. CarPlay plays at its own 44.1 kHz and is never resampled.
+   converter. CarPlay plays at the rate the phone sends (44.1 or 48 kHz) and is never resampled.
 2. **Tone and imaging, if you want them**, on Android Auto, CarPlay and Bluetooth audio: an
    accurate 10-band EQ whose end bands can be shelves, or a parametric EQ with up to 20 bands, a
    preamp, a clip guard, a listening-position delay, and a live view of the music behind the EQ
@@ -60,7 +60,8 @@ link behind it to 48 kHz while the car runs:
   44.1 kHz.
 
 This is for what plays through Android (Android Auto, Bluetooth audio). CarPlay does not go
-through Android's audio server; it keeps its own 44.1 kHz, unconverted.
+through Android's audio server: the CarPlay app opens the speaker link at the rate of the stream
+it plays, 44.1 or 48 kHz, so its music is never converted and needs no switch.
 
 On the Ioniq 5 the link ran at 47,995-48,004 frames a second, at the right pitch, with no
 clicks. [How the switch works](#the-48-khz-switch).
@@ -105,10 +106,10 @@ other one.
 ### EQ on CarPlay (on by default)
 
 CarPlay's music, wired or wireless, gets the same EQ (Easy or Expert), preamp, clip guard and
-listening position as Android Auto, with the same filter code, at CarPlay's own 44.1 kHz and with
-nothing converted. The meter, the live view and the Status page show CarPlay's music while it
-plays. Siri and calls are never processed. Added delay: 1.4 ms (the clip guard's look-ahead), plus
-the seat delay if you set one.
+listening position as Android Auto, with the same filter code, at CarPlay's own rate (44.1 or
+48 kHz) and with nothing converted. The meter, the live view and the Status page show CarPlay's
+music while it plays. Siri and calls are never processed. Added delay: 1.4 ms (the clip guard's
+look-ahead), plus the seat delay if you set one.
 
 Settings > EQ on CarPlay turns it off (CarPlay is flat at once) or on again (from the next car
 start, or at once when it was on at this car start). If it cannot load, or the CarPlay app keeps restarting with it, it turns itself off and the
@@ -143,7 +144,7 @@ default; a seat offset adjusts it). Volumes stay with the car's balance and fade
 | Source | EQ Engine's EQ | Sample rate |
 |---|---|---|
 | Android Auto music (wired or wireless) | yes | 48 kHz, not converted |
-| CarPlay music (wired or wireless) | yes | 44.1 kHz, not converted |
+| CarPlay music (wired or wireless) | yes | 44.1 or 48 kHz (as the phone sends it), not converted |
 | Bluetooth audio (for example an iPhone) | yes | 44.1 kHz, converted up to 48 kHz (Very high) |
 | Android Auto's directions voice, the car's navigation prompts | no (Android's second output) | voice converted with the converter choice |
 | Siri, phone calls (hands-free, CarPlay calls) | no | not touched |
@@ -202,8 +203,10 @@ All ten Easy sliders at +4 dB, at 48 kHz (calculated with the filter's own code)
 ## How EQ on CarPlay works
 
 CarPlay's music does not go through Android's audio server. The factory CarPlay app receives it
-from the phone and writes it to the speaker link itself, with TinyALSA, at 44.1 kHz. So no Android
-audio effect can reach it; EQ Engine has to run inside that app.
+from the phone and writes it to the speaker link itself, with TinyALSA, at the stream's own rate:
+usually 44.1 kHz, and 48 kHz when the phone sends that (seen on a Genesis G70, where it changed when
+the iPhone's Camera app opened or closed). So no Android audio effect can reach it; EQ Engine has
+to run inside that app.
 
 - **At each car start**, before the CarPlay app starts, EQ Engine lays a small library of its own
   over the app's JNI library, `/system/lib/libCarPlayAndroid.so`, with an in-memory bind mount
@@ -383,7 +386,7 @@ With the EQ off, CarPlay's music is passed through untouched too.
    CarPlay is laid over the CarPlay app before that app starts.
 6. Open EQ Engine from NEMESIS Manager > My Packages > EQ Engine > Launch. Play some music. On
    the Status page, the Output tile should show "48 kHz, unconverted" within about 10 s with
-   Android Auto, or "CarPlay, 44.1 kHz" with CarPlay.
+   Android Auto, or "CarPlay, 44.1 kHz" (or 48 kHz) with CarPlay.
 
 > [!IMPORTANT]
 > **Restart the head unit after installing or updating.** Until then Android's audio has not
