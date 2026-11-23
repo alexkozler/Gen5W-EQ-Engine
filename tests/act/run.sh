@@ -342,6 +342,7 @@ S
     cat > $T/stubs/umount <<'S'
 #!/bin/sh
 grep -q " $1 " /tmp/eqeact/proc/mounts || exit 1
+[ -f /tmp/eqeact/umount_fail ] && { echo "failed: Device or resource busy" >&2; exit 1; }
 # the audio server has the file loaded
 [ -f /tmp/eqeact/busy ] && { echo "failed: Device or resource busy" >&2; exit 1; }
 cp "$1.under" "$1" && rm -f "$1.under"
@@ -357,6 +358,7 @@ check) echo "symbols 4 of 4" ;;
 umount)
     echo "umount $2" >> $T/umount.log
     grep -q " $2 " $T/proc/mounts || { echo "failed: Invalid argument"; exit 1; }
+    [ -f $T/umount_fail ] && { echo "failed: Device or resource busy"; exit 1; }
     cp "$2.under" "$2" && rm -f "$2.under"
     grep -v " $2 " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
     echo "detached $2" ;;
@@ -987,7 +989,7 @@ cpwsetup() {  # labsetup, plus the CarPlay watch installed and the factory CarPl
     cp $T/proc/2290/maps $T/dipo_maps
     echo 2290 > $T/dipo_pid
     rm -f $T/dipo_no_restart $T/dipo_nudge_only $T/am.log $T/cpcheck_fail $T/cpcheck.log $T/dipo_starts.log
-    rm -f $T/cps_noload $T/cps_fail $T/cps_nowatch $T/cps_nostatus $T/cp_connected $T/cp_jni_loaded
+    rm -f $T/cps_noload $T/cps_fail $T/cps_nowatch $T/cps_nostatus $T/cp_connected $T/cp_jni_loaded $T/cps_nocopy $T/umount_fail
     # the kernel's TCP tables: a listening socket of the app, another process's established
     # connection, and (cp_connected) the app's established connection to a phone
     mkdir -p $T/proc/net
@@ -1067,8 +1069,9 @@ echo "b2800000-b2810000 r-xp 00000000 b3:19 88   /system/lib/libCarPlayAndroid.s
 m=0
 grep -q " $T/system/lib/libCarPlayAndroid.so " $T/proc/mounts && m=1
 if [ $m = 1 ] && [ ! -f $T/cps_noload ]; then
-    echo "b2700000-b2710000 r-xp 00000000 b3:19 89   /data/eqengine/lib/libCarPlayAndroid.car.so" >> $T/proc/$n/maps
+    [ -f $T/cps_nocopy ] || echo "b2700000-b2710000 r-xp 00000000 b3:19 89   /data/eqengine/lib/libCarPlayAndroid.car.so" >> $T/proc/$n/maps
     st=watching
+    [ -f $T/cps_nocopy ] && st=failed
     [ -f $T/cps_fail ] && st=failed
     [ -f $T/cps_nowatch ] && st="not watching"
     [ -f $T/cps_nostatus ] || printf 'version=2\npid=%s\nstate=%s\nimports=4 of 4\nhmgapi=yes\n' $n "$st" > $T/data/eqengine/cpw/status.$n
@@ -1187,6 +1190,11 @@ carstart
 ok "guard: after a take-off, the next car start is without the watch" "! jmounted && grep -qx 'start 2330 mounted=0' $T/dipo_starts.log && ! grep -q EQE_CPW $T/boot_out.txt"
 cpwsetup; run cpwatch 1; touch $T/cps_fail; carstart; run cpwguard
 ok "guard: the watch says the factory library did not load (nothing connected): taken off, the app restarted without it" "[ \"\$(cst state)\" = failed ] && ! jmounted && [ ! -f $CS/cpw_want ] && grep -qx 'start 2310 mounted=0' $T/dipo_starts.log && grep -q 'taken off: the watch could not load the factory library (pid 2300); taken off, and the CarPlay app restarted without it (pid 2310)' $CS/cpw_result"
+cpwsetup; run cpwatch 1; touch $T/cps_nocopy; carstart; run cpwguard
+ok "0.7.6: the factory library did not load at all (its copy never mapped): still taken off, the app restarted without it, the app told" "[ \"\$(cst state)\" = failed ] && ! jmounted && [ ! -f $CS/cpw_want ] && grep -qx 'start 2310 mounted=0' $T/dipo_starts.log && grep -q 'taken off: the watch could not load the factory library (pid 2300); taken off, and the CarPlay app restarted without it (pid 2310)' $CS/cpw_result && grep -qx 'why=it could not load the factory CarPlay library' $CS/cpw_failed"
+cpwsetup; run cpwatch 1; touch $T/cps_nocopy $T/umount_fail; carstart; run cpwguard
+ok "0.7.6: when the mount cannot be removed, the app is not restarted (it would load the watch again); says to restart the car" "[ \"\$(cst state)\" = failed ] && jmounted && [ ! -f $CS/cpw_want ] && [ $(nkill) = 0 ] && grep -q 'its mount could not be removed now' $CS/cpw_result && [ -f $CS/cpw_failed ]"
+rm -f $T/umount_fail $T/cps_nocopy
 cpwsetup; run cpwatch 1; touch $T/cps_fail $T/cp_connected; $T/stubs/nettcp; carstart; run cpwguard
 ok "guard: the factory library did not load, but the app has a connection: taken off, not restarted, says to restart the car" "[ \"\$(cst state)\" = failed ] && ! jmounted && [ $(nstart) = 1 ] && grep -q 'the CarPlay app was not restarted (1 established connections); restart the car (parked)' $CS/cpw_result"
 cpwsetup; run cpwatch 1; touch $T/cps_fail $T/dipo_no_restart $T/dipo_nudge_only; carstart; run cpwguard
@@ -1224,6 +1232,18 @@ cpwsetup; run cpwatch 1; carstart; run cpwguard; run cpwatch 0
 echo "1 $FMD5 1000" > $CS/cpw_want; echo "the watch's notes" > $CW/keep.txt
 run cpwboot
 ok "the boot step while the app runs the watch from an earlier mount: laid over, the app's notes and live file left where they are" "[ $(rc) = 0 ] && jmounted && grep -q 'EQE_CPW laid over the CarPlay app.s JNI library at the car start' $T/out.txt && [ -f $CW/keep.txt ] && [ ! -f $CW.prev/keep.txt ]"
+
+echo "-- another package's mount at the CarPlay path (0.7.6)"
+foreign() { cpwsetup; rm -f $T/umount.log; cp $JNI $JNI.under; echo "another package's CarPlay library" > $JNI; echo "none $JNI none rw 0 0" >> $T/proc/mounts; }
+foreign; export EQE_CPW_NOTIFY=1; run cpwatch 1; unset EQE_CPW_NOTIFY
+ok "turning it on over another package's file: refused, nothing laid over it, the app told at an install" "[ $(rc) = 1 ] && grep -q 'EQE_CPW refused: another package has a file laid over $JNI' $T/out.txt && grep -qx \"another package's CarPlay library\" $JNI && [ ! -f $CS/cpw_want ] && [ \$(grep -c \" $JNI \" $T/proc/mounts) = 1 ] && grep -q '^why=it could not be prepared: another package has a file laid over' $CS/cpw_failed"
+foreign; echo "1 $FMD5 1000" > $CS/cpw_want; run cpwboot
+ok "the car start with another package's file there: not laid over it, off, the app told" "grep -q 'not laid over at this start: another package has a file laid over $JNI' $T/out.txt && grep -qx \"another package's CarPlay library\" $JNI && [ ! -f $CS/cpw_want ] && [ \"\$(cst state)\" = failed ]"
+foreign; run cpwatch 0
+ok "turning it off leaves another package's mount alone" "[ $(rc) = 0 ] && grep -qx \"another package's CarPlay library\" $JNI && jmounted && [ ! -s $T/umount.log ]"
+foreign; echo "1 $FMD5 1000" > $CS/cpw_want; run off
+ok "EQ Engine off leaves another package's mount alone" "grep -qx \"another package's CarPlay library\" $JNI && jmounted"
+rm -f $CS/disabled; cp $JNI.under $JNI; rm -f $JNI.under; grep -v " $JNI " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
 
 echo "-- refusals and failures"
 cpwsetup; touch $CS/disabled

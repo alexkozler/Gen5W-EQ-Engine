@@ -26,8 +26,8 @@ It is a plain NEMESIS package. It is **not** an HMG-API mod and does not need HM
 alongside it, including HMG-API's wireless CarPlay and Android Auto package
 ([how](#eq-on-carplay-and-other-add-ons)).
 
-**Current version: 0.7.5**: 0.7.4, tested on the Ioniq 5 below, plus one fix to the EQ on CarPlay
-switch. What changed: [CHANGELOG.md](CHANGELOG.md).
+**Current version: 0.7.6**: 0.7.4, tested on the Ioniq 5 below, plus fixes from code reviews (0.7.5
+and 0.7.6). What changed: [CHANGELOG.md](CHANGELOG.md).
 
 ## Verified vehicles
 
@@ -211,10 +211,13 @@ audio effect can reach it; EQ Engine has to run inside that app.
   exactly as before. It then points four entries of the CarPlay audio library's import table
   (`pcm_open`, `pcm_close`, `pcm_write`, `pcm_read`, found from its dynamic symbol table) at its
   own functions. No code is changed.
-- Each of those calls is handed on to the car's TinyALSA. The **music stream** (the main speaker
-  link, 44.1 or 48 kHz, 16-bit stereo) is first run through EQ Engine's filter, into a buffer of
-  its own. Every other stream (Siri, calls, the microphone) is handed on untouched, and the music
-  goes dry while the microphone is open.
+- Each of those calls is handed on to the car's TinyALSA. The stream it treats as **music** is
+  the one CarPlay opens on the main speaker link at 44.1 or 48 kHz, 16-bit stereo; that stream is
+  first run through EQ Engine's filter, into a buffer of its own. CarPlay's music always comes that
+  way. EQ Engine cannot see what a stream is for, so another sound CarPlay played there in that
+  format while no music played would get the EQ too; a second stream while music plays is left
+  alone. Siri and calls use other rates and are handed on untouched, and the music goes dry while
+  the microphone is open.
 - The app's settings reach it through a small file it reads ten times a second, so changes are
   heard within a fraction of a second. Its levels and live view come back the same way.
 - Before it is used, at the install and again after a factory software update, EQ Engine checks it
@@ -237,7 +240,11 @@ EQ Engine keeps out of their way:
   `libiap2session.so`), so their patches go in unchanged;
 - it was tested with HMG-API and its wireless CarPlay and Android Auto package: wired and wireless
   CarPlay played through EQ Engine with HMG-API's hooks in the app. Diagnostics shows whether
-  HMG-API's hooks are in the CarPlay app.
+  HMG-API's hooks are in the CarPlay app;
+- if another package has laid a file of its own over `libCarPlayAndroid.so`, EQ on CarPlay stays
+  off (and says so) rather than covering it, and turning EQ Engine off, uninstalling it or the
+  rescue stick never take another package's mount away: EQ Engine unmounts only its own files
+  (checked by md5).
 
 ## The 48 kHz switch
 

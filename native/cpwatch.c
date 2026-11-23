@@ -251,10 +251,14 @@ struct win {
     uint64_t eq_ns;
     uint32_t eq_calls, eq_max;
     int32_t out_peak, min_gain; /* min_gain x 10000, 10000 = idle */
+    /* 0.7.6: the time writes waited for g_eq_lock (the settings thread holding it), apart from eq_ns */
+    uint64_t wait_ns;
+    uint32_t wait_max;
 };
 
 struct stream {
     struct pcm *pcm; /* set when opened, NULL once closed (atomic) */
+    int closing;     /* 0.7.6: its close is under way: the slot is not reused until it is done (atomic) */
     int id;
     unsigned int card, device, flags, bufsize;
     struct pcm_config cfg;
@@ -586,8 +590,10 @@ static void live_state(void) {
 
 /* under g_eq_lock: the processed stream's settings as they should be now (dry while a microphone is
    open, or when the EQ was switched off or the settings went away: the last ones stay, EQ off) */
+static uint32_t g_applies; /* 0.7.6: settings applied to the filter (status eq_applies=), for the tests */
 static void eq_apply(int jump) {
     eqe_ctx *c = &g_eq;
+    __atomic_add_fetch(&g_applies, 1, __ATOMIC_RELAXED);
     eqe_settings s = g_set_ok ? g_set : c->set;
     if (eq_why() != CPE_WHY_NONE || g_mics > 0) s.eq_on = 0;
     c->set = s;
@@ -744,7 +750,11 @@ static void *eq_thread(void *arg) {
         if (fresh != NULL) g_eq.spec = fresh;
         if (live) g_eq.spec_wanted_ns = now;
         int on = ok ? b[3] != 0 : g_on;
-        int changed = ok != g_set_ok || off != g_off || on != g_on || (ok && (uint32_t)b[2] != g_ctl_seq);
+        /* 0.7.6: what the settings say, not their number: the app writes the file again every second
+           while the live view is shown (a new seq, the same settings), and each of those used to
+           redesign every band under the lock */
+        int seqnew = ok && (uint32_t)b[2] != g_ctl_seq;
+        int changed = ok != g_set_ok || off != g_off || on != g_on || (ok && memcmp(&s, &g_set, sizeof(s)) != 0);
         int before = eq_why();
         if (ok) {
             g_set = s;
@@ -759,6 +769,8 @@ static void *eq_thread(void *arg) {
             if (g_pass != NULL && g_pass->why != CPE_WHY_FORMAT && before != CPE_WHY_NONE && eq_why() == CPE_WHY_NONE)
                 g_pass->why = CPE_WHY_STARTED;
             live_state();
+        } else if (seqnew) {
+            live_state(); /* the seq in use, for the app */
         }
         int why = eq_why();
         int procs = g_proc != NULL;
@@ -883,8 +895,10 @@ static void window_line(const struct stream *s, const struct win *w) {
             char g[40];
             if (w->min_gain >= 9999) snprintf(g, sizeof(g), "idle");
             else snprintf(g, sizeof(g), "down to %.1f dB", 20.0 * log10(w->min_gain / 10000.0));
-            snprintf(b + l, sizeof(b) - l, "; EQ %.0f us avg (max %.0f) per write, out peak %.1f dBFS, clip guard %s",
-                     (double)w->eq_ns / w->eq_calls / 1000.0, w->eq_max / 1000.0, db(w->out_peak), g);
+            snprintf(b + l, sizeof(b) - l, "; EQ %.0f us avg (max %.0f) per write, out peak %.1f dBFS, clip guard %s; "
+                     "waited for the settings %.0f us avg (max %.0f)",
+                     (double)w->eq_ns / w->eq_calls / 1000.0, w->eq_max / 1000.0, db(w->out_peak), g,
+                     (double)w->wait_ns / w->eq_calls / 1000.0, w->wait_max / 1000.0);
         }
     }
     log_write(b);
@@ -956,8 +970,9 @@ static void write_status(void) {
         len += (size_t)snprintf(b + len, sizeof(b) - len, "eq=untouched s%d: %s\n", pid_, why_text(pwhy));
     else
         len += (size_t)snprintf(b + len, sizeof(b) - len, "eq=idle: %s\n", why == CPE_WHY_NONE ? "on for the next music stream" : why_text(why));
-    len += (size_t)snprintf(b + len, sizeof(b) - len, "eq_switch=%s\neq_settings=%s %u\neq_buffers=%u\nlive=%s\n", on ? "on" : "off",
-                            set_ok ? "ok" : "none", cseq, eq_bufs, g_live ? "yes" : "no");
+    len += (size_t)snprintf(b + len, sizeof(b) - len, "eq_switch=%s\neq_settings=%s %u\neq_buffers=%u\nlive=%s\neq_applies=%u\n",
+                            on ? "on" : "off", set_ok ? "ok" : "none", cseq, eq_bufs, g_live ? "yes" : "no",
+                            __atomic_load_n(&g_applies, __ATOMIC_RELAXED));
     /* the 16 newest streams */
     for (int i = 0; i < n && len < sizeof(b) - EVLEN; i++) {
         if (g_st[i].id <= g_ids - 16) continue;
@@ -1097,7 +1112,7 @@ static struct pcm *w_open(unsigned int card, unsigned int device, unsigned int f
             /* full: the oldest closed stream whose notes are all written */
             for (int i = 0; i < g_nst; i++) {
                 struct stream *r = &g_st[i];
-                if (__atomic_load_n(&r->pcm, __ATOMIC_ACQUIRE) != NULL ||
+                if (__atomic_load_n(&r->pcm, __ATOMIC_ACQUIRE) != NULL || __atomic_load_n(&r->closing, __ATOMIC_ACQUIRE) ||
                     r->read_seq != __atomic_load_n(&r->done_seq, __ATOMIC_ACQUIRE))
                     continue;
                 if (slot < 0 || r->id < g_st[slot].id) slot = i;
@@ -1184,7 +1199,10 @@ static int w_close(struct pcm *pcm) {
     }
     struct stream *s = find(pcm);
     if (s != NULL) {
-        /* no call on this stream can come after its close: its window is finished here */
+        /* no call on this stream can come after its close: its window is finished here. The slot
+           stays reserved (closing) until the bookkeeping below is done, so an open on another
+           thread cannot take it over in between */
+        __atomic_store_n(&s->closing, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&s->pcm, NULL, __ATOMIC_RELEASE);
         roll(s, 1);
     }
@@ -1209,6 +1227,7 @@ static int w_close(struct pcm *pcm) {
         live_state();
         pthread_mutex_unlock(&g_eq_lock);
         if (again) event_l("EQ: s%d gets the EQ again (the microphone closed)", again);
+        __atomic_store_n(&s->closing, 0, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&g_lock);
     }
     return rc;
@@ -1233,7 +1252,7 @@ static int w_write(struct pcm *pcm, const void *data, unsigned int count) {
            plays (in pieces of OBUF_FRAMES if a write is ever longer); the app's buffer is only read */
         const int16_t *src = (const int16_t *)data;
         unsigned int left = count / 4;
-        uint64_t eq_ns = 0;
+        uint64_t eq_ns = 0, wait_ns = 0;
         int32_t opk = 0, mg = 10000;
         int rc = 0;
         uint64_t t0 = now_us();
@@ -1249,8 +1268,10 @@ static int w_write(struct pcm *pcm, const void *data, unsigned int count) {
         s->retry = 0;
         while (left > 0) {
             unsigned int n = left > OBUF_FRAMES ? OBUF_FRAMES : left;
+            int64_t w0 = now_ns();
             pthread_mutex_lock(&g_eq_lock);
             int64_t a = now_ns();
+            if (a > w0) wait_ns += (uint64_t)(a - w0);
             int32_t g = eq_block(src, g_obuf, n, a);
             eq_ns += (uint64_t)(now_ns() - a);
             if (g_eq.blk_peak > opk) opk = g_eq.blk_peak;
@@ -1274,6 +1295,8 @@ static int w_write(struct pcm *pcm, const void *data, unsigned int count) {
         w->eq_ns += eq_ns;
         w->eq_calls++;
         if (eq_ns > w->eq_max) w->eq_max = clamp32(eq_ns);
+        w->wait_ns += wait_ns;
+        if (wait_ns > w->wait_max) w->wait_max = clamp32(wait_ns);
         if (opk > w->out_peak) w->out_peak = opk;
         if (mg < w->min_gain) w->min_gain = mg;
         return rc;

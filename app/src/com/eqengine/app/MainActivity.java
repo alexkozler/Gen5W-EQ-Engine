@@ -29,7 +29,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * EQ Engine 0.7.5. A navigation rail on the left (EQ, Position, Settings, Status) and the pages:
+ * EQ Engine 0.7.6. A navigation rail on the left (EQ, Position, Settings, Status) and the pages:
  * EQ (Easy: ten sliders with the response curve and the output meter; Expert: a parametric curve
  * editor with up to 20 bands and a band card; the live view in both; Flat, four user slots both
  * modes share, Curves on USB and Undo), Position (listening position),
@@ -45,7 +45,7 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements Engine.Listener, EqPanel.Listener, NavRail.Listener,
         CarView.Listener, HSlider.Listener, XPanel.Listener, WSlider.Listener {
-    static final String VERSION = "0.7.5";
+    static final String VERSION = "0.7.6";
     private static final String ACT = "sh /data/eqengine/bin/act.sh";
     private static final String STATE = BootStatus.STATE_DIR;
     private static final String LAB = "/data/eqengine/lab";
@@ -262,7 +262,10 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         long now = SystemClock.uptimeMillis();
         int lat = snap.latencyMs > 0 ? snap.latencyMs : DEFAULT_LATENCY_MS;
         int[] st = engine.stats();
-        if (st != null && st.length > 1) xpanel.setRate(st[1]);
+        // the Expert graph at the rate the music plays at: CarPlay's own while it plays (0.7.6)
+        int[] cpr = engine.cpLive();
+        if (CarPlayEq.playing(cpr) && CarPlayEq.rate(cpr) >= 8000) xpanel.setRate(CarPlayEq.rate(cpr));
+        else if (st != null && st.length > 1) xpanel.setRate(st[1]);
         int[] lv = engine.level();
         if (lv != null) {
             // the 0.6.6 filter: each buffer's level, shown when it reaches the speakers

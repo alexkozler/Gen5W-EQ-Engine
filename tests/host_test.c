@@ -183,7 +183,7 @@ int main(void) {
 
     /* ---- parameter checks */
     int32_t ver = 0;
-    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x323);
+    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x324);
     {
         /* very high quality loader: the marker was there at the first call, so the PC build of
            libaudio-resampler.so is loaded and its status is readable */
@@ -368,7 +368,7 @@ int main(void) {
         CHECK(c->clipped > 0);
         int32_t st[EQE_STATS_COUNT];
         CHECK(get_param(h, EQE_PARAM_STATS, st, sizeof(st), &got) == 0 && got == sizeof(st));
-        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x323 && st[6] == 70 && st[16] > 0 && st[23] == 1);
+        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x324 && st[6] == 70 && st[16] > 0 && st[23] == 1);
         AELI.release_effect(h);
     }
 
@@ -698,6 +698,28 @@ int main(void) {
         }
         printf("Expert largest boost, 60 random settings: at most %.3f dB under a fine sweep\n", under);
         CHECK(under <= 0.005);
+        /* 0.7.6 (0x324): the same settings also play at CarPlay's 44.1 kHz, where a band at or above
+           0.45 of the rate (19,845 Hz) is left out: a 19 kHz boost next to a 20 kHz cut boosts far
+           more there, and the answer is the larger of the rates */
+        {
+            eqe_settings r = mk(1, 0, 1, NULL);
+            r.mode = 1; r.nx = 2;
+            r.x[0][0] = EQE_X_PEAK; r.x[0][1] = 1900000; r.x[0][2] = 1200; r.x[0][3] = 500;
+            r.x[1][0] = EQE_X_PEAK; r.x[1][1] = 2000000; r.x[1][2] = -1500; r.x[1][3] = 500;
+            int32_t pk[3];
+            CHECK(set_param_raw(h, EQE_PARAM_PEAK, &r, sizeof(r)) == 0);
+            CHECK(get_param(h, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0);
+            coefs_t k48[EQE_NBAND], k44[EQE_NBAND];
+            for (int j = 0; j < EQE_NBAND; j++) {
+                k48[j] = j < 2 ? xband_coefs(r.x[j], 48000.0) : kIdentity;
+                k44[j] = j < 2 ? xband_coefs(r.x[j], 44100.0) : kIdentity;
+            }
+            double at48, at44;
+            double p48 = peak_gain(k48, 48000.0, &at48), p44 = peak_gain(k44, 44100.0, &at44);
+            printf("largest boost, a 19 kHz +12 dB peak next to a 20 kHz -15 dB cut: %+.2f dB at 48 kHz, %+.2f dB at 44.1 kHz; "
+                   "asked of the %.0f Hz filter: %+.2f dB at %d Hz, at %d Hz\n", p48, p44, c->rate, pk[0] / 100.0, pk[1], pk[2]);
+            CHECK(pk[2] == 44100 && fabs(pk[0] / 100.0 - p44) < 0.02 && p44 > p48 + 3.0);
+        }
         /* Easy -> Expert -> Easy while music plays: the ramps stay finite, and every band of the
          * other mode goes quiet */
         {
@@ -756,13 +778,17 @@ int main(void) {
                "%.1f Hz; the graph's points %+.2f dB)\n", pk[0] / 100.0, pk[1], tmax, tat, gmax);
         CHECK(pk[0] / 100.0 >= tmax - 0.005 && pk[0] / 100.0 <= tmax + 0.02 && pk[1] == 0 && pk[2] == 48000);
         CHECK(pk[0] / 100.0 > gmax + 3.0 && pk[0] > 2100 && pk[0] < 2400);
-        /* random settings, all four end-band types, both rates: never below a fine sweep */
+        /* random settings, all four end-band types, asked of a filter at either rate: never below a
+           fine sweep, and (0.7.6) the answer is the larger of 44.1 and 48 kHz */
         double rates2[] = {44100, 48000};
         double under = 0.0, over = 0.0;
+        int other_rate = 0;
         for (int ri = 0; ri < 2; ri++) {
             AELI.release_effect(h);
             h = make(rates2[ri], buf, buf, N, 0);
             c = (eqe_ctx *)h;
+            effect_handle_t hb = make(rates2[1 - ri], buf, buf, N, 0);
+            eqe_ctx *cb = (eqe_ctx *)hb;
             for (int t = 0; t < 60; t++) {
                 int bands[EQE_NB];
                 for (int j = 0; j < EQE_NB; j++) bands[j] = (int)((rnd() * 2.0 - 1.0) * 1200.0);
@@ -770,15 +796,24 @@ int main(void) {
                 CHECK(set_param_raw(h, EQE_PARAM_PEAK, &r, sizeof(r)) == 0);
                 CHECK(get_param(h, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0);
                 apply(h, r);
-                double m = resp_at(c, 0.0);
-                for (double f = 0.5; f < 0.5 * rates2[ri]; f *= 1.001) { double d = resp_at(c, f); if (d > m) m = d; }
-                double d = resp_at(c, 0.5 * rates2[ri]); if (d > m) m = d;
+                apply(hb, r);
+                double m = -1e9;
+                for (int w = 0; w < 2; w++) {
+                    eqe_ctx *cc = w == 0 ? c : cb;
+                    double nyq = 0.5 * cc->rate;
+                    double d = resp_at(cc, 0.0); if (d > m) m = d;
+                    for (double f = 0.5; f < nyq; f *= 1.001) { d = resp_at(cc, f); if (d > m) m = d; }
+                    d = resp_at(cc, nyq); if (d > m) m = d;
+                }
+                if (pk[2] != (int32_t)rates2[ri]) other_rate++;
                 double e = pk[0] / 100.0 - m;
                 if (-e > under) under = -e;
                 if (e > over) over = e;
             }
+            AELI.release_effect(hb);
         }
-        printf("largest boost, 120 random settings: at most %.3f dB under and %.3f dB over a fine sweep\n", under, over);
+        printf("largest boost, 120 random settings: at most %.3f dB under and %.3f dB over a fine sweep at both rates "
+               "(%d answers from the other rate)\n", under, over, other_rate);
         CHECK(under <= 0.005 && over <= 0.02);
         /* settings that are not valid: refused, and no answer left over */
         eqe_settings bad = mk(1, 0, 1, NULL);

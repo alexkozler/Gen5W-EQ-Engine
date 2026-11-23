@@ -23,14 +23,15 @@ final class Engine {
     static final int P_STATS = 2, P_VERSION = 3, P_SETTINGS = 10, P_RESPONSE = 11, P_GAINS = 12, P_VHQ = 13,
             P_SPECTRUM = 14, P_LEVEL = 15, P_PEAK = 16;
     /**
-     * 0x323 = this filter (0.7.4: the bands run a chunk at a time; the same sound as 0x322);
+     * 0x324 = this filter (0.7.6: P_PEAK is the largest boost over its rate, 44.1 and 48 kHz);
+     * 0x323 = 0.7.4-0.7.5's filter (the bands run a chunk at a time; the same sound as 0x322);
      * 0x322 = 0.7.1-0.7.3's filter (settings layout 3: Expert mode, up to 20 bands of its own);
      * 0x321 = 0.6.10's filter (adds P_PEAK, the largest boost of any settings from the solved filters);
      * 0x320 = 0.6.6 filter (settings layout 2 with the end-band types, P_SPECTRUM, P_LEVEL);
      * 0x310 = 0.5 filter (adds P_VHQ); 0x300 = 0.4 filter. The older ones stay in the audio server
      * after an update until it restarts, so they are still driven (without the new parts).
      */
-    static final int LIB_VERSION = 0x323, LIB_VERSION_0611 = 0x322, LIB_VERSION_0610 = 0x321, LIB_VERSION_066 = 0x320, LIB_VERSION_05 = 0x310,
+    static final int LIB_VERSION = 0x324, LIB_VERSION_074 = 0x323, LIB_VERSION_0611 = 0x322, LIB_VERSION_0610 = 0x321, LIB_VERSION_066 = 0x320, LIB_VERSION_05 = 0x310,
             LIB_VERSION_04 = 0x300;
     static final int NRESP = 96, NSTATS = 28, NSPEC = 48;
     static final int RESP_NONE = 0x80000000;
@@ -180,17 +181,20 @@ final class Engine {
                 readStats();
                 lastStatsAt = now;
             }
-            boolean nw = newFilter();
-            level = nw && pollMode >= POLL_METER ? readInts(P_LEVEL, 6) : null;
-            spectrum = nw && pollMode == POLL_LIVE ? readInts(P_SPECTRUM, 4 + NSPEC) : null;
             // CarPlay's music through the CarPlay watch's EQ (0.7.3): its level and live view instead
-            // (while CarPlay has the speaker link, Android's output cannot play)
+            // (while CarPlay has the speaker link, Android's output cannot play). 0.7.6: Android's
+            // filter is then not asked at all (two calls into the audio server every 40 ms, on this
+            // thread, for numbers that were thrown away)
             if (pollMode == POLL_LIVE) CarPlayEq.keepLive();
             int[] cv = CarPlayEq.snapshot();
             cpLive = cv;
             if (CarPlayEq.playing(cv)) {
-                if (pollMode >= POLL_METER) level = CarPlayEq.level(cv);
-                if (pollMode == POLL_LIVE) spectrum = CarPlayEq.spectrum(cv);
+                level = pollMode >= POLL_METER ? CarPlayEq.level(cv) : null;
+                spectrum = pollMode == POLL_LIVE ? CarPlayEq.spectrum(cv) : null;
+            } else {
+                boolean nw = newFilter();
+                level = nw && pollMode >= POLL_METER ? readInts(P_LEVEL, 6) : null;
+                spectrum = nw && pollMode == POLL_LIVE ? readInts(P_SPECTRUM, 4 + NSPEC) : null;
             }
             Listener l = listener;
             if (l != null) l.onEngine();
@@ -225,7 +229,7 @@ final class Engine {
 
     /** Filters that take settings layout 3 (Expert mode): 0x323 and 0x322 behave the same to the app. */
     static boolean expertLib(int v) {
-        return v == LIB_VERSION || v == LIB_VERSION_0611;
+        return v == LIB_VERSION || v == LIB_VERSION_074 || v == LIB_VERSION_0611;
     }
 
     /** The settings layout the running filter takes: 3 (Expert mode), 2 (end-band types) or 1. */
@@ -463,7 +467,9 @@ final class Engine {
         }
         if (rc != 0) EqLog.w("the filter refused the settings (" + rc + "): " + settings.describe());
         else EqLog.d("settings sent: " + settings.describe());
-        response = readInts(P_RESPONSE, NRESP);
+        // the Easy graph's response (0.7.6: not in Expert, which draws its own curves; the next push
+        // in Easy reads it again)
+        if (!settings.expert || response == null) response = readInts(P_RESPONSE, NRESP);
         return rc;
     }
 

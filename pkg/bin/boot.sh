@@ -48,7 +48,7 @@
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.7.5
+VER=0.7.6
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -90,6 +90,14 @@ mounted() {
         [ "$_m" = "$TARGET" ] && return 0
     done < $PROC/mounts
     return 1
+}
+
+# 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its
+# own mounts, never another package's at the same path)
+ours() {
+    [ -f "$2" ] || return 1
+    set -- $(md5 "$1" 2>/dev/null) $(md5 "$2" 2>/dev/null)
+    [ -n "$1" ] && [ "$1" = "$3" ]
 }
 
 md5of() {
@@ -338,24 +346,30 @@ MSR=0
 APPLIED_AT=0
 GOOD=0
 
+# The status for the app, written only when it changes (0.7.6: it was written every round, every
+# 5 s for as long as the car ran). "updated" is when it last changed.
+STATUS_LAST=""
 write_status() {
+    _st="version=$VER
+boot_id=$BID
+state=$STATE
+reason=$REASON
+overlay=$OVERLAY
+strikes=$STRIKES
+audio_server_pid=$MSPID
+unexpected_restarts=$MSR
+applied_at=$APPLIED_AT
+good=$GOOD
+converter=$CONV
+service=$SVC_STARTED"
+    [ -f $S/status ] && [ "$_st" = "$STATUS_LAST" ] && return 0
     {
-        echo "version=$VER"
-        echo "boot_id=$BID"
-        echo "state=$STATE"
-        echo "reason=$REASON"
-        echo "overlay=$OVERLAY"
-        echo "strikes=$STRIKES"
-        echo "audio_server_pid=$MSPID"
-        echo "unexpected_restarts=$MSR"
-        echo "applied_at=$APPLIED_AT"
-        echo "good=$GOOD"
-        echo "converter=$CONV"
-        echo "service=$SVC_STARTED"
+        echo "$_st"
         echo "updated=$(up)"
     } > $S/status.tmp
     chmod 644 $S/status.tmp
     mv $S/status.tmp $S/status
+    STATUS_LAST=$_st
 }
 
 set_lastboot() {
@@ -366,12 +380,12 @@ set_lastboot() {
 unmount_all() {
     lab_off
     _i=0
-    while mounted && [ $_i -lt 5 ]; do
+    while mounted && ours $TARGET $OURS && [ $_i -lt 5 ]; do
         umount $TARGET
         _i=$((_i + 1))
         mounted && sleep 1
     done
-    mounted && return 1
+    mounted && ours $TARGET $OURS && return 1
     return 0
 }
 
@@ -596,9 +610,13 @@ fi
 
 # ---- Housekeeping (after the mount)
 chmod 755 $D $S
-# Stage 1 left some of these writable by everyone.
+# Stage 1 left some of these writable by everyone. The crash logs (raw system and kernel logs,
+# with personal data) stay readable by root only (0.7.6: they were made 644 here too).
 for _f in $S/*; do
-    [ -f "$_f" ] && chmod 644 "$_f"
+    case "${_f##*/}" in
+        crash.log|crash.prev.log) [ -f "$_f" ] && chmod 600 "$_f" ;;
+        *) [ -f "$_f" ] && chmod 644 "$_f" ;;
+    esac
 done
 rm -f $S/fresh_install
 
@@ -684,6 +702,7 @@ EOL
 fi
 LASTR=0
 LASTWD=0
+LASTCH=0
 LAB_GRACE=0
 while :; do
     NOW=$(up)
@@ -799,9 +818,14 @@ while :; do
             fi
         fi
     fi
-    # logcat creates its file readable by root only; the app shows the confirmation line
-    [ -f $S/resampler.log ] && chmod 644 $S/resampler.log
-    [ -f $S/resampler.log.1 ] && chmod 644 $S/resampler.log.1
+    # logcat creates its file readable by root only; the app shows the confirmation line. Put
+    # right every round until the start is confirmed good, then once a minute (0.7.6: every
+    # round, two processes every 5 s)
+    if [ $GOOD = 0 ] || [ $((NOW - LASTCH)) -ge 60 ]; then
+        LASTCH=$NOW
+        [ -f $S/resampler.log ] && chmod 644 $S/resampler.log
+        [ -f $S/resampler.log.1 ] && chmod 644 $S/resampler.log.1
+    fi
     write_status
     # Start the EQ service only after this start's status is written, so it never reads the
     # previous run's status (for example "off" just after being turned back on).

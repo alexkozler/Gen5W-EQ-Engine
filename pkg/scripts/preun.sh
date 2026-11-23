@@ -26,8 +26,16 @@ mounted() {
     done < /proc/mounts
     return 1
 }
+
+# 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its
+# own mounts, never another package's at the same path)
+ours() {
+    [ -f "$2" ] || return 1
+    set -- $(md5 "$1" 2>/dev/null) $(md5 "$2" 2>/dev/null)
+    [ -n "$1" ] && [ "$1" = "$3" ]
+}
 i=0
-while mounted && [ $i -lt 5 ]; do
+while mounted && ours $TARGET $D/conf/audio_effects.conf && [ $i -lt 5 ]; do
     umount $TARGET
     i=$((i + 1))
     mounted && sleep 1
@@ -44,6 +52,11 @@ for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf /
             [ "$_m" = "$t" ] && m=1
         done < /proc/mounts
         [ $m = 0 ] && break
+        # 0.7.6: EQ on CarPlay's layer only while it is EQ Engine's file there (never another
+        # package's mount on that path)
+        case "$t" in
+            */libCarPlayAndroid.so) ours $t $D/lib/eqe_cpwatch.so || break ;;
+        esac
         umount $t
         # busy while the audio server has the file loaded: detach it (the running audio server
         # keeps what it has until the car restarts)

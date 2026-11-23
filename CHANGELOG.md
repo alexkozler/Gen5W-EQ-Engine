@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.6
+
+All the changes from 0.7.5, and fixes from two code reviews (tested on a PC; the car-tested build
+is 0.7.4):
+
+### EQ on CarPlay
+
+- If the car's CarPlay library failed to load at all, EQ on CarPlay did not notice and stayed on,
+  which could leave CarPlay unable to start at every car start. It now turns itself off, restarts
+  the CarPlay app without it when nothing is connected, and tells you; it restarts the app only once
+  its own mount is confirmed gone.
+- EQ Engine now removes only its own mounts (checked by md5), when it is turned off, when EQ on
+  CarPlay turns off, at uninstall and with the rescue stick, for both the CarPlay layer and the
+  effects list. If another package has laid a file over the CarPlay app's library, EQ on CarPlay
+  stays off rather than covering it.
+- A stream closing while another opened, once more than 64 had been opened in one car start, could
+  lose track of the microphone or of the music stream. A closing stream now keeps its place until
+  its close is done.
+- The once-a-second "the live view is shown" message from the app no longer makes the CarPlay
+  filter redesign every band; only settings that changed are applied.
+- Its notes now show how long the music waited for a settings change, apart from the filter's own
+  time.
+
+### EQ page
+
+- Auto preamp now covers the larger boost of 44.1 and 48 kHz (filter 324): a band near 20 kHz is
+  left out at CarPlay's 44.1 kHz, so a 20 kHz cut next to a 19 kHz boost could leave up to 12 dB of
+  boost on CarPlay.
+- The Expert graph is drawn at CarPlay's rate while CarPlay plays.
+- Changing a band's width (or a -/+ button) redraws only that band's curve, not all of them.
+- While CarPlay plays, the app no longer asks Android's audio server for levels and the live view
+  it does not show (two calls every 40 ms with Live on); Expert mode no longer reads the Easy
+  graph after each change.
+
+### Privacy and housekeeping
+
+- The crash logs EQ Engine keeps (they hold the raw system log) stay readable by root only; the
+  next start, and an install, made them readable by every app.
+- The boot step writes its status file only when it changes (it was every 5 s while the car ran).
+
 ## 0.7.5
 
 The first release since 0.6.6. The versions in between (0.6.7 to 0.7.4) were test builds that were

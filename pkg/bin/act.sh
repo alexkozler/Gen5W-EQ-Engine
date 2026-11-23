@@ -35,7 +35,7 @@
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
-VER=0.7.5
+VER=0.7.6
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -111,6 +111,14 @@ mounted() {
         [ "$_m" = "$TARGET" ] && return 0
     done < /proc/mounts
     return 1
+}
+
+# 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its
+# own mounts, never another package's at the same path)
+ours() {
+    [ -f "$2" ] || return 1
+    set -- $(md5 "$1" 2>/dev/null) $(md5 "$2" 2>/dev/null)
+    [ -n "$1" ] && [ "$1" = "$3" ]
 }
 
 snapshot() {
@@ -1947,9 +1955,15 @@ cpw_restart_stock() {
 # start, so CarPlay cannot work there) and nothing is connected or playing.
 cpw_takeoff() {
     rm -f $CPW_WANT $CPW_RS
-    unmount_at $CPW_T
+    if ! cpw_unmount; then
+        _tn="$2; turned off, but its mount could not be removed now (it is gone at the next car start); restart the car (parked)"
+        cpw_state failed "" "$_tn"
+        cpw_result "taken off: $_tn"
+        cpw_fail_note "$2"
+        return 1
+    fi
     _tn="$2; taken off (the CarPlay app's next start and the next car start are without it)"
-    if [ -n "$1" ] && [ -d $PROC/$1 ] && cpw_in $1 && [ "$(cpw_wstate $1)" = failed ]; then
+    if [ -n "$1" ] && [ -d $PROC/$1 ] && [ "$(cpw_wstate $1)" = failed ]; then
         cp_session $1
         if ! cp_has_link $1 && [ $CPS_OK = 1 ] && [ $CPS_N = 0 ]; then
             if cpw_restart_stock $1; then
@@ -1992,6 +2006,33 @@ cpw_file_ok() {
     [ -n "$_cw" ] && [ "$(md5of $CPW)" = "$_cw" ]
 }
 
+# 0.7.6: what is mounted at the CarPlay app's JNI library path is checked by whose file it is.
+# 0 = EQ Engine's watch is the file there now (the top of anything mounted there).
+cpw_mounted() {
+    mounted_at $CPW_T || return 1
+    _mw=""
+    [ -f $CPWSUM ] && read _mw < $CPWSUM
+    [ -n "$_mw" ] && [ "$(md5of $CPW_T)" = "$_mw" ]
+}
+
+# 0 = something that is not EQ Engine's watch is mounted there (another package's file)
+cpw_foreign() {
+    mounted_at $CPW_T && ! cpw_mounted
+}
+
+# Takes EQ Engine's watch off that path, and only it: one mount at a time while the file on top is
+# the watch, never another package's mount there. A plain umount says "busy" while a process has
+# the file mapped: then it is detached (eqe_lab umount). 0 = the watch is not mounted there now.
+cpw_unmount() {
+    _ui=0
+    while cpw_mounted && [ $_ui -lt 4 ]; do
+        umount $CPW_T 2>/dev/null || { [ -x $LABBIN ] && $LABBIN umount $CPW_T > /dev/null 2>&1; }
+        _ui=$((_ui + 1))
+        cpw_mounted && sleep 1
+    done
+    ! cpw_mounted
+}
+
 # Makes CPW_COPY the same as the factory file, whose md5 is $1: 0 when it is
 cpw_copy() {
     if [ ! -f $CPW_COPY ] || [ "$(md5of $CPW_COPY)" != "$1" ]; then
@@ -2005,10 +2046,8 @@ cpw_copy() {
 # Lays the watch over the CarPlay app's JNI library and checks that what is there now is the watch
 # (its md5 from the install): 0, else the mount is taken off again and 1.
 cpw_mount() {
-    _cw=""
-    read _cw < $CPWSUM
-    if ! mount -o bind $CPW $CPW_T || ! mounted_at $CPW_T || [ "$(md5of $CPW_T)" != "$_cw" ]; then
-        unmount_at $CPW_T
+    if ! mount -o bind $CPW $CPW_T || ! cpw_mounted; then
+        cpw_unmount
         return 1
     fi
     return 0
@@ -2029,7 +2068,11 @@ cpwatch_on() {
     cpw_file_ok || { cpw_refuse "the CarPlay watch is not installed or failed its check"; return 1; }
     [ -x $LABBIN ] || { cpw_refuse "eqe_lab is not installed"; return 1; }
     _cpp=$(cp_pid)
-    if mounted_at $CPW_T; then
+    if cpw_foreign; then
+        cpw_refuse "another package has a file laid over $CPW_T; EQ on CarPlay stays off so it does not undo that"
+        return 1
+    fi
+    if cpw_mounted; then
         # laid over at this car start and still there (the choice is kept or written again)
         [ -f $CPW_WANT ] || {
             _cu=1000
@@ -2087,7 +2130,7 @@ cpwatch_off() {
     rm -f $CPW_WANT $CPW_RS
     _cpp=$(cp_pid)
     [ -n "$_cpp" ] && echo "EQE_CPW_NOTE the CarPlay app (pid $_cpp) has $(cp_conn $_cpp) now"
-    if ! unmount_at $CPW_T; then
+    if ! cpw_unmount; then
         cpw_state ending "$_cpp" "off from the next car start (the mount could not be removed now)"
         cpw_result "off from the next car start; the watch's mount could not be removed now"
         return 1
@@ -2131,7 +2174,11 @@ cpw_boot() {
         ''|*[!0-9]*) _bu=1000 ;;
     esac
     # already laid over at this car start (the boot step runs again when EQ Engine is turned on)
-    mounted_at $CPW_T && return 0
+    cpw_mounted && return 0
+    if cpw_foreign; then
+        cpw_boot_fail "another package has a file laid over $CPW_T, so EQ on CarPlay stays off and does not undo that"
+        return 1
+    fi
     _bp=$(cp_pid)
     # (an app that already runs the watch, from an earlier mount that was taken off, is laid over
     # for as usual: the watch is what it has; its maps show the watch under the factory name or,
@@ -2188,14 +2235,17 @@ cpw_guard() {
         waiting|on) ;;
         *) return 0 ;;
     esac
-    mounted_at $CPW_T || return 0
+    cpw_mounted || return 0
     _gp=$(cpw_get pid)
     _gn=$(cp_pid)
     [ -n "$_gn" ] || return 0
-    if [ "$_gn" = "$_gp" ]; then
-        [ "$(cpw_wstate $_gn)" = failed ] && cpw_takeoff $_gn "the watch could not load the factory library (pid $_gn)"
+    # 0.7.6: the watch's own status in this app process first. When the factory library did not
+    # load at all, its copy is never mapped, so the mapping test below would wait for it forever.
+    if [ "$(cpw_wstate $_gn)" = failed ]; then
+        cpw_takeoff $_gn "the watch could not load the factory library (pid $_gn)"
         return 0
     fi
+    [ "$_gn" = "$_gp" ] && return 0
     # a start of the app that has not loaded its JNI library yet: looked at again next round
     cpw_in $_gn || return 0
     if [ -n "$_gp" ]; then
@@ -2219,7 +2269,6 @@ cpw_guard() {
     fi
     cpw_state on $_gn "watching"
     cpw_result "loaded in the factory CarPlay app (pid $_gn), started from the zygote as usual"
-    [ "$(cpw_wstate $_gn)" = failed ] && cpw_takeoff $_gn "the watch could not load the factory library (pid $_gn)"
     return 0
 }
 
@@ -2227,9 +2276,9 @@ cpw_guard() {
 # keeps the watch until the car restarts (its EQ passes the music through untouched: EQ Engine is off). Nothing is restarted.
 cpw_all_off() {
     cpw_prop_clear
-    [ -f $CPW_WANT ] || mounted_at $CPW_T || [ "$(cpw_get state)" = on ] || return 0
+    [ -f $CPW_WANT ] || cpw_mounted || [ "$(cpw_get state)" = on ] || return 0
     rm -f $CPW_WANT $CPW_RS
-    unmount_at $CPW_T
+    cpw_unmount
     _ap=$(cp_pid)
     if [ -n "$_ap" ] && cpw_in $_ap; then
         cpw_state ending $_ap "off (EQ Engine turned off); the CarPlay app running now keeps it until the next car start"
@@ -3059,14 +3108,14 @@ off)
     # the boot step notices within 5 s; make sure the overlay is gone either way
     sleep 6
     i=0
-    while mounted && [ $i -lt 5 ]; do
+    while mounted && ours $TARGET $D/conf/audio_effects.conf && [ $i -lt 5 ]; do
         umount $TARGET
         i=$((i + 1))
         mounted && sleep 1
     done
     lab_unmount_all
     cpw_all_off
-    mounted && { echo "the overlay could not be removed; it goes away at the next start"; exit 1; }
+    mounted && ours $TARGET $D/conf/audio_effects.conf && { echo "the overlay could not be removed; it goes away at the next start"; exit 1; }
     echo "off"
     ;;
 on)

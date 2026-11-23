@@ -1,4 +1,4 @@
-EQ Engine 0.7.5 (NEMESIS package "eqengine")
+EQ Engine 0.7.6 (NEMESIS package "eqengine")
 ===========================================
 
 A 10-band EQ (or a parametric one with up to 20 bands), clip guard and
@@ -149,7 +149,9 @@ and again after a factory software update.
   patches of the CarPlay libraries stay in place. It does not need HMG-API.
 - If it cannot load, or the CarPlay app restarts twice within two minutes
   with it, it turns itself off (CarPlay then plays as without EQ Engine), and
-  the app says so the next time you open it. Please save All logs then and
+  the app says so the next time you open it. If another package has laid a
+  file over the CarPlay app's library, it stays off rather than covering it;
+  EQ Engine only ever removes its own mounts. Please save All logs then and
   send them. If CarPlay misbehaves with it, turn it off and restart the car
   (parked), or use the rescue stick.
 Its notes go into All logs and the report.

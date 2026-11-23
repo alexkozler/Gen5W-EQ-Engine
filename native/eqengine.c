@@ -54,7 +54,8 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
-#define EQE_LIB_VERSION 0x00000323 /* 0x323 (0.7.4): the bands run a chunk at a time (bands_block), bit for bit 0x322's output;
+#define EQE_LIB_VERSION 0x00000324 /* 0x324 (0.7.6): EQE_PARAM_PEAK answers the largest boost over this rate, 44.1 and 48 kHz;
+                                      0x323 (0.7.4): the bands run a chunk at a time (bands_block), bit for bit 0x322's output;
                                       0x322: settings layout 3 (Expert mode: up to EQE_NX bands of its own);
                                       0x321: EQE_PARAM_PEAK, and SET_CONFIG refuses all but 16-bit stereo;
                                       0x320 (0.6.6): settings layout 2 (ends), EQE_PARAM_SPECTRUM, EQE_PARAM_LEVEL;
@@ -681,23 +682,38 @@ static int peak_query(const eqe_ctx *c, const eqe_settings *s, int32_t out[3]) {
     /* the solver's inputs only (rate, settings, interaction matrix), in a scratch context */
     eqe_ctx *t = (eqe_ctx *)calloc(1, sizeof(eqe_ctx));
     if (t == NULL) return -1;
-    t->rate = c->rate;
-    t->set = *s;
-    prepare_matrix(t);
-    coefs_t k[EQE_NBAND];
-    if (s->mode == 1) {
-        for (int j = 0; j < EQE_NBAND; j++) k[j] = j < s->nx ? xband_coefs(s->x[j], t->rate) : kIdentity;
-    } else {
-        double g[EQE_NB];
-        solve_gains(t, g);
-        for (int j = 0; j < EQE_NBAND; j++) k[j] = j < EQE_NB ? band_coefs(s->ends, j, g[j], t->rate) : kIdentity;
+    /* 0.7.6 (0x324): the same settings also play at CarPlay's 44.1 kHz (and Android's output can be at
+       either rate), and a band at or above 0.45 of a rate is left out at that rate: a 20 kHz cut
+       works at 48 kHz but not at 44.1 kHz. So the largest boost over this filter's rate, 44.1 and
+       48 kHz; [2] says at which rate it is. */
+    const double rates[3] = {c->rate, 44100.0, 48000.0};
+    double best = -1e300, best_at = 0.0, best_rate = c->rate;
+    for (int r = 0; r < 3; r++) {
+        if (r > 0 && rates[r] == c->rate) continue;
+        t->rate = rates[r];
+        t->set = *s;
+        t->design_ends = 0;
+        prepare_matrix(t);
+        coefs_t k[EQE_NBAND];
+        if (s->mode == 1) {
+            for (int j = 0; j < EQE_NBAND; j++) k[j] = j < s->nx ? xband_coefs(s->x[j], t->rate) : kIdentity;
+        } else {
+            double g[EQE_NB];
+            solve_gains(t, g);
+            for (int j = 0; j < EQE_NBAND; j++) k[j] = j < EQE_NB ? band_coefs(s->ends, j, g[j], t->rate) : kIdentity;
+        }
+        double at;
+        double p = peak_gain(k, t->rate, &at);
+        if (p > best + 1e-9) {
+            best = p;
+            best_at = at;
+            best_rate = t->rate;
+        }
     }
     free(t);
-    double at;
-    double p = peak_gain(k, c->rate, &at);
-    out[0] = (int32_t)ceil(p * 100.0 - 1e-6);
-    out[1] = (int32_t)floor(at + 0.5);
-    out[2] = (int32_t)c->rate;
+    out[0] = (int32_t)ceil(best * 100.0 - 1e-6);
+    out[1] = (int32_t)floor(best_at + 0.5);
+    out[2] = (int32_t)best_rate;
     return 0;
 }
 

@@ -46,8 +46,17 @@ struct pcm *pcm_open(unsigned int card, unsigned int device, unsigned int flags,
     return open_impl(card, device, flags, config);
 }
 
+/* 0.7.6: called once inside the next pcm_close, for a close that takes long while another thread
+   opens a stream (the slot race test) */
+void (*fake_close_hook)(void);
+
 int pcm_close(struct pcm *pcm) {
     closes++;
+    if (fake_close_hook != NULL) {
+        void (*h)(void) = fake_close_hook;
+        fake_close_hook = NULL;
+        h();
+    }
     free(pcm);
     return 0;
 }

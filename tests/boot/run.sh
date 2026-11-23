@@ -514,7 +514,7 @@ setup bootT1; mkdir -p $VS; echo "100 an old line" > $VS/events.log; rm -f $T/mo
 echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 160 ] && touch /tmp/eqeboot/stop' > $T/hook
 rununtilstop
 ok "mounted before this start wrote any event line" "grep -qx 'mount after 1 event lines' $T/mount.log && grep -q 'overlay applied' $T/out.txt"
-ok "the order in the event log: starting, overlay, timing" "[ \"\$(sed -n 2p $VS/events.log | cut -d' ' -f2-)\" = 'EQ Engine boot step 0.7.5 starting (strikes 0)' ] && sed -n 3p $VS/events.log | grep -q 'effects list overlay applied' && sed -n 4p $VS/events.log | grep -q '^[0-9]* timing: '"
+ok "the order in the event log: starting, overlay, timing" "[ \"\$(sed -n 2p $VS/events.log | cut -d' ' -f2-)\" = 'EQ Engine boot step 0.7.6 starting (strikes 0)' ] && sed -n 3p $VS/events.log | grep -q 'effects list overlay applied' && sed -n 4p $VS/events.log | grep -q '^[0-9]* timing: '"
 ok "timing: this step's start and the overlay with decimals, the audio server's own start (its stat), nothing loaded yet" "grep -q 'timing: this step started at 100.25 s (its process at ? s), the overlay was in place at 100.25 s; Android.s audio server (pid 167) started at 2.93 s and had loaded at 100.25 s: no effect library yet' $T/out.txt"
 ok "timing kept for the app and the logs; in time, no late note" "grep -qx 'audio_server_start=2.93' $VS/boot_timing && grep -qx 'loaded_at_overlay=none' $VS/boot_timing && grep -qx 'result=in_time' $VS/boot_timing && grep -qx 'overlay_at=100.25' $VS/boot_timing && grep -qx 'checked_at=100.25' $VS/boot_timing && [ ! -f $VS/late_list ]"
 
@@ -562,7 +562,7 @@ ok "a new start: the last start's late note and timing are replaced" "[ ! -f $VS
 
 setup bootT7; mkdir -p $VS; echo "turned off in the app" > $VS/disabled; rm -f $T/mount.log
 runboot 30
-ok "turned off: nothing mounted, no timing, the start's events still written" "[ ! -f $T/mount.log ] && [ ! -f $VS/boot_timing ] && grep -q 'boot step 0.7.5 starting' $VS/events.log && [ \"\$(st state)\" = off ]"
+ok "turned off: nothing mounted, no timing, the start's events still written" "[ ! -f $T/mount.log ] && [ ! -f $VS/boot_timing ] && grep -q 'boot step 0.7.6 starting' $VS/events.log && [ \"\$(st state)\" = off ]"
 
 setup bootT8
 # the audio server loads EQ Engine's list while this step does its housekeeping (its first chmod)
@@ -616,5 +616,15 @@ setup bootZ2; vhqsetup 1 good map; zy 165
   echo '[ $u -ge 260 ] && touch /tmp/eqeboot/stop'; } > $T/hook
 rununtilstop
 ok "the zygote still running: an audio server crash counts as before" "grep -q 'restarted unexpectedly (1 this start): pid 167 -> 168' $VS/events.log && [ \"\$(cat $VSET/converter)\" = 3 ]"
+rm -f $T/hook $T/stop
+runboot 30
+ok "0.7.6: the next run's housekeeping leaves the crash logs root only (they hold the raw system log)" "[ -f $VS/crash.log ] && [ \"\$(stat -c %a $VS/crash.log)\" = 600 ] && [ \"\$(stat -c %a $VS/events.log)\" = 644 ]"
+
+echo "== 32. (0.7.6) the status file is written only when it changes"
+setup bootW
+runboot 300
+U=$(st updated)
+UE=$(cut -d. -f1 $T/proc/uptime)
+ok "written when it changed only: last at uptime $U, the run went on to $UE (confirmed good long before the end)" "[ -n \"$U\" ] && [ \"$U\" -lt 1000 ] && [ \"$UE\" -gt 5000 ] && [ \"\$(st good)\" = 1 ] && grep -q 'confirmed good' $T/out.txt"
 
 echo "$SH: $pass passed, $fail failed"

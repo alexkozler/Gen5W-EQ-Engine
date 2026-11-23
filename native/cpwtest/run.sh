@@ -84,7 +84,10 @@ ok "notes: the microphone: dry, then the EQ again" "grep -q 'EQ: s[0-9]* goes dr
 ok "notes: each untouched stream with its reason" "grep -q 'plays untouched: EQ on CarPlay is switched off in the app' $L4 && grep -q 'plays untouched: EQ Engine is turned off' $L4 && grep -q 'plays untouched: not CarPlay.s music stream' $L4"
 ok "notes: a processed stream's windows have the EQ's time, output peak and clip guard" "grep -q '; EQ [0-9]* us avg (max [0-9]*) per write, out peak -[0-9.]* dBFS, clip guard idle' $L4"
 ok "notes: settings that are not valid are not used" "grep -q 'EQ: no settings from the EQ Engine app yet; settings from the app: none' $L4"
-ok "notes: past the table's 64 slots, streams keep their own numbers and their notes (closed slots used again)" "grep -q 'open s7[0-9]: card 0 device 2 out' $L4 && grep -q 'EQ: s7[0-9] through EQ Engine.s filter' $L4 && ! grep -q 'not followed' $L4"
+ok "notes: past the table's 64 slots, streams keep their own numbers and their notes (closed slots used again)" "grep -q 'open s7[0-9]: card 0 device 2 out' $L4 && grep -q 'EQ: s7[0-9] through EQ Engine.s filter' $L4 && ! grep -q 'device 2 out.*not followed' $L4"
+N=$(sed -n 's/.*open s\([0-9]*\): card 0 device 2 out, 44100 Hz 2 ch s16, period 999 .*/\1/p' $L4 | tail -n1)
+ok "0.7.6: a long close while the table is full keeps its slot: its close is noted as its own (s$N), the open meanwhile finds the table full" "[ -n \"$N\" ] && grep -q \"close s$N after\" $L4 && grep -q 'open: card 0 device 0 in, 24000 Hz 2 ch s16, period 777 x 4 -> ok, not followed (the table of 64 streams is full)' $L4"
+ok "0.7.6: notes: a processed stream's windows say how long writes waited for the settings" "grep -q '; waited for the settings [0-9]* us avg (max [0-9]*)' $L4"
 
 echo "== no factory library behind it"
 $O/test_cps $O/w2/libCarPlayAndroid.so $O/missing/libCarPlayAndroid.car.so failed 0 || fail=$((fail+1))

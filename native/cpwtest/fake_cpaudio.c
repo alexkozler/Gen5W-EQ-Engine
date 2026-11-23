@@ -18,6 +18,7 @@ struct pcm_config {
     int avail_min;
 };
 struct pcm *pcm_open(unsigned int card, unsigned int device, unsigned int flags, struct pcm_config *config);
+extern void (*fake_close_hook)(void);
 int pcm_close(struct pcm *pcm);
 int pcm_write(struct pcm *pcm, const void *data, unsigned int count);
 int pcm_read(struct pcm *pcm, void *data, unsigned int count);
@@ -241,6 +242,36 @@ static int read_live(const char *path, cpl_live *L) {
     return 0;
 }
 
+/* the watch's status in this process: eq_applies= (0.7.6), -1 when it cannot be read */
+static long read_applies(void) {
+    const char *live = getenv("CPE_TEST_LIVE");
+    const char *sl = live != NULL ? strrchr(live, '/') : NULL;
+    if (sl == NULL) return -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%.*s/status.%d", (int)(sl - live), live, (int)getpid());
+    FILE *f = fopen(path, "r");
+    if (f == NULL) return -1;
+    char line[256];
+    long v = -1;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (strncmp(line, "eq_applies=", 11) == 0) v = atol(line + 11);
+    fclose(f);
+    return v;
+}
+
+/* the other thread's open in test 12: after the watch has written the closing stream's notes */
+static struct pcm *race_b;
+static void race_open(void) {
+    usleep(400000);
+    struct pcm_config cb;
+    memset(&cb, 0, sizeof(cb));
+    cb.channels = 2;
+    cb.rate = 24000;
+    cb.period_size = 777;
+    cb.period_count = 4;
+    race_b = pcm_open(0, 0, 0x10000000u, &cb);
+}
+
 int cpa_eq(void) {
     const char *ctl = getenv("CPE_TEST_CTL"), *off = getenv("CPE_TEST_OFF"), *live = getenv("CPE_TEST_LIVE");
     if (ctl == NULL || off == NULL || live == NULL) return 1;
@@ -291,7 +322,7 @@ int cpa_eq(void) {
     snprintf(what, sizeof(what), "the live file: processing at 44100 Hz, 1024-frame buffers, the output peak (%d, a +6 dB tone: about 6538), the settings in use, processing time (%d ns)",
              L.blk_peak, L.avg_ns);
     CHECK(ok && L.state == CPL_PROCESSING && L.why == CPE_WHY_NONE && L.rate == 44100 && L.frames == 1024 && L.blk_seq >= 30 &&
-              L.blk_peak > 6400 && L.blk_peak < 6700 && L.ctl_seq == (int32_t)eq_seq && L.avg_ns > 0 && L.lib == 0x323,
+              L.blk_peak > 6400 && L.blk_peak < 6700 && L.ctl_seq == (int32_t)eq_seq && L.avg_ns > 0 && L.lib == 0x324,
           what);
     snprintf(what, sizeof(what), "the live view: analysed (%u), its strongest band is the one at 1 kHz (band %d, %.1f dBFS)", L.spec_seq,
              best, L.spec[best] / 100.0);
@@ -392,5 +423,60 @@ int cpa_eq(void) {
     snprintf(what, sizeof(what), "the 75th stream (the table holds 64): still through the EQ (%.2f dB)", g);
     CHECK(own_buffer == 20 && fabs(g - 6.0) < 0.15, what);
     pcm_close(p);
+
+    /* 12. (0.7.6) a close that takes long while the table is full: another thread opens a stream
+       meanwhile (here from inside TinyALSA's close, after the watch has written the closing stream's
+       notes). The closing stream's slot stays its own until the close is done: run.sh checks that
+       its close is noted under its own number and that the other open finds the table full. */
+    usleep(350000);
+    struct pcm *keep[63];
+    struct pcm_config ck = c;
+    for (int k = 0; k < 63; k++) {
+        keep[k] = pcm_open(0, 1, 0, &ck);
+        if (k % 12 == 11) usleep(250000); /* the watch writes the notes a few at a time */
+    }
+    usleep(250000);
+    struct pcm_config ca = c;
+    ca.period_size = 999;
+    p = pcm_open(0, 2, 0, &ca);
+    play(p, 2, 1024, 44100);
+    fake_close_hook = race_open;
+    pcm_close(p);
+    if (race_b != NULL) pcm_close(race_b);
+    for (int k = 0; k < 63; k++) pcm_close(keep[k]);
+
+    /* 13. (0.7.6) the same settings written again with a new number (the app's once-a-second "the
+       live view is wanted"): not applied again; different settings are */
+    set_easy(1, 600);
+    write_ctl(ctl, 1, 0);
+    usleep(150000);
+    p = pcm_open(0, 2, 0, &c);
+    play(p, 4, 1024, 44100);
+    struct pcm *dummy;
+    struct pcm_config cd = c;
+    dummy = pcm_open(0, 1, 0, &cd);
+    pcm_close(dummy);
+    usleep(350000);
+    long a0 = read_applies();
+    write_ctl(ctl, 1, 0);
+    usleep(150000);
+    write_ctl(ctl, 1, 0);
+    usleep(150000);
+    dummy = pcm_open(0, 1, 0, &cd);
+    pcm_close(dummy);
+    usleep(350000);
+    long a1 = read_applies();
+    set_easy(1, 300);
+    write_ctl(ctl, 1, 0);
+    usleep(150000);
+    dummy = pcm_open(0, 1, 0, &cd);
+    pcm_close(dummy);
+    usleep(350000);
+    long a2 = read_applies();
+    snprintf(what, sizeof(what), "the same settings written again (a new number) are not applied again, new ones are (applies %ld, %ld, %ld)", a0, a1, a2);
+    CHECK(a0 > 0 && a1 == a0 && a2 == a1 + 1, what);
+    play(p, 4, 1024, 44100);
+    pcm_close(p);
     return fails;
 }
+

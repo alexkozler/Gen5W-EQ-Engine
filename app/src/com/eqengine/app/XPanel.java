@@ -142,9 +142,28 @@ final class XPanel extends View implements LiveLayer.Geometry {
     void setValues(EqSettings s) {
         preamp = s.preamp;
         eqOn = s.eqOn;
-        bands = EqSettings.copyBands(s.xb);
+        ArrayList<int[]> nb = EqSettings.copyBands(s.xb);
+        // 0.7.6: a change to one band (its width slider, a -/+ button) works out only that band's
+        // curve again, as a drag does; anything more (bands added, removed, sorted) all of them
+        int changed = -1, nchanged = 0;
+        if (nb.size() == bands.size() && bandDb.length == nb.size()) {
+            for (int j = 0; j < nb.size(); j++) {
+                if (!java.util.Arrays.equals(nb.get(j), bands.get(j))) {
+                    changed = j;
+                    nchanged++;
+                }
+            }
+        } else {
+            nchanged = -1;
+        }
+        bands = nb;
         sel = s.xb.isEmpty() ? -1 : EqSettings.clamp(s.xSel, 0, s.xb.size() - 1);
-        recompute();
+        if (nchanged == 1) {
+            recomputeBand(changed);
+            fitRange();
+        } else if (nchanged != 0) {
+            recompute();
+        }
         invalidate();
     }
 
@@ -157,7 +176,7 @@ final class XPanel extends View implements LiveLayer.Geometry {
     }
 
     private void recompute() {
-        bandDb = new float[bands.size()][NPTS];
+        if (bandDb.length != bands.size()) bandDb = new float[bands.size()][NPTS];
         for (int i = 0; i < NPTS; i++) sumDb[i] = 0f;
         for (int j = 0; j < bands.size(); j++) {
             double[] k = XDesign.coefs(bands.get(j), rate);
