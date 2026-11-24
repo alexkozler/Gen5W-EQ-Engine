@@ -2602,7 +2602,7 @@ report_checks() {
     if [ "$_sdk" = 19 ]; then check ok "Android $_rel (API $_sdk)"; else check NO "Android $_rel (API $_sdk); EQ Engine is built for Android 4.4 (API 19)"; fi
     _prod=$(getprop ro.build.product)
     case "$_prod" in
-        NEEV.USA.*) check ok "head unit software $_prod (the package is marked for NEEV.USA.*)" ;;
+        NEEV.USA.*) check ok "head unit software $_prod (the software of the car EQ Engine was tested on)" ;;
         *) check ? "head unit software $_prod: not the car EQ Engine was tested on (2022 Ioniq 5, USA)" ;;
     esac
     _st=$(state_now)

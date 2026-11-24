@@ -43,10 +43,9 @@ NEMESIS 1.17's package icon. What changed: [CHANGELOG.md](CHANGELOG.md).
 
 No other car or software version has been tested, including Kia cars and other Genesis models with
 the same head unit. Other cars may have a different amplifier, audio driver, audio settings or
-CarPlay software. The package is marked for the software of the cars above
-(`os="NEEV.USA.*,CEEV.USA.*,CEEV.CAN.*,IKFL.CAN.*"`); on other software NEMESIS shows it as a
-partial match. If you try it on another car, please send a
-[car report](#reporting-a-problem).
+CarPlay software. The package is marked for any head unit software (`os="any"`), so NEMESIS shows
+no compatibility warning on any car: check the list above yourself. If you try it on another car,
+please send a [car report](#reporting-a-problem).
 
 ## What it does
 

@@ -17,8 +17,9 @@ and wireless, an update over the previous version, an uninstall and a reinstall)
   CarPlay is playing (nothing can be changed then).
 - EQ Engine refuses to start, and says why, when another package's file is laid over Android's
   effects list; it never takes another package's file over the audio driver for its own either.
-- The package now lists the head unit software it has been seen working on (Ioniq 5 and Ioniq 6
-  in the USA, Ioniq 6 and Genesis G70 in Canada).
+- The package is marked for any head unit software (it was US Ioniq 5 software only), so NEMESIS
+  no longer shows it as a partial match on other cars. The README's Verified vehicles lists the
+  cars it has been tested on.
 - The package has its own icon in NEMESIS Manager's Store and package lists (NEMESIS 1.17's
   descriptor 1.2; older NEMESIS installs it as before and shows its usual icon).
 
