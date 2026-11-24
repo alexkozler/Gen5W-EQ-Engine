@@ -63,6 +63,28 @@ final class EqLog {
         line("E", t == null ? msg : msg + "\n" + sw.toString().trim());
     }
 
+    /**
+     * (after 0.7.6) As e(), but written to the file on the calling thread: for the crash handler
+     * when the background thread itself is the one crashing (its loop has ended, so a line posted
+     * to it would never be written).
+     */
+    static void eNow(String msg, Throwable t) {
+        StringWriter sw = new StringWriter();
+        if (t != null) t.printStackTrace(new PrintWriter(sw));
+        String text = t == null ? msg : msg + "\n" + sw.toString().trim();
+        final String s;
+        final File f;
+        synchronized (EqLog.class) {
+            s = FMT.format(new Date()) + " E " + text;
+            tail.add(s.length() > 600 ? s.substring(0, 600) + " ..." : s);
+            while (tail.size() > TAIL_LINES) tail.removeFirst();
+            version++;
+            f = file;
+        }
+        android.util.Log.e(TAG, msg);
+        if (f != null) append(f, s + "\n");
+    }
+
     static synchronized String tailText() {
         StringBuilder sb = new StringBuilder();
         for (int i = tail.size() - 1; i >= 0; i--) sb.append(tail.get(i)).append('\n');
@@ -96,7 +118,7 @@ final class EqLog {
         });
     }
 
-    /** On the background thread only. */
+    /** On the background thread only (or by eNow, once that thread has died). */
     private static void append(File f, String text) {
         FileOutputStream out = null;
         try {

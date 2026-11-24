@@ -31,6 +31,10 @@ gcc $CF $SAN $W -DCPW_DIR="\"$O/notes3\"" -DCPS_COPY="\"$O/lib/libCarPlayAndroid
     -o $O/w3/libCarPlayAndroid.so $HERE/../cpwatch.c -ldl -lpthread -lm
 gcc $CF $SAN $W -DCPW_DIR="\"$O/notes2\"" -DCPW_TINYALSA="\"libtinyalsa_none.so\"" \
     -o $O/nolib/libCarPlayAndroid.so $HERE/../cpwatch.c -ldl -lpthread -lm
+mkdir -p $O/w5
+gcc $CF $SAN $W -DCPW_DIR="\"$O/notes5\"" -DCPS_COPY="\"$O/lib/libCarPlayAndroid.car.so\"" \
+    -DCPE_CTL="\"$O/share5/cp_eq.bin\"" -DCPE_OFF="\"$O/share5/disabled\"" \
+    -o $O/w5/libCarPlayAndroid.so $HERE/../cpwatch.c -ldl -lpthread -lm
 gcc $CF $SAN -o $O/test_cps $HERE/test_cps.c -ldl
 gcc -std=gnu11 -O1 -g -Wall -Wextra -Werror $SAN -o $O/eqe_lab $HERE/../eqe_lab.c -ldl
 export ASAN_OPTIONS=detect_leaks=0
@@ -74,7 +78,9 @@ echo "== EQ on CarPlay's music (0.7.3): the app's control file, the streams, the
 CPE_TEST_CTL=$O/share4/cp_eq.bin CPE_TEST_OFF=$O/state4/disabled CPE_TEST_LIVE=$O/notes4/live.bin \
     $O/test_cps $O/w4/libCarPlayAndroid.so $COPY eq 0 || fail=$((fail+1))
 PID=$(ls $O/notes4 | sed -n 's/^cpw_\([0-9]*\)\.log$/\1/p' | head -n1)
-L4=$O/notes4/cpw_$PID.log
+# (test 14 renamed the first notes file to .before: all the notes are both files together)
+cat $O/notes4/cpw_$PID.log.before $O/notes4/cpw_$PID.log > $O/notes4/all.log 2>/dev/null
+L4=$O/notes4/all.log
 echo "--- its notes"
 cat $L4
 ok "the live file: made by the watch, 4096 bytes, readable by the app" "[ \"\$(stat -c %s $O/notes4/live.bin)\" = 4096 ] && [ \"\$(stat -c %a $O/notes4/live.bin)\" = 644 ]"
@@ -98,6 +104,18 @@ echo "== an import that does not hold the TinyALSA the watch hands on to"
 $O/test_cps $O/w3/libCarPlayAndroid.so $COPY guarded 0.3 || fail=$((fail+1))
 PID=$(ls $O/notes3 | sed -n 's/^cpw_\([0-9]*\)\.log$/\1/p' | head -n1)
 ok "each import left alone, said why; not watching, and the music still played (the checks above)" "grep -q 'libCarPlayAudio.so: 0 of 4 TinyALSA imports watched (none), the table read-only again; left alone: pcm_open (it holds 0x[0-9a-f]*, not TinyALSA.s)' $O/notes3/cpw_$PID.log && grep -qx 'state=not watching' $O/notes3/status.$PID && grep -qx 'imports=0 of 4' $O/notes3/status.$PID"
+
+echo "== an audio library laid out unlike the factory one (after 0.7.6): left alone, nothing read outside it"
+for m in badphoff badphnum baddyn; do
+    rm -rf $O/notes5 && mkdir -p $O/notes5
+    $O/test_cps $O/w5/libCarPlayAndroid.so $COPY $m 0.3 || fail=$((fail+1))
+    PID=$(ls $O/notes5 | sed -n 's/^cpw_\([0-9]*\)\.log$/\1/p' | head -n1)
+    case $m in
+        baddyn) why='its dynamic section is not where it is loaded' ;;
+        *) why='its program headers are not where it is loaded' ;;
+    esac
+    ok "$m: the CarPlay app goes on, nothing is watched, the notes say why; the music still played" "[ -n '$PID' ] && grep -q \"libCarPlayAudio.so: $why (laid out unlike the factory file): nothing is watched\" $O/notes5/cpw_$PID.log && grep -qx 'state=not watching' $O/notes5/status.$PID && grep -qx 'imports=0 of 0' $O/notes5/status.$PID"
+done
 
 echo "== the check before use (eqe_lab cpcheck <watch> <copy>)"
 NB=$(ls $O/notes | wc -l)

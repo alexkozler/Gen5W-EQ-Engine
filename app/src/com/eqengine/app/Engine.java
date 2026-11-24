@@ -23,7 +23,8 @@ final class Engine {
     static final int P_STATS = 2, P_VERSION = 3, P_SETTINGS = 10, P_RESPONSE = 11, P_GAINS = 12, P_VHQ = 13,
             P_SPECTRUM = 14, P_LEVEL = 15, P_PEAK = 16;
     /**
-     * 0x324 = this filter (0.7.6: P_PEAK is the largest boost over its rate, 44.1 and 48 kHz);
+     * 0x325 = this filter (after 0.7.6: the EQ turned off with the clip guard off no longer cracks);
+     * 0x324 = 0.7.6's filter (P_PEAK is the largest boost over its rate, 44.1 and 48 kHz);
      * 0x323 = 0.7.4-0.7.5's filter (the bands run a chunk at a time; the same sound as 0x322);
      * 0x322 = 0.7.1-0.7.3's filter (settings layout 3: Expert mode, up to 20 bands of its own);
      * 0x321 = 0.6.10's filter (adds P_PEAK, the largest boost of any settings from the solved filters);
@@ -31,7 +32,7 @@ final class Engine {
      * 0x310 = 0.5 filter (adds P_VHQ); 0x300 = 0.4 filter. The older ones stay in the audio server
      * after an update until it restarts, so they are still driven (without the new parts).
      */
-    static final int LIB_VERSION = 0x324, LIB_VERSION_074 = 0x323, LIB_VERSION_0611 = 0x322, LIB_VERSION_0610 = 0x321, LIB_VERSION_066 = 0x320, LIB_VERSION_05 = 0x310,
+    static final int LIB_VERSION = 0x325, LIB_VERSION_076 = 0x324, LIB_VERSION_074 = 0x323, LIB_VERSION_0611 = 0x322, LIB_VERSION_0610 = 0x321, LIB_VERSION_066 = 0x320, LIB_VERSION_05 = 0x310,
             LIB_VERSION_04 = 0x300;
     static final int NRESP = 96, NSTATS = 28, NSPEC = 48;
     static final int RESP_NONE = 0x80000000;
@@ -229,7 +230,7 @@ final class Engine {
 
     /** Filters that take settings layout 3 (Expert mode): 0x323 and 0x322 behave the same to the app. */
     static boolean expertLib(int v) {
-        return v == LIB_VERSION || v == LIB_VERSION_074 || v == LIB_VERSION_0611;
+        return v == LIB_VERSION || v == LIB_VERSION_076 || v == LIB_VERSION_074 || v == LIB_VERSION_0611;
     }
 
     /** The settings layout the running filter takes: 3 (Expert mode), 2 (end-band types) or 1. */

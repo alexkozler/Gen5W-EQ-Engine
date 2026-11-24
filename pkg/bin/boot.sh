@@ -18,7 +18,8 @@
 # Stage 2 additions:
 #  - Audio converter: sets af.resampler.quality before music starts, from settings/converter
 #    (the Lab's choice: 4 very high quality, the default; 3 high; 0 Android's default), and
-#    records the audio server's own confirmation line to state/resampler.log. Turning off or the
+#    records the audio server's own confirmation line to state/resampler.log (after 0.7.6: until
+#    it has the running audio server's line, then again for the next one). Turning off or the
 #    crash watch put it back to 0. It is a run-time property: a start without this step has
 #    Android's default. Fallbacks: tables that fail their check make that start use 3
 #    (state/conv_fallback says why); each unexpected audio server restart steps the choice down
@@ -48,7 +49,7 @@
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.7.6
+VER=0.7.7
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -59,7 +60,6 @@ VHQLIB=$D/lib/libaudio-resampler.so
 VHQSUM=$D/conf/libaudio-resampler.md5
 SET=$D/settings
 HAL_T=/system/lib/hw/audio.primary.tcc803x.so
-POL_T=/system/etc/audio_policy.conf
 SVC=com.eqengine.app/.EqService
 KEEP_CMD="sh $D/bin/act.sh keep"
 CPW_CMD="sh $D/bin/act.sh cpwboot"
@@ -70,13 +70,19 @@ GOOD_AFTER=45
 [ -n "$EQE_TEST_ROOT" ] && {
     D=$EQE_TEST_ROOT/data/eqengine; S=$D/state; OURS=$D/conf/audio_effects.conf; LIB=$D/lib/libeqengine.so; SET=$D/settings
     VHQLIB=$D/lib/libaudio-resampler.so; VHQSUM=$D/conf/libaudio-resampler.md5
-    HAL_T=$EQE_TEST_ROOT/system/lib/hw/audio.primary.tcc803x.so; POL_T=$EQE_TEST_ROOT/system/etc/audio_policy.conf
+    HAL_T=$EQE_TEST_ROOT/system/lib/hw/audio.primary.tcc803x.so
     TARGET=$EQE_TEST_ROOT/system/etc/audio_effects.conf; VENDOR=$EQE_TEST_ROOT/vendor/etc/audio_effects.conf
     [ -n "$EQE_GOOD_AFTER" ] && GOOD_AFTER=$EQE_GOOD_AFTER
     [ -n "$EQE_KEEP_CMD" ] && KEEP_CMD=$EQE_KEEP_CMD
     [ -n "$EQE_CPW_CMD" ] && CPW_CMD=$EQE_CPW_CMD
 }
 PROC=${EQE_PROC:-/proc}
+# (after 0.7.6) the bind mount runs Android's own mount program: NEMESIS puts a `mount` script first
+# in its services' PATH that only handles "remount" and starts this same program for anything else,
+# one shell start later, in the race with the audio server reading its effects list. (Tests use
+# the PATH's.)
+MOUNT=mount
+[ -z "$EQE_TEST_ROOT" ] && [ -x /system/bin/mount ] && MOUNT=/system/bin/mount
 
 up() { read _u _r < $PROC/uptime; echo "${_u%%.*}"; }
 
@@ -139,14 +145,20 @@ zygote_pid() {
 # root only (it holds what the log holds: logs are private), copied by All logs.
 crash_snapshot() {
     [ -f $S/crash.log ] && mv $S/crash.log $S/crash.prev.log
+    # (after 0.7.6) root only from the start (made under umask 077: no moment at 644 in which
+    # another app could open it), not only once the system log is in it
+    rm -f $S/crash.log
+    umask 077
+    : > $S/crash.log
+    umask 022
+    chmod 600 $S/crash.log
     {
         echo "$(up) $1"
         echo "--- logcat (main, system, events)"
         logcat -d -v threadtime -b main -b system -b events 2>&1
         echo "--- kernel log"
         dmesg 2>&1
-    } > $S/crash.log
-    chmod 600 $S/crash.log
+    } >> $S/crash.log
 }
 
 flat() {
@@ -201,11 +213,13 @@ conv_quality() {
 }
 
 maps_has() {
-    # $1 = pid, $2 = file name: is it mapped into that process?
+    # $1 = pid, $2 = file name: is it mapped into that process? (Also when the file was deleted
+    # since: an update before the head unit restarts removes the old one, which that process keeps
+    # using; after 0.7.6.)
     [ -f $PROC/$1/maps ] || return 1
     while read _a _p _o _d _i _f; do
         case "$_f" in
-            */$2) return 0 ;;
+            */$2|*/$2" (deleted)") return 0 ;;
         esac
     done < $PROC/$1/maps
     return 1
@@ -234,11 +248,16 @@ conv_step_down() {
     event "audio converter stepped down to $_to: $1"
 }
 
+# The Lab driver watch laid over the audio driver: only while the file there is EQ Engine's own
+# (after 0.7.6, as for the effects list and the CarPlay layer: another package's mount on that path
+# is never taken for it nor removed). 0.6.0's 48 kHz policy copy cannot outlast a car start, so
+# audio_policy.conf is not looked at any more.
 lab_mounted() {
+    _lm=0
     while read _d _m _rest; do
-        [ "$_m" = "$HAL_T" ] || [ "$_m" = "$POL_T" ] && return 0
+        [ "$_m" = "$HAL_T" ] && _lm=1
     done < $PROC/mounts
-    return 1
+    [ $_lm = 1 ] && ours $HAL_T $D/lib/eqe_drvwatch.so
 }
 
 lab_recent() {
@@ -261,7 +280,15 @@ keep_alive() {
     [ -f $S/keep.pid ] || return 1
     read _kp < $S/keep.pid
     _kp=$(num "$_kp")
-    [ $_kp -gt 0 ] && [ -d $PROC/$_kp ]
+    [ $_kp -gt 0 ] && [ -d $PROC/$_kp ] || return 1
+    # (after 0.7.6) a pid used again by another program is not the keeper (the shells drop the
+    # NUL bytes between the arguments)
+    _kc=""
+    [ -f $PROC/$_kp/cmdline ] && read -r _kc < $PROC/$_kp/cmdline
+    case "$_kc" in
+        ""|*act.sh*) return 0 ;;
+    esac
+    return 1
 }
 
 keep_start() {
@@ -271,18 +298,11 @@ keep_start() {
 }
 
 lab_off() {
-    # removes both Lab overlays (driver watch, 0.6.0's 48 kHz policy); 0 when none is left
-    for _t in $HAL_T $POL_T; do
-        _i=0
-        while [ $_i -lt 5 ]; do
-            _m=0
-            while read _d _mp _rest; do
-                [ "$_mp" = "$_t" ] && _m=1
-            done < $PROC/mounts
-            [ $_m = 0 ] && break
-            umount $_t
-            _i=$((_i + 1))
-        done
+    # removes the Lab driver watch (EQ Engine's own only); 0 when it is not left
+    _i=0
+    while [ $_i -lt 5 ] && lab_mounted; do
+        umount $HAL_T
+        _i=$((_i + 1))
     done
     rm -f $S/lab_active
     ! lab_mounted
@@ -309,6 +329,47 @@ start_capture() {
     stop_capture
     logcat -v time -f $S/resampler.log -s AudioResampler:D AudioResamplerSinc:E < /dev/null > /dev/null 2>&1 &
     echo $! > $S/resampler.pid
+}
+
+# (after 0.7.6) The capture is a logcat that reads every line Android logs (about 460 a second on
+# this unit), so it no longer runs the whole drive. An audio server logs its converter line once,
+# when it first converts (the "could not open" line, if any, right after it): the capture stops
+# one round after it holds the running audio server's line, and starts again for the next audio
+# server (logcat first writes what its buffer still holds, about the last minute, so a line logged
+# in between is kept). An audio server that never converts keeps it running, as before.
+CAP_DONE=""
+CAP_SEEN=""
+cap_has() {
+    [ -f $S/resampler.log ] || return 1
+    while IFS= read -r _cl; do
+        case "$_cl" in
+            *"forcing AudioResampler quality to "*) ;;
+            *) continue ;;
+        esac
+        _cq=${_cl#*"AudioResampler("}
+        _cq=${_cq%%")"*}
+        _cq=${_cq##* }
+        [ "$_cq" = "$1" ] && return 0
+    done < $S/resampler.log
+    return 1
+}
+cap_check() {
+    [ -n "$MSPID" ] || return 0
+    [ "$CAP_DONE" = "$MSPID" ] && return 0
+    if [ ! -f $S/resampler.pid ]; then
+        start_capture
+        CAP_SEEN=""
+        return 0
+    fi
+    cap_has $MSPID || return 0
+    if [ "$CAP_SEEN" = "$MSPID" ]; then
+        stop_capture
+        CAP_DONE=$MSPID
+    else
+        CAP_SEEN=$MSPID
+        # logcat makes its file root only; the app shows this line
+        chmod 644 $S/resampler.log
+    fi
 }
 
 reset_conv() {
@@ -434,10 +495,25 @@ fx_now() {
     [ -f $PROC/$1/maps ] || return 0
     while read _a _p _o _d _i _f; do
         case "$_f" in
-            */libeqengine.so) FX=ours; return 0 ;;
+            # (after 0.7.6: also the previous version's, removed by an update before a restart)
+            */libeqengine.so|*/libeqengine.so" (deleted)") FX=ours; return 0 ;;
             */soundfx/*) FX=factory ;;
         esac
     done < $PROC/$1/maps
+}
+
+# (after 0.7.6) EQ Engine's filter is in that process only as the file an update removed: the
+# previous version, until the next car start or audio restart
+maps_old_only() {
+    [ -f $PROC/$1/maps ] || return 1
+    _mo=1
+    while read _a _p _o _d _i _f; do
+        case "$_f" in
+            */libeqengine.so) return 1 ;;
+            */libeqengine.so" (deleted)") _mo=0 ;;
+        esac
+    done < $PROC/$1/maps
+    return $_mo
 }
 
 # Where Android's audio server was when the overlay went in (0.6.9): state/boot_timing and one
@@ -574,9 +650,14 @@ elif [ $STRIKES -ge 2 ]; then
     NM_STATE=off; NM_REASON="two starts in a row ended before EQ Engine was confirmed good. Turn it back on in the app."; NM_PHASE=off
 elif [ -f $VENDOR ]; then
     NM_STATE=refused; NM_REASON="this unit has $VENDOR, which Android reads instead; not applying"; NM_PHASE=refused
-elif mounted; then
+elif mounted && ours $TARGET $OURS; then
     # Already applied during this start (the service was restarted, for example by a reinstall).
+    # Only EQ Engine's own list counts (after 0.7.6): another package's file laid over it goes on
+    # to the checks below and is refused, untouched. (If conf/audio_effects.conf ever changes, an
+    # update before a restart would meet the old version's list here: accept its md5 too then.)
     PRE_MOUNTED=1
+elif mounted; then
+    NM_STATE=refused; NM_REASON="another package's file is laid over Android's effects list: EQ Engine does not apply itself while it is there, and leaves it alone"; NM_PHASE=refused
 elif [ ! -f $LIB ]; then
     NM_STATE=refused; NM_REASON="the filter library is missing ($LIB)"; NM_PHASE=refused
 elif [ ! -f $OURS ]; then
@@ -598,7 +679,7 @@ else
         PHASE=applied
         [ $FRESH = 1 ] && PHASE=installed
         echo "$BID $PHASE" > $S/lastboot
-        if mount -o bind $OURS $TARGET; then
+        if $MOUNT -o bind $OURS $TARGET; then
             up_at
             T_MOUNT=$UP_AT
             snap_ms
@@ -611,10 +692,12 @@ fi
 # ---- Housekeeping (after the mount)
 chmod 755 $D $S
 # Stage 1 left some of these writable by everyone. The crash logs (raw system and kernel logs,
-# with personal data) stay readable by root only (0.7.6: they were made 644 here too).
+# with personal data) stay readable by root only (0.7.6: they were made 644 here too), and so (after
+# 0.7.6) do the Lab's log lines, a restart's AudioService lines and what an interrupted car report
+# left behind (its raw log and audio policy dump).
 for _f in $S/*; do
     case "${_f##*/}" in
-        crash.log|crash.prev.log) [ -f "$_f" ] && chmod 600 "$_f" ;;
+        crash.log|crash.prev.log|lab_now.log|restart_as.log|report_log.txt|report_dump.txt) [ -f "$_f" ] && chmod 600 "$_f" ;;
         *) [ -f "$_f" ] && chmod 644 "$_f" ;;
     esac
 done
@@ -627,10 +710,12 @@ _rb=""
 if [ "$_rb" != "$BID" ]; then
     # the previous start's timing and late-list note
     rm -f $S/late_list $S/boot_timing
-    rm -f $S/resampler.log $S/resampler.log.1 $S/resampler_now.log $S/last_restart $S/expected_restart
-    rm -rf $S/restart.lock
+    rm -f $S/resampler.log $S/resampler.log.1 $S/resampler_now.log $S/last_restart $S/expected_restart $S/restart_as.log
+    rm -rf $S/restart.lock $S/cpwatch.lock
     # Lab tests and the 48 kHz switch are in memory: a new start has neither
-    rm -f $S/lab_active $S/lab_ended $S/rate48 $S/rate48_sent $S/output $S/keep.pid $S/af.txt
+    rm -f $S/lab_active $S/lab_ended $S/rate48 $S/rate48_sent $S/output $S/keep.pid $S/af.txt $S/af_report.txt $S/report_af.txt
+    # a car report's own files, left only when it was cut short
+    rm -f $S/report_log.txt $S/report_dump.txt
     # Hold.java (48 kHz switches) does not outlive a car start
     rm -rf $S/hold
     [ -f $S/output.log ] && mv $S/output.log $S/output.prev.log
@@ -704,6 +789,7 @@ LASTR=0
 LASTWD=0
 LASTCH=0
 LAB_GRACE=0
+CR48_AT=0
 while :; do
     NOW=$(up)
     if [ -f $S/disabled ]; then
@@ -751,7 +837,9 @@ while :; do
                 echo 0 > $SET/rate48
                 chmod 644 $SET/rate48
             fi
-            LAB_GRACE=$((NOW + 60))
+            # (after 0.7.6: no Lab grace here, so a later crash in this minute is counted as
+            # usual; and this start is confirmed good only 45 s after this restart)
+            CR48_AT=$NOW
             event "audio server restarted unexpectedly right after a 48 kHz switch (pid $MSPID -> ${NEW:-?}); 48 kHz output turned off"
             crash_snapshot "the audio server restarted right after a 48 kHz switch: pid $MSPID -> ${NEW:-?}"
         elif [ -f $S/lab_active ] || [ $NOW -lt $LAB_GRACE ] || lab_recent; then
@@ -784,7 +872,9 @@ while :; do
     # Android's zygote, to tell a framework restart from an audio server crash (looked up again
     # only while not known)
     [ -z "$ZYPID" ] && ZYPID=$(zygote_pid)
-    if [ $GOOD = 0 ] && [ $OVERLAY = 1 ] && [ $MSR = 0 ] && [ $((NOW - APPLIED_AT)) -ge $GOOD_AFTER ]; then
+    cap_check
+    if [ $GOOD = 0 ] && [ $OVERLAY = 1 ] && [ $MSR = 0 ] && [ $((NOW - APPLIED_AT)) -ge $GOOD_AFTER ] && \
+       [ $((NOW - CR48_AT)) -ge $GOOD_AFTER ]; then
         GOOD=1
         STRIKES=0
         echo 0 > $S/strikes
@@ -797,6 +887,11 @@ while :; do
             # Engine existed: expected, and the install's instructions say to restart the car.
             REASON="effects list overlay applied; just installed: the running audio server started before EQ Engine was installed and loads it at the next car start or audio restart (parked)"
             event "just installed: the running audio server ($MSPID) started before EQ Engine was installed; it loads EQ Engine at the next car start or audio restart (parked)"
+        elif [ -n "$MSPID" ] && [ $FRESH = 1 ] && [ "$MSPID" = "$FRESH_MS" ] && maps_old_only $MSPID; then
+            # (after 0.7.6) an update: the running audio server still has the previous version's
+            # filter (its file removed by the update), which goes on working until then
+            REASON="effects list overlay applied; just installed (an update): the running audio server has the previous version until the next car start or audio restart (parked)"
+            event "just installed (an update): the running audio server ($MSPID) has the previous version's filter; this version's loads at the next car start or audio restart (parked)"
         elif [ -n "$MSPID" ] && [ -f $PROC/$MSPID/maps ] && ! maps_has $MSPID libeqengine.so; then
             # The audio server read its effects list before the overlay was in place (0.6.3, one car
             # start in three): no EQ, no converter tables, no 48 kHz output in it. No restart from
@@ -833,8 +928,15 @@ while :; do
         SVC_STARTED=1
         LASTWD=$NOW
         event "Android has started; starting the EQ service: $(flat $(am startservice -n $SVC 2>&1))"
-        keep_start
-        event "48 kHz output keeper started"
+        # (after 0.7.6) the boot step runs again when EQ Engine is turned back on: a keeper still
+        # running from before carries on (it follows the setting), so no second one cancels its
+        # track hold in the middle of a rate change
+        if keep_alive; then
+            event "48 kHz output keeper still running (pid $_kp): kept"
+        else
+            keep_start
+            event "48 kHz output keeper started"
+        fi
         write_status
     elif [ $SVC_STARTED = 1 ] && [ $((NOW - LASTWD)) -ge 60 ]; then
         LASTWD=$NOW

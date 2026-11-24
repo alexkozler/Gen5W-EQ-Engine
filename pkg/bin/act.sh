@@ -3,6 +3,10 @@
 # 767 bytes; that is why these live here instead of in the app).
 #
 #   act.sh save <usb root> <app files dir> <1 = with Android dumps | 0>
+#   act.sh crashsave <app files dir> <usb root>...
+#                          (the app's crash handler) save ... 0 to the first of the sticks that is
+#                          already EQ Engine's (an EQENGINE folder or README-EQENGINE.txt); none:
+#                          nothing is written
 #   act.sh restart [4|3|0] restart Android's audio server (optionally setting the converter first:
 #                          4 very high quality with EQ Engine's tables, 3 high, 0 Android default);
 #                          one at a time, COOLDOWN seconds apart at least, and it returns only after
@@ -35,7 +39,7 @@
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
-VER=0.7.6
+VER=0.7.7
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -54,6 +58,15 @@ if [ -n "$EQE_TEST_ROOT" ]; then
     PROC=$EQE_TEST_ROOT/proc
     kill() { "$EQE_TEST_ROOT/stubs/kill" "$@"; }
 fi
+# (after 0.7.6) bind mounts run Android's own mount program, not NEMESIS's `mount` script first in
+# its services' PATH (it only handles "remount" and starts this same program for anything else).
+# (Tests use the PATH's.)
+MOUNT=mount
+[ -z "$EQE_TEST_ROOT" ] && [ -x /system/bin/mount ] && MOUNT=/system/bin/mount
+# the audio server scan that the hold and the buffer check read (af_scan). The car report scans
+# into a file of its own: a report made during a hold could otherwise rewrite the keeper's file
+# between its two reads, and the hold would pass with nothing held (after 0.7.6).
+AF_F=$S/af.txt
 VHQLIB=$D/lib/libaudio-resampler.so
 VHQSUM=$D/conf/libaudio-resampler.md5
 # Lab tests (in-memory bind mounts, like the effects list; gone at the next car start)
@@ -65,8 +78,6 @@ HAL_COPY=$D/lib/hal/eqe_hal_orig.so
 WATCH=$D/lib/eqe_drvwatch.so
 WATCHSUM=$D/conf/eqe_drvwatch.md5
 DRV=$D/drv
-# 0.6.0's 48 kHz test laid a policy copy here; still taken off if one is ever found mounted
-POL_T=$SYS/system/etc/audio_policy.conf
 EFX_T=$SYS/system/etc/audio_effects.conf
 # the stock effects list this package was built for (the same value as in boot.sh)
 EFX_MD5=4d98c1b38bd1d9eaf929d9b616c0d118
@@ -106,9 +117,12 @@ ms_pid() {
     }
 }
 
+# (shell variables are global: these loops use names found nowhere else, so a caller's variables are
+# never overwritten. Through 0.7.6 they used _m, and the report's effects-list check printed a
+# mount point where the md5 belonged.)
 mounted() {
-    while read _d _m _rest; do
-        [ "$_m" = "$TARGET" ] && return 0
+    while read _mt_d _mt_m _mt_r; do
+        [ "$_mt_m" = "$TARGET" ] && return 0
     done < /proc/mounts
     return 1
 }
@@ -123,8 +137,8 @@ ours() {
 
 snapshot() {
     # $1 = before | after
-    /system/bin/dumpsys media.audio_flinger > "af_$1.txt" 2>&1
-    /system/bin/dumpsys media.audio_policy > "ap_$1.txt" 2>&1
+    dump_to media.audio_flinger "af_$1.txt" 15
+    dump_to media.audio_policy "ap_$1.txt" 15
     {
         for f in /proc/asound/cards /proc/asound/pcm /proc/asound/card0/pcm*/sub0/hw_params /proc/asound/card0/pcm*/sub0/status; do
             [ -f "$f" ] && { echo "== $f"; cat "$f"; }
@@ -161,11 +175,87 @@ uptime_s() {
     echo "${_u%%.*}"
 }
 
+# (after 0.7.6) the same into UPNOW, with no subshell (the keeper's every-second checks)
+up_now() {
+    read _u _r < $PROC/uptime
+    UPNOW=${_u%%.*}
+}
+
 num() {
     case "$1" in
         ''|*[!0-9]*) echo 0 ;;
         *) echo "$1" ;;
     esac
+}
+
+# (after 0.7.6) While restart_now waits, one logcat follows AudioService's lines into RS_LOG, read
+# with builtins once a second (a logcat -d of the whole log every second took about a second each
+# on the car, about 460 lines a second). A watchdog stops that logcat after RS_MAX s should this
+# script itself be stopped first (the real sleep and kill, and the real /proc: our own processes).
+RS_LOG=$S/restart_as.log
+RS_MAX=${EQE_RS_MAX:-45}
+RS_SLEEP=sleep
+[ -n "$EQE_TEST_ROOT" ] && RS_SLEEP=/bin/sleep
+RS_PID=""; RS_WD=""; RS_T0=""
+rs_start() {
+    rs_stop
+    # AudioService's lines can name Bluetooth devices: root only from the start
+    umask 077
+    : > $RS_LOG
+    umask 022
+    # the log's clock now: only a marker logged after this counts (the logcat first writes what
+    # the log still holds, oldest first, which can take seconds on the car: an older marker than
+    # the last one must not end the wait while the rest is still being written)
+    RS_T0=$(hms_now)
+    logcat -v time -s AudioService < /dev/null >> $RS_LOG 2>/dev/null &
+    RS_PID=$!
+    rs_watch $RS_PID < /dev/null > /dev/null 2>&1 &
+    RS_WD=$!
+}
+rs_watch() {
+    $RS_SLEEP $RS_MAX
+    _wc=""
+    { read -r _wc < /proc/$1/cmdline; } 2>/dev/null
+    case "$_wc" in
+        *logcat*) command kill $1 2>/dev/null ;;
+    esac
+}
+rs_stop() {
+    [ -n "$RS_PID" ] && command kill $RS_PID 2>/dev/null
+    [ -n "$RS_WD" ] && command kill $RS_WD 2>/dev/null
+    RS_PID=""; RS_WD=""
+    rm -f $RS_LOG
+}
+# the last "Media server started." line in RS_LOG logged in the 10 minutes from RS_T0 (HHMMSS on
+# the log's clock) on, into MK. Compared as seconds of the day, forward from RS_T0 across midnight:
+# a line from even 1 s before RS_T0 is about 24 h ahead, so it never counts.
+rs_marker() {
+    MK=""
+    [ -f $RS_LOG ] || return 0
+    _t0s=""
+    case "$RS_T0" in
+        [0-9][0-9][0-9][0-9][0-9][0-9])
+            _mx=${RS_T0#??}
+            _t0s=$(( (1${RS_T0%????} - 100) * 3600 + (1${_mx%??} - 100) * 60 + 1${_mx#??} - 100 )) ;;
+    esac
+    while read -r _md _mt _mrest; do
+        case "$_mrest" in
+            *"Media server started"*) ;;
+            *) continue ;;
+        esac
+        if [ -n "$_t0s" ]; then
+            _mc=${_mt%%.*}
+            case "$_mc" in
+                [0-9][0-9]:[0-9][0-9]:[0-9][0-9]) ;;
+                *) continue ;;
+            esac
+            _mh=${_mc%%:*}; _mc=${_mc#*:}
+            _mm=${_mc%%:*}; _mc=${_mc#*:}
+            _ms=$(( (1$_mh - 100) * 3600 + (1$_mm - 100) * 60 + 1$_mc - 100 ))
+            [ $(( (_ms - _t0s + 86400) % 86400 )) -le 600 ] || continue
+        fi
+        MK="$_md $_mt $_mrest"
+    done < $RS_LOG
 }
 
 # The last "Media server started." line of Android's AudioService: it logs that once it has
@@ -183,8 +273,38 @@ started_marker() {
 }
 
 # Client pids of the tracks Android's mixer is playing now (the "active tracks" tables).
+# (after 0.7.6) dumpsys of service $1 into file $2, waited for at most $3 s: an audio server that no
+# longer answers must not hold up the audio restart that would cure it, nor the logs that would show
+# why. 0 = it answered; 1 = it was stopped (a line saying so ends the file). The child is our own
+# process, so the real /proc and the shell's own kill are used.
+dump_to() {
+    rm -f "$2"
+    dumpsys $1 > "$2" 2>&1 < /dev/null &
+    _dtp=$!
+    _dti=0
+    while [ -d /proc/$_dtp ] && [ $_dti -lt $3 ]; do
+        sleep 1
+        _dti=$((_dti + 1))
+    done
+    if [ -d /proc/$_dtp ]; then
+        command kill -9 $_dtp 2>/dev/null
+        wait $_dtp 2>/dev/null
+        echo "(dumpsys $1 did not answer within $3 s)" >> "$2"
+        return 1
+    fi
+    wait $_dtp 2>/dev/null
+    return 0
+}
+
 playing_clients() {
-    dumpsys media.audio_flinger 2>/dev/null | {
+    # (after 0.7.6) a dump that does not come back gives no list: the restart goes ahead without the
+    # check of what played before
+    if ! dump_to media.audio_flinger $S/clients_af.txt 10; then
+        rm -f $S/clients_af.txt
+        echo ""
+        return 0
+    fi
+    {
         _in=0
         _out=""
         while read _a _b _c _rest; do
@@ -202,7 +322,8 @@ playing_clients() {
             esac
         done
         echo $_out
-    }
+    } < $S/clients_af.txt
+    rm -f $S/clients_af.txt
 }
 
 proc_name() {
@@ -229,11 +350,13 @@ vhq_ok() {
 }
 
 maps_has() {
-    # $1 = pid, $2 = file name: is it mapped into that process?
+    # $1 = pid, $2 = file name: is it mapped into that process? (Also when the file was deleted
+    # since: an update before the head unit restarts removes the old one, which that process keeps
+    # using; after 0.7.6.)
     [ -f $PROC/$1/maps ] || return 1
     while read _ma _mp _mo _md _mi _mf; do
         case "$_mf" in
-            */$2) return 0 ;;
+            */$2|*/$2" (deleted)") return 0 ;;
         esac
     done < $PROC/$1/maps
     return 1
@@ -259,8 +382,8 @@ EOL
 # ------------------------------------------------------------------ Lab tests
 
 mounted_at() {
-    while read _d _m _rest; do
-        [ "$_m" = "$1" ] && return 0
+    while read _mt_d _mt_m _mt_r; do
+        [ "$_mt_m" = "$1" ] && return 0
     done < $PROC/mounts
     return 1
 }
@@ -283,18 +406,27 @@ unmount_at() {
     ! mounted_at $1
 }
 
+# the Lab driver watch is laid over the audio driver now, and the file there is EQ Engine's own
+# (after 0.7.6: another package's mount on that path is never taken for it nor removed)
+lab_watch_on() {
+    mounted_at $HAL_T && ours $HAL_T $WATCH
+}
+
 lab_unmount_all() {
-    # both Lab overlays; 0 when neither is left
+    # the Lab driver watch (0.6.0's 48 kHz policy copy cannot outlast a car start, so
+    # audio_policy.conf is left alone); 0 when it is not left
     _ok=0
-    unmount_at $HAL_T || _ok=1
-    unmount_at $POL_T || _ok=1
+    if lab_watch_on; then
+        unmount_at $HAL_T
+        lab_watch_on && _ok=1
+    fi
     rm -f $S/lab_active
     return $_ok
 }
 
 lab_write_active() {
     _a=""
-    mounted_at $HAL_T && _a="$_a watch"
+    lab_watch_on && _a="$_a watch"
     if [ -n "$_a" ]; then
         echo "$_a" > $S/lab_active
         chmod 644 $S/lab_active
@@ -312,7 +444,8 @@ lab_result() {
 
 # Prepares and mounts the driver watch. 0 = mounted (or already), 1 = refused (message printed).
 watch_on() {
-    mounted_at $HAL_T && return 0
+    lab_watch_on && return 0
+    mounted_at $HAL_T && { echo "another package has a file laid over $HAL_T; not starting the driver watch"; return 1; }
     [ -f $HAL_V ] && { echo "this unit has $HAL_V, which Android would load instead; not starting the driver watch"; return 1; }
     [ -f $WATCH ] && [ -f $WATCHSUM ] || { echo "the driver watch is not installed"; return 1; }
     read _w < $WATCHSUM
@@ -335,7 +468,7 @@ watch_on() {
     chown media:media $DRV 2>/dev/null
     chmod 755 $DRV
     chmod 644 $WATCH
-    mount -o bind $WATCH $HAL_T || { echo "the driver watch could not be mounted"; return 1; }
+    $MOUNT -o bind $WATCH $HAL_T || { echo "the driver watch could not be mounted"; return 1; }
     [ "$(md5of $HAL_T)" = "$_w" ] || { unmount_at $HAL_T; echo "the driver watch did not check out after mounting; removed it"; return 1; }
     return 0
 }
@@ -417,6 +550,13 @@ link_of() {
 # "<pcm> <state> <rate>" of the playback link the thread $1 has open (nothing if none), read
 # straight from the kernel's files: cheap enough to do every second
 link_now() {
+    link_now_set "$1" || return 1
+    echo "$LINK_NOW"
+}
+
+# (after 0.7.6) link_now into LINK_NOW ("" when none), with no subshell: the keeper's every-second check
+link_now_set() {
+    LINK_NOW=""
     for _f in $PROC/asound/card*/pcm*p/sub0/status; do
         [ -f $_f ] || continue
         _st=""
@@ -435,7 +575,7 @@ link_now() {
                 [ "$_k" = "rate:" ] && _r=$_a
             done < $_d/sub0/hw_params
         fi
-        echo "${_d##*/} ${_st:-unknown} ${_r:-unknown}"
+        LINK_NOW="${_d##*/} ${_st:-unknown} ${_r:-unknown}"
         return 0
     done
     return 1
@@ -480,7 +620,8 @@ link_other() {
                 [ "$_ok" = "rate:" ] && LO_RATE=$_oa
             done < $_od/sub0/hw_params
         fi
-        K_OTHER_AT=$(uptime_s)
+        up_now
+        K_OTHER_AT=$UPNOW
         return 0
     done
     return 1
@@ -525,7 +666,13 @@ keep_other() {
         out_log "the main link ($MAIN_PCM) is in use by $LO_NAME (thread $LO_TID, ${LO_STATE:-?} at ${LO_RATE:-?} Hz), which plays to it directly, not through Android's audio server; the keeper changes nothing while it has the link"
     fi
     K_LAST=""
-    keep_note other "the main speaker link is in use by $LO_NAME, which plays to it directly, not through Android's audio server; EQ Engine cannot process that sound"
+    # (after 0.7.7's car test: since 0.7.3 EQ on CarPlay processes the CarPlay app's music inside
+    # that app, so "cannot process" is said only of another program)
+    if [ "$LO_NAME" = "$CP_APP" ]; then
+        keep_note other "the main speaker link is in use by the factory CarPlay app, which plays to it directly at its own rate, not through Android's audio server; 48 kHz output waits until it lets go (EQ on CarPlay processes its music, when it is on)"
+    else
+        keep_note other "the main speaker link is in use by $LO_NAME, which plays to it directly, not through Android's audio server; EQ Engine cannot process that sound"
+    fi
 }
 
 # The other process has let go of the main link: the app is shown what it was shown before (or
@@ -625,15 +772,16 @@ keep_note() {
 
 # r48_send <rate>: sends sampling_rate=<rate> to the main output, then reads back what Android's
 # output (SR1), the link's setting (LP, LR) and the link's measured frames/s (LF) say; SEEN sums
-# it up and HL is the driver's own line. 0: all say <rate>; 1: they do not; 2: Android says <rate>
-# but nothing plays, so the link could not be checked; 3: the audio server stopped.
+# it up (the driver's own line is read afterwards, by keep_change). 0: all say <rate>; 1: they
+# do not; 2: Android says <rate> but nothing plays, so the link could not be checked; 3: the audio
+# server stopped.
 r48_send() {
     _want=$1
     R48_T0=$(hms_now)
     uptime_s > $SENT
     chmod 644 $SENT
     ANS=$($LABBIN set $K_IO sampling_rate=$_want 2>&1)
-    SR1=""; LP=""; LR=""; LF=""; HL=""
+    SR1=""; LP=""; LR=""; LF=""
     # A driver that takes the rate restarts the link at it within a fraction of a second. Until
     # then Android may already mix at the new rate (wrong speed), so look at once, twice at most.
     _i=0
@@ -656,8 +804,8 @@ r48_send() {
     if [ -z "$R48_QUICK" ] && [ -n "$LR" ] && [ "$LR" = $_want ] && [ "$SR1" = $_want ]; then
         set -- $(link_of $K_TID 3000)
         [ -n "$1" ] && { LP=$1; LR=$2; LF=${3%%.*}; }
-        # the driver's own line; on a failure it is read after the put-back (logcat takes a while)
-        HL=$(hal_new "$R48_T0")
+        # (after 0.7.6) the driver's own line is read by keep_change after the hold and the
+        # buffer check (logcat takes seconds on the car)
     fi
     if [ -z "$LR" ]; then
         SEEN="output $K_IO at ${SR1:-?} Hz; the link is not playing"
@@ -699,7 +847,7 @@ keep_switch() {
             K_OUT=$_to; K_LINK=$LP; K_LR=$LR; K_FPS=$LF; K_MEASURED="$K_PID $_to"
             # with the silent track the frames/s are counted when music plays
             [ -n "$R48_QUICK" ] && K_MEASURED=""
-            out_log "switched to $_to Hz: $SEEN${R48_QUICK:+ (a silent track ran the link)}${HL:+; driver: $HL}"
+            out_log "switched to $_to Hz: $SEEN${R48_QUICK:+ (a silent track ran the link)}"
             if [ $_to = 48000 ]; then
                 echo "$K_PID $K_IO" > $R48
                 chmod 644 $R48
@@ -940,14 +1088,14 @@ hold_begin() {
     _att=0
     while :; do
         _att=$((_att + 1))
-        af_scan $K_IO > $S/af.txt
+        af_scan $K_IO > $AF_F
         _mix=""; _chs=""; _ss=""
         while read -r _k _a _b; do
             case "$_k" in
                 mix) _mix=$_a ;;
                 chain) _chs="$_chs $_a" ;;
             esac
-        done < $S/af.txt
+        done < $AF_F
         if [ -z "$_mix" ]; then
             HOLD_WHY="the audio server's dump does not show the main output's buffers"
             return 1
@@ -961,7 +1109,7 @@ hold_begin() {
                 *" $_a "*) continue ;;
             esac
             _ss="$_ss $_a"
-        done < $S/af.txt
+        done < $AF_F
         [ -n "$_ss$_wake" ] || return 0
         hold_start $_wake $_ss || return 1
         # "held <n> <sessions> [silent <session>]"
@@ -998,11 +1146,11 @@ hold_begin() {
                 return 1
             fi
         fi
-        af_scan $K_IO > $S/af.txt
+        af_scan $K_IO > $AF_F
         _bad=""
         while read -r _k _a _b; do
             [ "$_k" = track ] && [ "$_b" = "$_mix" ] && _bad="$_bad $_a"
-        done < $S/af.txt
+        done < $AF_F
         if [ -z "$_bad" ]; then
             set -- $HOLD_SESS
             HOLD_N=$#
@@ -1020,11 +1168,11 @@ hold_begin() {
 # chain (BUF_N tracks); 1 = some do not (STALE: their sessions); 2 = the dump does not show them
 buffers_check() {
     STALE=""; BUF_N=0
-    af_scan $K_IO > $S/af.txt
+    af_scan $K_IO > $AF_F
     _mix=""
     while read -r _k _a _b; do
         [ "$_k" = mix ] && _mix=$_a
-    done < $S/af.txt
+    done < $AF_F
     [ -n "$_mix" ] || return 2
     while read -r _k _a _b; do
         [ "$_k" = track ] || continue
@@ -1033,13 +1181,13 @@ buffers_check() {
         _okc=0
         while read -r _k2 _a2 _b2; do
             [ "$_k2" = chain ] && [ "$_a2" = "$_a" ] && [ "$_b2" = "$_b" ] && _okc=1
-        done < $S/af.txt
+        done < $AF_F
         [ $_okc = 1 ] && continue
         case " $STALE " in
             *" $_a "*) ;;
             *) STALE="$STALE $_a" ;;
         esac
-    done < $S/af.txt
+    done < $AF_F
     STALE=${STALE# }
     [ -z "$STALE" ]
 }
@@ -1140,16 +1288,18 @@ keep_change() {
     R48_QUICK=""
     # the silence ends here; the driver's lines are read only now (logcat takes seconds on the car)
     hold_end
+    # (after 0.7.6) the tracks' buffers first: a track Android left on a freed buffer is silent
+    # until moved back, so that is not kept waiting for the log read below
+    [ -n "$K_PID" ] && keep_buffers
     if [ -n "$K_PID" ] && [ -n "$_t0" ]; then
         if [ $_kc = 1 ]; then
             _hl=$(hal_since "$_t0")
             [ -n "$_hl" ] && out_log "the driver's lines about its rate since the switch: $_hl"
-        elif [ -n "$_kw" ]; then
+        else
             _hl=$(hal_new "$_t0")
             [ -n "$_hl" ] && out_log "the driver's line for that switch: $_hl"
         fi
     fi
-    [ -n "$K_PID" ] && keep_buffers
     return $_kc
 }
 
@@ -1162,8 +1312,9 @@ keep_idle() {
     [ "$K_IDLED" = "$K_PID $K_WANT" ] && return 0
     [ -n "$K_HELD$K_NO48$K_UNSAFE" ] && return 0
     [ $K_TRIES -lt $KEEP_TRIES ] || return 0
-    [ $(($(uptime_s) - K_SINCE)) -ge $IDLE_AFTER ] || return 0
-    [ -n "$K_OTHER_AT" ] && [ $(($(uptime_s) - K_OTHER_AT)) -lt $OTHER_QUIET ] && return 0
+    up_now
+    [ $((UPNOW - K_SINCE)) -ge $IDLE_AFTER ] || return 0
+    [ -n "$K_OTHER_AT" ] && [ $((UPNOW - K_OTHER_AT)) -lt $OTHER_QUIET ] && return 0
     set -- $(main_out)
     [ "$2" = "$K_TID" ] || return 0
     K_OUT=$3
@@ -1310,7 +1461,14 @@ keep_loop() {
         [ -f $KEEP_PID ] && read _kp < $KEEP_PID
         [ "$_kp" = $$ ] || exit 0
         [ $((_round % 3)) = 0 ] && cpw_guard > /dev/null 2>&1
-        _w=$(rate48_wanted)
+        # as rate48_wanted, with no subshell (every second for the whole drive; after 0.7.6)
+        _w=1
+        [ -f $D/settings/rate48 ] && read _w < $D/settings/rate48
+        [ -f $S/disabled ] && _w=0
+        case "$_w" in
+            0) ;;
+            *) _w=1 ;;
+        esac
         if [ "$_w" != "$K_WANT" ]; then
             if [ -n "$K_WANT" ]; then
                 if [ $_w = 1 ]; then out_log "48 kHz output turned on"; else out_log "48 kHz output turned off"; fi
@@ -1360,7 +1518,8 @@ keep_loop() {
             sleep $KEEP_POLL
             continue
         fi
-        set -- $(link_now $K_TID)
+        link_now_set $K_TID
+        set -- $LINK_NOW
         if [ "$2" != RUNNING ]; then
             K_LAST=""
             [ -z "$K_STATE" ] && keep_note waiting "Waiting for music"
@@ -1407,7 +1566,9 @@ safe() {
 report_props() {
     getprop 2>/dev/null | while read -r _l; do
         _n=${_l%%]*}
-        _n=${_n#[}
+        # (the line starts with "["; stripping it with an unclosed bracket pattern left it on the
+        # car's mksh, so no name with a fixed prefix ever matched the list below until after 0.7.6)
+        _n=${_n#?}
         case "$_n" in
             *serial*|*vin*|*imei*|*iccid*|*mac*|*addr*|*ssid*|*bt.*|*bluetooth*|*wifi*|*wlan*|*phone*|*imsi*|*msisdn*) continue ;;
             *key*|*token*|*pass*|*user*|*account*|*gps*|*location*|*name*|*host*|*cmdline*|*sim*|*number*|*boot.*) continue ;;
@@ -1982,10 +2143,14 @@ cpw_takeoff() {
 
 cpw_lock() {
     if ! mkdir $S/cpwatch.lock 2>/dev/null; then
-        _lt=""
-        [ -f $S/cpwatch.lock/at ] && read _lt < $S/cpwatch.lock/at
+        # "<uptime> <pid>": live only while that act.sh still runs, in this car start (after 0.7.6:
+        # one left by a power cut, stamped with a later uptime than now, no longer blocks the next
+        # drive; boot.sh removes it at a car start too)
+        _lt=""; _lp=""
+        [ -f $S/cpwatch.lock/at ] && read _lt _lp < $S/cpwatch.lock/at
         _lt=$(num "$_lt")
-        if [ $(($(uptime_s) - _lt)) -lt $((CPW_WAIT + 30)) ]; then
+        _ld=$(($(uptime_s) - _lt))
+        if [ $_ld -ge 0 ] && [ $_ld -lt $((CPW_WAIT + 30)) ] && { [ -z "$_lp" ] || [ -d $PROC/$_lp ]; }; then
             echo EQE_WAIT
             echo "The CarPlay watch is already being switched. Try again in a minute."
             return 1
@@ -1993,7 +2158,7 @@ cpw_lock() {
         rm -rf $S/cpwatch.lock
         mkdir $S/cpwatch.lock 2>/dev/null || { echo EQE_WAIT; echo "The CarPlay watch is already being switched."; return 1; }
     fi
-    uptime_s > $S/cpwatch.lock/at
+    echo "$(uptime_s) $$" > $S/cpwatch.lock/at
     trap 'rm -rf $S/cpwatch.lock' EXIT
     return 0
 }
@@ -2046,7 +2211,7 @@ cpw_copy() {
 # Lays the watch over the CarPlay app's JNI library and checks that what is there now is the watch
 # (its md5 from the install): 0, else the mount is taken off again and 1.
 cpw_mount() {
-    if ! mount -o bind $CPW $CPW_T || ! cpw_mounted; then
+    if ! $MOUNT -o bind $CPW $CPW_T || ! cpw_mounted; then
         cpw_unmount
         return 1
     fi
@@ -2108,6 +2273,17 @@ cpwatch_on() {
         # laid over again for that app's next start, as at the car start, and the guard watches it.
         [ -n "$_cpp" ] && echo "EQE_CPW_NOTE the CarPlay app (pid $_cpp) has $(cp_conn $_cpp) now"
         rm -f $CPW_RS
+        # after an update (0.7.6 on: the install's own "on"), the folder the running layer writes its
+        # notes, status and live file to was deleted with the old version: made again, as the app's
+        # user, so the layer goes on there (it makes its live file again by itself)
+        if [ ! -d $CPW_D ]; then
+            mkdir -p $CPW_D
+            if chown $_cu:$_cu $CPW_D 2>/dev/null; then
+                chmod 755 $CPW_D
+            else
+                chmod 777 $CPW_D
+            fi
+        fi
         if cpw_mount; then
             cpw_state on $_cpp "watching (still loaded since the car start; turned on again)"
             cpw_result "on: still loaded in the CarPlay app (pid $_cpp); laid over again for its next start. Nothing was restarted"
@@ -2231,12 +2407,37 @@ cpw_boot() {
 # mount is still there), a second later start within two minutes takes it off, and so does a watch
 # that says the factory library did not load.
 cpw_guard() {
-    case "$(cpw_get state)" in
+    # state and pid with builtins (the keeper runs this every 3 s for the whole drive)
+    _gst=""; _gp=""
+    if [ -f $CPW_ST ]; then
+        while IFS='=' read -r _ck _cv; do
+            case "$_ck" in
+                state) _gst=$_cv ;;
+                pid) _gp=$_cv ;;
+            esac
+        done < $CPW_ST
+    fi
+    case "$_gst" in
         waiting|on) ;;
         *) return 0 ;;
     esac
+    # (after 0.7.6) the usual case, with no process started: on in the app process it was found
+    # in, that process still the CarPlay app, its status not "failed". The full check below (the
+    # mount's md5, a scan of every process) would find the same and change nothing.
+    if [ "$_gst" = on ] && [ -n "$_gp" ] && [ -f $PROC/$_gp/cmdline ]; then
+        _gcl=""
+        { read -r _gcl < $PROC/$_gp/cmdline; } 2>/dev/null
+        if [ "$_gcl" = "$CP_APP" ]; then
+            _gws=""
+            if [ -f $CPW_D/status.$_gp ]; then
+                while IFS='=' read -r _wk _wv; do
+                    [ "$_wk" = state ] && _gws=$_wv
+                done < $CPW_D/status.$_gp
+            fi
+            [ "$_gws" = failed ] || return 0
+        fi
+    fi
     cpw_mounted || return 0
-    _gp=$(cpw_get pid)
     _gn=$(cp_pid)
     [ -n "$_gn" ] || return 0
     # 0.7.6: the watch's own status in this app process first. When the factory library did not
@@ -2422,8 +2623,10 @@ report_checks() {
     _m=$(md5of $EFX_T)
     if [ ! -f $EFX_T ]; then
         check NO "effects list: $EFX_T is missing"
-    elif mounted_at $EFX_T; then
+    elif mounted_at $EFX_T && ours $EFX_T $D/conf/audio_effects.conf; then
         check ok "effects list: EQ Engine's copy is laid over Android's (md5 $_m)"
+    elif mounted_at $EFX_T; then
+        check NO "effects list: another package's file is laid over Android's (md5 $_m); EQ Engine does not start while it is there"
     elif [ "$_m" = $EFX_MD5 ]; then
         check ok "effects list: the stock one EQ Engine was built for (md5 $_m), not laid over now"
     else
@@ -2435,15 +2638,17 @@ report_checks() {
     else
         if maps_has $_p libeqengine.so; then check ok "EQ Engine's filter is loaded in the audio server ($_p)"
         else check NO "EQ Engine's filter is not loaded in the audio server ($_p)"; fi
-        if dumpsys media.audio_flinger 2>/dev/null | {
-            _f=1
+        # (after 0.7.6) from the report's one dump, waited for at most 15 s (report)
+        _f=1
+        if [ -n "$RPT_AF" ]; then
             while read -r _l; do
                 case "$_l" in
                     *"name: EQ Engine"*) _f=0 ;;
                 esac
-            done
-            exit $_f
-        }; then check ok "the EQ is attached to the main output's mix (session 0)"
+            done < $S/report_af.txt
+        fi
+        if [ -z "$RPT_AF" ]; then check NO "Android's audio server did not answer its dump within 15 s: the checks that read it are left out"
+        elif [ $_f = 0 ]; then check ok "the EQ is attached to the main output's mix (session 0)"
         else check NO "the EQ is not attached to any output (the app attaches it once the filter is loaded)"; fi
         _q=$(getprop af.resampler.quality)
         if [ "$_q" = 4 ]; then
@@ -2454,7 +2659,7 @@ report_checks() {
         fi
     fi
     _drv=$HAL_T
-    mounted_at $HAL_T && _drv=$HAL_COPY
+    lab_watch_on && _drv=$HAL_COPY
     _hm=$(md5of $_drv)
     if [ "$_hm" = $HAL_MD5 ]; then check ok "audio driver: the same one as on the tested car (md5 $_hm)"
     else check ? "audio driver: md5 ${_hm:-missing}, not the tested car's; the driver watch will not start"; fi
@@ -2468,7 +2673,7 @@ report_checks() {
     else
         check NO "eqe_lab is not installed"
     fi
-    if [ -n "$_p" ]; then
+    if [ -n "$_p" ] && [ -n "$RPT_AF" ]; then
         set -- $(main_out)
         _io=$1; _tid=$2; _sr=$3
         if [ -n "$_sr" ]; then
@@ -2479,8 +2684,12 @@ report_checks() {
                 check ? "main output: io $_io at $_sr Hz; nothing was playing, so the link was not measured"
             fi
             K_IO=$_io
+            AF_F=$S/af_report.txt
             buffers_check
-            case $? in
+            _bc=$?
+            rm -f $AF_F
+            AF_F=$S/af.txt
+            case $_bc in
                 0) check ok "track buffers: all $BUF_N tracks on the main output play into its mix buffer or their own effect chain" ;;
                 1) check NO "track buffers: tracks of session(s) $STALE play into a buffer the main output no longer uses (Android 4.4 loses them at a rate change): restart Android audio (parked)" ;;
                 *) check ? "track buffers: the audio server's dump does not show them" ;;
@@ -2539,6 +2748,11 @@ report() {
         AudioResamplerSinc:V audio_hw_primary:V audio_hw_fm1288:V EQEDrv:V AudioService:V MicomAudioService:V \
         MicomAudioManager:V AudioTrack:V < /dev/null > /dev/null 2>&1 &
     _lp=$!
+    # (after 0.7.6) one dump of the audio server, waited for at most 15 s: when it does not answer
+    # (the case the report is wanted for), the parts that read its dump are left out instead of the
+    # report hanging on them
+    RPT_AF=1
+    dump_to media.audio_flinger $S/report_af.txt 15 || RPT_AF=""
     {
         echo "EQ Engine car report"
         echo
@@ -2566,8 +2780,12 @@ report() {
             set -- $(ls -l $_f)
             echo "  $(md5of $_f) $4 bytes $_f"
         done
-        mounted_at $HAL_T && echo "  (the driver watch is laid over the driver; the factory driver's copy: $(md5of $HAL_COPY))"
-        mounted_at $EFX_T && echo "  (EQ Engine's effects list is laid over Android's)"
+        lab_watch_on && echo "  (the driver watch is laid over the driver; the factory driver's copy: $(md5of $HAL_COPY))"
+        if mounted_at $EFX_T && ours $EFX_T $D/conf/audio_effects.conf; then
+            echo "  (EQ Engine's effects list is laid over Android's)"
+        elif mounted_at $EFX_T; then
+            echo "  (another package's file is laid over Android's effects list)"
+        fi
         for _f in $SYS/system/etc/audio_policy.conf $SYS/vendor/etc/audio_policy.conf; do
             [ -f $_f ] && { echo "  sample rates declared in $_f:"; policy_rates $_f; }
         done
@@ -2578,11 +2796,14 @@ report() {
         report_section "Properties (build and audio only)"
         report_props
         report_section "Apps playing through Android's audio server"
-        client_names
+        if [ -n "$RPT_AF" ]; then client_names; else echo "(the audio server did not answer its dump)"; fi
         report_section "Android's audio server"
-        dumpsys media.audio_flinger 2>&1 | safe
+        safe < $S/report_af.txt
         report_section "Android's audio policy"
-        dumpsys media.audio_policy 2>&1 | safe
+        # unfiltered (it can name Bluetooth devices): root only until safe() has read it
+        ( umask 077; dump_to media.audio_policy $S/report_dump.txt 15 )
+        safe < $S/report_dump.txt
+        rm -f $S/report_dump.txt
         report_section "EQ Engine: boot step"
         [ -f $S/status ] && cat $S/status
         echo "-- events"
@@ -2599,9 +2820,13 @@ report() {
             cat $DRV/status
             [ -f $DRV/drv.log ] && safe < $DRV/drv.log
         fi
-        if [ -f $CPW_ST ] || [ -d $CPW_D ]; then
+        if [ -f $CPW_ST ] || [ -d $CPW_D ] || [ -f $S/cpw_failed ] || [ -f $S/cpw_result.prev ]; then
             echo "-- CarPlay watch"
             cat $CPW_ST $S/cpw_result 2>/dev/null
+            # (after 0.7.6) why it turned itself off, which outlasts a car start, and what it did at
+            # the previous car start
+            [ -f $S/cpw_failed ] && { echo "-- EQ on CarPlay turned itself off (the app shows this once)"; safe < $S/cpw_failed; }
+            [ -f $S/cpw_result.prev ] && { echo "-- (the previous car start)"; safe < $S/cpw_result.prev; }
             for _f in $CPW_D/status.* $CPW_D/cpw_*.log; do
                 [ -f $_f ] && { echo "== ${_f##*/}"; safe < $_f; }
             done
@@ -2626,8 +2851,15 @@ report() {
         safe < $TMPL | squeeze
     } >> "$F.part" 2>&1
     kill $_lp 2>/dev/null
-    rm -f $TMPL
-    mv "$F.part" "$F"
+    rm -f $TMPL $S/report_af.txt
+    # (after 0.7.6) the body's own write errors went into the file that could not be written: a last
+    # line written on its own says whether the stick took it all
+    if ! echo "-- end of the report" >> "$F.part" 2>/dev/null || ! mv "$F.part" "$F" 2>/dev/null; then
+        rm -f "$F.part"
+        sync
+        echo "the report could not be written to the stick (it may be full)"
+        return 1
+    fi
     sync
     echo "EQE_REPORT ${F##*/}"
     echo "saved to $F"
@@ -2677,7 +2909,7 @@ lab_action() {
     [ -f $S/disabled ] && { echo "EQ Engine is off; turn it on first"; return 1; }
     WANT_W=$1
     HAD_W=0
-    mounted_at $HAL_T && HAD_W=1
+    lab_watch_on && HAD_W=1
     if [ $WANT_W = $HAD_W ]; then
         lab_write_active
         if [ $HAD_W = 1 ]; then echo "already on: watch"; else echo "no Lab test is on"; fi
@@ -2687,7 +2919,7 @@ lab_action() {
     # the driver watch is a file in place before the audio server starts: one restart (the 48 kHz
     # keeper switches the new audio server's output again once music plays)
     if [ $WANT_W = 0 ]; then
-        unmount_at $HAL_T || { echo "the driver watch could not be removed"; return 1; }
+        lab_unmount_all || { echo "the driver watch could not be removed"; return 1; }
     elif ! watch_on; then
         lab_write_active
         return 1
@@ -2719,8 +2951,13 @@ lab_action() {
     fi
     lab_write_active
     [ $WANT_W = 0 ] && lab_result "off: outputs $(output_rates)"
-    logcat -d -v time -s audio_hw_primary:V EQEDrv:V AudioFlinger:V AudioPolicyManagerBase:V > $S/lab_now.log 2>/dev/null
-    chmod 644 $S/lab_now.log 2>/dev/null
+    # (after 0.7.6) a system log: root only (All logs copies it as root; the app does not read it)
+    rm -f $S/lab_now.log
+    umask 077
+    : > $S/lab_now.log
+    umask 022
+    chmod 600 $S/lab_now.log 2>/dev/null
+    logcat -d -v time -s audio_hw_primary:V EQEDrv:V AudioFlinger:V AudioPolicyManagerBase:V >> $S/lab_now.log 2>/dev/null
     return 0
 }
 
@@ -2780,6 +3017,9 @@ restart_now() {
         0|3|4) setprop af.resampler.quality $1 ;;
     esac
     echo "$NOW" > $S/expected_restart
+    # AudioService's lines from here on (and what its log still holds: the last marker is M0)
+    rs_start
+    trap 'rm -rf $L; rs_stop' EXIT
     kill $P
     i=0
     while [ -d $PROC/$P ] && [ $i -lt 3 ]; do
@@ -2795,12 +3035,14 @@ restart_now() {
         sleep 1
         [ -n "$NP" ] || NP=$(ms_pid)
         [ -n "$NP" ] || continue
-        M1=$(started_marker)
-        if [ -n "$M1" ] && [ "$M1" != "$M0" ]; then
+        rs_marker
+        if [ -n "$MK" ] && [ "$MK" != "$M0" ]; then
             OK=1
             break
         fi
     done
+    rs_stop
+    trap 'rm -rf $L' EXIT
     sleep $SETTLE
     # Android 4.4 recreates each app's playing stream on the new audio server, but does not always
     # start it again (seen with Android Auto: the stream sits idle and the music is silent while
@@ -2916,6 +3158,73 @@ curve_ok() {
         x\;*) ;;
         *x*) return 1 ;;
     esac
+    # (after 0.7.6) the same shape the app reads, so a line it cannot use never replaces a slot:
+    # Easy "preamp,10 bands" (11 whole numbers); Expert "x;preamp" then up to 20 ";type:Hz:gain:width"
+    set -f
+    _cok=0
+    case "$CURVE_LINE" in
+        x\;*)
+            _cr=${CURVE_LINE#x;}
+            _cbs=""
+            case "$_cr" in
+                *\;*) _cbs=${_cr#*;} ;;
+            esac
+            curve_int "${_cr%%;*}" && curve_bands "$_cbs" && _cok=1
+            ;;
+        ,*|*,|*,,*) ;;
+        *)
+            _kifs=$IFS
+            IFS=,
+            set -- $CURVE_LINE
+            IFS=$_kifs
+            if [ $# = 11 ]; then
+                _cok=1
+                for _kv in "$@"; do
+                    curve_int "$_kv" || _cok=0
+                done
+            fi
+            ;;
+    esac
+    set +f
+    [ $_cok = 1 ]
+}
+
+# All logs: one file copied to the stick; a copy that could not be written is noted (SAVE_FAIL)
+save_cp() {
+    cat "$1" > "$2" 2>/dev/null || SAVE_FAIL=1
+}
+
+# one whole number, as the app reads them (a sign alone, an empty field or a "-" inside is not one)
+curve_int() {
+    case "$1" in
+        ''|-|*[!0-9-]*|?*-*) return 1 ;;
+    esac
+    # at most 9 digits: every one fits the app's Integer.parseInt (10 can be past 2^31 - 1)
+    _kd=${1#-}
+    [ ${#_kd} -le 9 ]
+}
+
+# an Expert line's bands after "x;preamp;": none, or up to 20 groups of 4 whole numbers (set -f is on)
+curve_bands() {
+    [ -n "$1" ] || return 0
+    case "$1" in
+        \;*|*\;|*\;\;*|:*|*:|*::*|*\;:*|*:\;*) return 1 ;;
+    esac
+    _kifs=$IFS
+    IFS=';'
+    set -- $1
+    IFS=$_kifs
+    [ $# -le 20 ] || return 1
+    for _kg in "$@"; do
+        _kifs=$IFS
+        IFS=:
+        set -- $_kg
+        IFS=$_kifs
+        [ $# = 4 ] || return 1
+        for _kv in "$@"; do
+            curve_int "$_kv" || return 1
+        done
+    done
     return 0
 }
 
@@ -2979,35 +3288,54 @@ curves_action() {
     return 0
 }
 
+# (after 0.7.6) The app's crash handler: All logs to the first stick already used for EQ Engine,
+# never to any stick that happens to be plugged in (a music stick: the logs are private). Looked
+# at here, as root and within the app's time limit for the call: the app itself cannot see the raw
+# USB mounts (/mnt/media_rw is media_rw's), and a stuck stick must not hold up the crashing app.
+if [ "$1" = crashsave ]; then
+    _ca=$2
+    shift 2
+    _cu=""
+    for _u in "$@"; do
+        if [ -d "$_u/EQENGINE" ] || [ -f "$_u/README-EQENGINE.txt" ]; then
+            _cu=$_u
+            break
+        fi
+    done
+    [ -n "$_cu" ] || { echo "no stick of EQ Engine's plugged in: nothing copied"; exit 0; }
+    set -- save "$_cu" "$_ca" 0
+fi
+
 case "$1" in
 save)
     U=$2
     A=$3
+    SAVE_FAIL=""
     [ -d "$U" ] || { echo "no USB stick at $U"; exit 1; }
     O="$U/EQENGINE/$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$O" && cd "$O" || { echo "cannot write to $O"; exit 1; }
-    [ -f "$A/eqengine.log" ] && cat "$A/eqengine.log" > app.log
-    [ -f "$A/eqengine.old.log" ] && cat "$A/eqengine.old.log" > app.old.log
+    [ -f "$A/eqengine.log" ] && save_cp "$A/eqengine.log" app.log
+    [ -f "$A/eqengine.old.log" ] && save_cp "$A/eqengine.old.log" app.old.log
     for f in $S/*; do
-        [ -f "$f" ] && cat "$f" > "state_${f##*/}.txt"
+        [ -f "$f" ] && save_cp "$f" "state_${f##*/}.txt"
     done
     for f in $D/settings/*; do
-        [ -f "$f" ] && cat "$f" > "settings_${f##*/}"
+        [ -f "$f" ] && save_cp "$f" "settings_${f##*/}"
     done
     for f in $DRV/*; do
-        [ -f "$f" ] && cat "$f" > "drv_${f##*/}.txt"
+        [ -f "$f" ] && save_cp "$f" "drv_${f##*/}.txt"
     done
     for f in $CPW_D/* $CPW_D.prev/*; do
         [ -f "$f" ] || continue
         case "$f" in
             *.bin) continue ;; # the live file (levels for the app's meter), not text
-            $CPW_D.prev/*) cat "$f" > "cpw_prev_${f##*/}.txt" ;;
-            *) cat "$f" > "cpw_${f##*/}.txt" ;;
+            $CPW_D.prev/*) save_cp "$f" "cpw_prev_${f##*/}.txt" ;;
+            *) save_cp "$f" "cpw_${f##*/}.txt" ;;
         esac
     done
     cat /data/nemesis/logs/eqengine/boot.log > boot_step.log 2>&1
     for f in /data/nemesis/logs/*.log; do
-        [ -f "$f" ] && cat "$f" > "nemesis_${f##*/}"
+        [ -f "$f" ] && save_cp "$f" "nemesis_${f##*/}"
     done
     cat /proc/mounts > mounts.txt
     cat /proc/meminfo > meminfo.txt
@@ -3028,7 +3356,7 @@ save)
         [ -d "$t" ] || continue
         mkdir -p "lab/${t##*/}"
         for f in "$t"/*; do
-            [ -f "$f" ] && cat "$f" > "lab/${t##*/}/${f##*/}"
+            [ -f "$f" ] && save_cp "$f" "lab/${t##*/}/${f##*/}"
         done
     done
     if [ "$4" = 1 ]; then
@@ -3039,7 +3367,7 @@ save)
         for f in $TOMB/tombstone_*; do
             [ -f "$f" ] || continue
             [ ! -f $REF ] || [ "$f" -nt $REF ] || continue
-            cat "$f" > "${f##*/}.txt"
+            save_cp "$f" "${f##*/}.txt"
             TN="$TN ${f##*/}"
         done
         echo "copied here (written since this install of EQ Engine):${TN:- none}" >> tombstones_list.txt
@@ -3054,11 +3382,18 @@ save)
                 cat $PROC/$_sp/$f > "dipo_$f.txt" 2>/dev/null
             done
         fi
-        /system/bin/dumpsys media.audio_flinger > audioflinger.txt 2>&1
-        /system/bin/dumpsys meminfo > meminfo_apps.txt 2>&1
+        dump_to media.audio_flinger audioflinger.txt 15
+        dump_to meminfo meminfo_apps.txt 15
         /system/bin/logcat -d -v time > logcat.txt 2>&1
         /system/bin/logcat -d -v time -b events > logcat_events.txt 2>&1
         dmesg > dmesg.txt 2>&1
+    fi
+    # (after 0.7.6) a copy that could not be written (save_cp), or a last small file that cannot be,
+    # means the stick did not take it all
+    if [ -n "$SAVE_FAIL" ] || ! echo "EQ Engine $VER: All logs saved $(date)" > saved_ok.txt 2>/dev/null; then
+        sync
+        echo "could not save everything to the stick (it may be full): $O"
+        exit 1
     fi
     sync
     echo "saved to $O"
@@ -3152,6 +3487,10 @@ trace)
     [ $N -gt 300 ] && N=300
     T=$LAB/trace_$(date +%Y%m%d_%H%M%S)
     mkdir -p $T && cd $T || { echo "cannot create $T"; exit 1; }
+    # (after 0.7.6) a trace holds the whole system log: root only from the start (All logs copies
+    # it as root; the app only lists the trace folders' names and reads alsa_summary.txt)
+    chmod 700 $T
+    umask 077
     snapshot before
     logcat -v time -f $T/logcat.txt < /dev/null > /dev/null 2>&1 &
     LP=$!
@@ -3169,9 +3508,14 @@ trace)
         rm -rf "$1"
         shift
     done
-    chmod 755 $LAB $T
-    for f in $LAB/* $T/*; do
-        [ -f "$f" ] && chmod 644 "$f"
+    chmod 755 $LAB
+    [ -f $LAB/alsa_summary.txt ] && chmod 644 $LAB/alsa_summary.txt
+    for _td in $LAB/trace_*; do
+        [ -d "$_td" ] || continue
+        chmod 700 "$_td"
+        for f in "$_td"/*; do
+            [ -f "$f" ] && chmod 600 "$f"
+        done
     done
     ls -l $T
     echo "trace saved to $T"

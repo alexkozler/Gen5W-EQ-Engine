@@ -183,7 +183,7 @@ int main(void) {
 
     /* ---- parameter checks */
     int32_t ver = 0;
-    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x324);
+    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x325);
     {
         /* very high quality loader: the marker was there at the first call, so the PC build of
            libaudio-resampler.so is loaded and its status is readable */
@@ -368,7 +368,7 @@ int main(void) {
         CHECK(c->clipped > 0);
         int32_t st[EQE_STATS_COUNT];
         CHECK(get_param(h, EQE_PARAM_STATS, st, sizeof(st), &got) == 0 && got == sizeof(st));
-        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x324 && st[6] == 70 && st[16] > 0 && st[23] == 1);
+        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x325 && st[6] == 70 && st[16] > 0 && st[23] == 1);
         AELI.release_effect(h);
     }
 
@@ -505,6 +505,34 @@ int main(void) {
         }
         printf("seat delay changes on a steady tone: largest step while changing %d, steady %d\n", worst_change, worst_steady);
         CHECK(worst_change <= worst_steady + 12);
+        AELI.release_effect(h);
+    }
+
+    /* ---- 0x325: EQ off with the clip guard off and a boost on loud music: the hand-back to the
+       bit-exact path must not wrap the look-ahead's over-full-scale samples to the opposite sign */
+    {
+        int16_t dc[2 * N];
+        audio_buffer_t bd = { N, { dc } };
+        h = make(44100, dc, dc, N, 0);
+        cmd_int(h, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+        c = (eqe_ctx *)h;
+        apply(h, mk(1, 600, 0, NULL)); /* +6 dB preamp, clip guard off */
+        for (int k = 0; k < 20; k++) {
+            for (int i = 0; i < 2 * N; i++) dc[i] = 32767;
+            (*h)->process(h, &bd, &bd);
+        }
+        int was_proc = c->processing;
+        apply(h, mk(0, 600, 0, NULL)); /* EQ off */
+        int neg = 0, back = 0;
+        for (int k = 0; k < 40; k++) {
+            for (int i = 0; i < 2 * N; i++) dc[i] = 32767;
+            (*h)->process(h, &bd, &bd);
+            for (int i = 0; i < 2 * N; i++) neg += dc[i] < 0;
+            if (c->processing == 0) back = 1;
+        }
+        printf("EQ off, clip guard off, +6 dB on near-full-scale input: %d samples wrapped to the other sign (want 0), back to bit-exact: %s\n",
+               neg, back ? "yes" : "no");
+        CHECK(was_proc == 1 && back && neg == 0);
         AELI.release_effect(h);
     }
 

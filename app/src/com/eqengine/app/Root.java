@@ -16,6 +16,10 @@ final class Root {
 
     private Root() {}
 
+    /** What the screen says when NEMESIS's root channel, or EQ Engine's part on the unit, is not there. */
+    static final String CHANNEL_DOWN = "EQ Engine could not reach NEMESIS's root access, or its own files on the unit are "
+            + "missing. Install EQ Engine again (or update NEMESIS), then restart the head unit.";
+
     /** NEMESIS's root channel refuses longer commands (SU_MAX_ARG 768, including the terminator). */
     static final int MAX_COMMAND = 767;
 
@@ -36,9 +40,18 @@ final class Root {
                 if (sb.length() < 8000) sb.append(line).append('\n');
             }
             int rc = p.waitFor();
-            return sb.toString() + "(exit " + rc + ")";
+            String out = sb.toString();
+            // (after 0.7.6) the root channel itself failed: one plain line for the screen (the raw
+            // text goes to the log)
+            if (rc != 0 && (out.contains("daemon not running") || out.contains("act.sh: not found")
+                    || out.contains("act.sh: No such file") || out.contains("can't open /data/eqengine/bin/act.sh"))) {
+                EqLog.w("root channel: " + out.trim());
+                return CHANNEL_DOWN + "\n(exit " + rc + ")";
+            }
+            return out + "(exit " + rc + ")";
         } catch (Throwable t) {
-            return "could not run " + NEMESIS + ": " + t;
+            EqLog.w("could not run " + NEMESIS + ": " + t);
+            return CHANNEL_DOWN + "\n(exit 1)";
         } finally {
             if (p != null) {
                 try {

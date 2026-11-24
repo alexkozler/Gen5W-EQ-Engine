@@ -322,7 +322,7 @@ int cpa_eq(void) {
     snprintf(what, sizeof(what), "the live file: processing at 44100 Hz, 1024-frame buffers, the output peak (%d, a +6 dB tone: about 6538), the settings in use, processing time (%d ns)",
              L.blk_peak, L.avg_ns);
     CHECK(ok && L.state == CPL_PROCESSING && L.why == CPE_WHY_NONE && L.rate == 44100 && L.frames == 1024 && L.blk_seq >= 30 &&
-              L.blk_peak > 6400 && L.blk_peak < 6700 && L.ctl_seq == (int32_t)eq_seq && L.avg_ns > 0 && L.lib == 0x324,
+              L.blk_peak > 6400 && L.blk_peak < 6700 && L.ctl_seq == (int32_t)eq_seq && L.avg_ns > 0 && L.lib == 0x325,
           what);
     snprintf(what, sizeof(what), "the live view: analysed (%u), its strongest band is the one at 1 kHz (band %d, %.1f dBFS)", L.spec_seq,
              best, L.spec[best] / 100.0);
@@ -476,6 +476,48 @@ int cpa_eq(void) {
     snprintf(what, sizeof(what), "the same settings written again (a new number) are not applied again, new ones are (applies %ld, %ld, %ld)", a0, a1, a2);
     CHECK(a0 > 0 && a1 == a0 && a2 == a1 + 1, what);
     play(p, 4, 1024, 44100);
+
+    /* 13b. (after 0.7.6) the answers for Auto and Copy Easy EQ (+3 dB at 1 kHz, Easy): worked out once
+       the settings have held for 300 ms, for the control file in use */
+    usleep(500000);
+    {
+        int okl = read_live(live, &L);
+        snprintf(what, sizeof(what), "the live file has Auto's and Copy Easy EQ's answers for the settings in use (seq %d of %d, "
+                 "largest boost %d at %d Hz, rate %d, 1 kHz band %d)", L.ans_seq, L.ctl_seq, L.ans_peak[0], L.ans_peak[1],
+                 L.ans_rate, L.ans_gains[5]);
+        CHECK(okl && L.ans_seq == L.ctl_seq && L.ans_peak[0] >= 280 && L.ans_peak[0] <= 340 && L.ans_peak[1] > 500 &&
+                  L.ans_peak[1] < 2000 && L.ans_gains[5] > 200 && L.ans_rate == 44100,
+              what);
+    }
+
+    /* 14. (after 0.7.6) an update of EQ Engine deletes /data/eqengine while the CarPlay app runs the
+       watch: the live file the app reads is made again within about a second, and the notes go on in
+       a new file (the old one is renamed here, so run.sh still reads all of them) */
+    {
+        const char *sl = strrchr(live, '/');
+        char logp[512], keep[540];
+        snprintf(logp, sizeof(logp), "%.*s/cpw_%d.log", (int)(sl - live), live, (int)getpid());
+        snprintf(keep, sizeof(keep), "%s.before", logp);
+        rename(logp, keep);
+        unlink(live);
+        dummy = pcm_open(0, 1, 0, &cd);
+        pcm_close(dummy);
+        usleep(1600000);
+        play(p, 4, 1024, 44100);
+        CHECK(read_live(live, &L) && L.pid == (int32_t)getpid() && L.state == CPL_PROCESSING && L.rate == 44100,
+              "a deleted live file is made again within about a second, and shows the music being processed");
+        dummy = pcm_open(0, 1, 0, &cd);
+        pcm_close(dummy);
+        usleep(400000);
+        char buf[4096];
+        int fd = open(logp, O_RDONLY);
+        ssize_t r = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (r < 0) r = 0;
+        buf[r] = 0;
+        CHECK(strstr(buf, "the earlier notes were removed") != NULL && strstr(buf, "open s") != NULL,
+              "deleted notes: a new notes file says so, and the notes go on there");
+    }
     pcm_close(p);
     return fails;
 }

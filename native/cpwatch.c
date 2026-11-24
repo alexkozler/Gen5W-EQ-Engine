@@ -528,17 +528,24 @@ static void set_desc(const eqe_settings *s, char *b, size_t n) {
 
 /* ---- the live file (written under g_eq_lock only, so there is one writer at a time) */
 
-static void live_open(void) {
+/* the live file mapped now (its device and inode), for live_check (the settings thread only) */
+static dev_t g_live_dev;
+static ino_t g_live_ino;
+static void live_state(void);
+
+/* Makes and maps CPW_DIR/live.bin with its header filled in; NULL if it cannot be made now. */
+static cpl_live *live_map(void) {
     int fd = open(CPW_DIR "/live.bin", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return;
+    if (fd < 0) return NULL;
     fchmod(fd, 0644); /* apps run with umask 077; the EQ Engine app reads this */
-    if (ftruncate(fd, CPL_BYTES) != 0) {
+    struct stat st;
+    if (ftruncate(fd, CPL_BYTES) != 0 || fstat(fd, &st) != 0) {
         close(fd);
-        return;
+        return NULL;
     }
     void *m = mmap(NULL, CPL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (m == MAP_FAILED) return;
+    if (m == MAP_FAILED) return NULL;
     cpl_live *L = (cpl_live *)m;
     uint32_t q = __atomic_load_n(&L->seq, __ATOMIC_RELAXED) | 1u;
     __atomic_store_n(&L->seq, q, __ATOMIC_RELEASE);
@@ -552,7 +559,35 @@ static void live_open(void) {
     L->min_gain = 10000;
     __atomic_thread_fence(__ATOMIC_RELEASE);
     __atomic_store_n(&L->seq, q + 1, __ATOMIC_RELEASE);
+    g_live_dev = st.st_dev;
+    g_live_ino = st.st_ino;
+    return L;
+}
+
+/* After 0.7.6: an update of EQ Engine deletes /data/eqengine while the CarPlay app runs the layer,
+   and the app then reads a live file that is not this one. About once a second the settings thread
+   checks that CPW_DIR/live.bin is still the file mapped here, and maps a new one when it is gone or
+   replaced (the audio thread writes it only under g_eq_lock, so the swap is made under it). */
+static void live_check(void) {
+    struct stat st;
+    if (g_live != NULL && stat(CPW_DIR "/live.bin", &st) == 0 && st.st_dev == g_live_dev && st.st_ino == g_live_ino)
+        return;
+    /* not while EQ Engine is marked off: an uninstall writes that before it deletes /data/eqengine,
+       and a file made meanwhile would be left behind (an update's install takes the mark away) */
+    if (access(CPE_OFF, F_OK) == 0) return;
+    cpl_live *L = live_map();
+    if (L == NULL) return; /* (the folder is not there yet: tried again in a second) */
+    pthread_mutex_lock(&g_eq_lock);
+    cpl_live *old = g_live;
     g_live = L;
+    live_state();
+    pthread_mutex_unlock(&g_eq_lock);
+    if (old != NULL) {
+        munmap(old, CPL_BYTES);
+        note("EQ: the live file was made again (the one in %s had been removed: EQ Engine updated?)", CPW_DIR);
+    } else {
+        note("EQ: the live file was made");
+    }
 }
 
 static void live_begin(void) {
@@ -723,15 +758,48 @@ static int read_ctl(int32_t *b, size_t n) {
     return got == n && more == 0;
 }
 
+/* After 0.7.6: what the app's Auto (EQE_PARAM_PEAK) and Copy Easy EQ (EQE_PARAM_GAINS) ask Android's
+   filter, worked out here for settings s, so both also work while CarPlay's EQ is the only one the
+   app can reach (Android's filter not loaded in this start). In the settings thread, outside
+   g_eq_lock: the same code as the audio server's filter, on a scratch context (the rate and the
+   solver's matrix only). The gains are for the stream's rate, or 44.1 kHz (CarPlay's music) before
+   one opened. 0 = done. */
+static int eq_answers(const eqe_settings *s, int32_t rate, int32_t peak[3], int32_t gains[EQE_NB]) {
+    eqe_ctx *t = (eqe_ctx *)calloc(1, sizeof(eqe_ctx));
+    if (t == NULL) return -1;
+    t->rate = rate > 0 ? (double)rate : 44100.0;
+    int r = peak_query(t, s, peak);
+    for (int j = 0; j < EQE_NB; j++) gains[j] = 0;
+    if (r == 0 && s->mode == 0) {
+        t->set = *s;
+        t->design_ends = 0;
+        prepare_matrix(t);
+        double g[EQE_NB];
+        solve_gains(t, g);
+        for (int j = 0; j < EQE_NB; j++) gains[j] = (int32_t)floor(g[j] * 100.0 + 0.5);
+    }
+    free(t);
+    return r;
+}
+
 static void *eq_thread(void *arg) {
     (void)arg;
     prctl(PR_SET_NAME, (unsigned long)"eqe-cpweq", 0, 0, 0);
     pthread_once(&g_eq_once, eq_init);
-    live_open();
+    cpl_live *L0 = live_map();
     pthread_mutex_lock(&g_eq_lock);
+    g_live = L0;
     live_state();
     pthread_mutex_unlock(&g_eq_lock);
-    if (g_live == NULL) note("EQ: the live file (%s/live.bin) could not be made: the app shows no CarPlay levels", CPW_DIR);
+    if (L0 == NULL) note("EQ: the live file (%s/live.bin) could not be made: the app shows no CarPlay levels", CPW_DIR);
+    int ticks = 0;
+    eqe_settings ans_set, ans_pend;
+    int ans_have = 0, ans_dirty = 0;
+    int64_t ans_since = 0;
+    int32_t ans_pk[3] = {0, 0, 0}, ans_g[EQE_NB] = {0}, ans_rate = 0;
+    uint32_t ans_written = 0;
+    memset(&ans_set, 0, sizeof(ans_set));
+    memset(&ans_pend, 0, sizeof(ans_pend));
     int64_t last_note = 0;
     int was_ok = -1, was_on = -1, was_off = -1;
     uint32_t noted_seq = 0;
@@ -774,7 +842,43 @@ static void *eq_thread(void *arg) {
         }
         int why = eq_why();
         int procs = g_proc != NULL;
+        int32_t srate = g_proc != NULL ? (int32_t)g_proc->cfg.rate : 0;
         pthread_mutex_unlock(&g_eq_lock);
+        /* after 0.7.6: Auto's and Copy Easy EQ's answers for these settings, worked out again only when
+           what the settings say (or the stream's rate) changed, and only once they have stayed so
+           for 300 ms (not for every step of a slider being dragged); their seq follows every new
+           write while they hold */
+        int need = ok && (!ans_have || memcmp(&s, &ans_set, sizeof(s)) != 0 || (srate > 0 && srate != ans_rate));
+        if (need) {
+            if (!ans_dirty || memcmp(&s, &ans_pend, sizeof(s)) != 0) {
+                ans_pend = s;
+                ans_since = now;
+                ans_dirty = 1;
+            }
+            if (now - ans_since >= 300000000LL) {
+                int32_t rt = srate > 0 ? srate : (ans_rate > 0 ? ans_rate : 44100);
+                ans_have = eq_answers(&ans_pend, rt, ans_pk, ans_g) == 0;
+                ans_set = ans_pend;
+                ans_rate = rt;
+                ans_written = 0;
+                ans_dirty = 0;
+            }
+        } else {
+            ans_dirty = 0;
+        }
+        if (ok && ans_have && memcmp(&s, &ans_set, sizeof(s)) == 0 && (uint32_t)b[2] != ans_written) {
+            pthread_mutex_lock(&g_eq_lock);
+            if (g_live != NULL) {
+                live_begin();
+                memcpy(g_live->ans_peak, ans_pk, sizeof(g_live->ans_peak));
+                g_live->ans_rate = ans_rate;
+                memcpy(g_live->ans_gains, ans_g, sizeof(g_live->ans_gains));
+                g_live->ans_seq = b[2];
+                live_end();
+                ans_written = (uint32_t)b[2];
+            }
+            pthread_mutex_unlock(&g_eq_lock);
+        }
         /* the notes: every change of on, off or valid; settings changes at most every 2 s, and only
            when what they say changed (0.7.4: the app writes the file again every second while the
            live view is shown, with a new seq and the same settings) */
@@ -791,6 +895,12 @@ static void *eq_thread(void *arg) {
             noted_seq = ok ? (uint32_t)b[2] : 0;
             snprintf(noted_desc, sizeof(noted_desc), "%s", d);
             last_note = now;
+        }
+        if (++ticks >= 1000 / CPE_TICK_MS) {
+            ticks = 0;
+            cpl_live *was = g_live; /* (only this thread changes g_live) */
+            live_check();
+            if (g_live != was) ans_written = 0; /* a new live file gets the answers again */
         }
         sleep_ms(CPE_TICK_MS);
     }
@@ -1059,6 +1169,21 @@ static void *logger(void *arg) {
             changed = 1;
         }
         if (changed || ++quiet >= 10000 / CPW_TICK_MS) {
+            /* after 0.7.6: an update of EQ Engine deletes the notes while this app runs: from then on
+               they go to a new file (the status file is written by name anyway) */
+            struct stat lst;
+            char lpath[160];
+            snprintf(lpath, sizeof(lpath), CPW_DIR "/cpw_%d.log", (int)getpid());
+            if (g_logfd >= 0 && stat(lpath, &lst) != 0 && errno == ENOENT && access(CPE_OFF, F_OK) != 0) {
+                close(g_logfd);
+                g_logfd = -1;
+                g_logged = 0;
+                g_logfull = 0;
+                stamp(st, sizeof(st));
+                snprintf(b, sizeof(b), "%s EQ Engine CarPlay watch %d in pid %d: the earlier notes were removed (EQ Engine updated?); new notes from here",
+                         st, CPW_VERSION, (int)getpid());
+                log_write(b);
+            }
             write_status();
             quiet = 0;
         }
@@ -1455,9 +1580,54 @@ static int store_slot(void **slot, void *v) {
     return 1;
 }
 
-static int want_index(const char *n) {
-    for (int i = 0; i < NWANT; i++)
-        if (strcmp(n, k_want[i]) == 0) return i;
+/* The audio library's own readable mappings (after 0.7.6): every read of its headers, its tables
+   and its import slots is checked against them first. A library laid out unlike any seen (one that
+   another package edited on disk, for example) is then left alone with a note, instead of being
+   read where nothing is mapped, which would end the CarPlay app at its start. Neighbouring
+   mappings of the file count as one range (the linker's read-only part after relocation shows as
+   a mapping of its own). */
+#define LIBMAPS 16
+struct libmaps {
+    int n;
+    uintptr_t s[LIBMAPS], e[LIBMAPS];
+};
+
+static void lib_maps(const char *name, struct libmaps *lm) {
+    lm->n = 0;
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (f == NULL) return;
+    struct mline m;
+    while (maps_next(f, &m)) {
+        if (m.perms[0] != 'r' || !path_is(m.path, name)) continue;
+        if (lm->n > 0 && lm->e[lm->n - 1] == m.s) {
+            lm->e[lm->n - 1] = m.e;
+        } else if (lm->n < LIBMAPS) {
+            lm->s[lm->n] = m.s;
+            lm->e[lm->n] = m.e;
+            lm->n++;
+        }
+    }
+    fclose(f);
+}
+
+/* bytes from a to the end of the library's readable range that holds it; 0 if none holds it */
+static size_t lib_room(const struct libmaps *lm, uintptr_t a) {
+    for (int i = 0; i < lm->n; i++)
+        if (a >= lm->s[i] && a < lm->e[i]) return (size_t)(lm->e[i] - a);
+    return 0;
+}
+
+/* 1 when the n bytes at a are all in one readable range of the library */
+static int in_lib(const struct libmaps *lm, uintptr_t a, size_t n) {
+    return n > 0 && lib_room(lm, a) >= n;
+}
+
+/* which of the four names the symbol name at n is (reading at most room bytes); -1 if none */
+static int want_index(const char *n, size_t room) {
+    for (int i = 0; i < NWANT; i++) {
+        size_t l = strlen(k_want[i]);
+        if (room > l && memcmp(n, k_want[i], l + 1) == 0) return i;
+    }
     return -1;
 }
 
@@ -1469,9 +1639,22 @@ static void swap_imports(void) {
         note("%s is not loaded in this process: nothing is watched", CPS_TARGET);
         return;
     }
+    struct libmaps lm;
+    lib_maps(CPS_TARGET, &lm);
+    size_t room0 = lib_room(&lm, base);
+    if (room0 < sizeof(ElfW(Ehdr))) {
+        note("%s: its ELF header cannot be read where it is loaded: nothing is watched", CPS_TARGET);
+        return;
+    }
     const ElfW(Ehdr) *eh = (const ElfW(Ehdr) *)base;
     if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 || eh->e_ident[EI_CLASS] != CLASS_HERE) {
         note("%s is not mapped as an ELF file of this CPU: nothing is watched", CPS_TARGET);
+        return;
+    }
+    /* its program headers: in the first loaded range, as every library's are (after 0.7.6) */
+    if (eh->e_phentsize != sizeof(ElfW(Phdr)) || eh->e_phnum == 0 || eh->e_phoff >= room0 ||
+        (size_t)eh->e_phnum * sizeof(ElfW(Phdr)) > room0 - (size_t)eh->e_phoff) {
+        note("%s: its program headers are not where it is loaded (laid out unlike the factory file): nothing is watched", CPS_TARGET);
         return;
     }
     const ElfW(Phdr) *ph = (const ElfW(Phdr) *)(base + eh->e_phoff);
@@ -1491,7 +1674,14 @@ static void swap_imports(void) {
     uintptr_t strtab = 0, symtab = 0, jmprel = 0, rel = 0, rela = 0;
     size_t pltrelsz = 0, relsz = 0, relasz = 0;
     long pltrel = DT_REL;
-    for (const ElfW(Dyn) *d = (const ElfW(Dyn) *)(bias + dynph->p_vaddr); d->d_tag != DT_NULL; d++) {
+    const ElfW(Dyn) *dyn = (const ElfW(Dyn) *)(bias + dynph->p_vaddr);
+    size_t ndyn = (size_t)dynph->p_filesz / sizeof(ElfW(Dyn));
+    if (ndyn == 0 || !in_lib(&lm, (uintptr_t)dyn, ndyn * sizeof(ElfW(Dyn)))) {
+        note("%s: its dynamic section is not where it is loaded (laid out unlike the factory file): nothing is watched", CPS_TARGET);
+        return;
+    }
+    for (size_t k = 0; k < ndyn && dyn[k].d_tag != DT_NULL; k++) {
+        const ElfW(Dyn) *d = &dyn[k];
         switch (d->d_tag) {
         case DT_STRTAB: strtab = d->d_un.d_ptr; break;
         case DT_SYMTAB: symtab = d->d_un.d_ptr; break;
@@ -1527,6 +1717,10 @@ static void swap_imports(void) {
     int which[16], ns = 0;
     for (int t = 0; t < 3; t++) {
         if (tabs[t].at == 0 || tabs[t].size == 0) continue;
+        if (!in_lib(&lm, tabs[t].at, tabs[t].size)) {
+            note("%s: a relocation table is not where it is loaded (laid out unlike the factory file): nothing is watched", CPS_TARGET);
+            return;
+        }
         size_t ent = tabs[t].isrela ? sizeof(ElfW(Rela)) : sizeof(ElfW(Rel));
         for (size_t o = 0; o + ent <= tabs[t].size; o += ent) {
             const ElfW(Rel) *r = (const ElfW(Rel) *)(tabs[t].at + o); /* a Rela starts the same way */
@@ -1535,9 +1729,15 @@ static void swap_imports(void) {
             size_t si = (size_t)R_SYM_OF(r->r_info);
             if (si == 0) continue;
             const ElfW(Sym) *sy = (const ElfW(Sym) *)symtab + si;
-            int w = want_index((const char *)strtab + sy->st_name);
+            if (!in_lib(&lm, (uintptr_t)sy, sizeof(*sy))) continue;
+            uintptr_t nm = strtab + sy->st_name;
+            int w = want_index((const char *)nm, lib_room(&lm, nm));
             if (w < 0) continue;
             void **s = (void **)(bias + r->r_offset);
+            if (!in_lib(&lm, (uintptr_t)s, sizeof(*s))) {
+                note("%s: its %s import slot is not where it is loaded: left alone", CPS_TARGET, k_want[w]);
+                continue;
+            }
             int dup = 0;
             for (int k = 0; k < ns; k++) dup |= slot[k] == s;
             if (!dup && ns < 16) {

@@ -8,10 +8,17 @@
 #    sets it to 0711 (enter a known path; no listing, no writing) and puts 0700 back after 40 s.
 #    pm copies the apk into /data/app, so the original path isn't needed after the install.
 # 2. Saves install diagnostics to EQENGINE/ on this USB stick and records the system log for
-#    40 seconds, so the package manager's full reason is kept if pm refuses the app.
+#    40 seconds, so the package manager's full reason is kept if pm refuses the app. That log
+#    holds personal data (phone names, Bluetooth addresses, songs): after a successful install
+#    postinstall stops it and deletes it (/dev/eqengine-install-log says which), so it stays on
+#    the stick only when the install failed.
 
-APPS=/data/nemesis/apps
+# Tests (tests/install/run.sh) point the paths at a simulated unit; on the car R is empty.
+R=${EQE_TEST_ROOT:-}
+APPS=$R/data/nemesis/apps
 OPENED=""
+# (an earlier install's note, if its postinstall never ran: never acted on)
+rm -f $R/dev/eqengine-install-log
 set -- $(ls -ld "$APPS" 2>/dev/null)
 WAS="$1"
 if [ "$WAS" = "drwx------" ]; then
@@ -19,8 +26,8 @@ if [ "$WAS" = "drwx------" ]; then
 fi
 
 U=""
-for d in /mnt/media_rw/usb0 /mnt/media_rw/usb1 /mnt/media_rw/usb2 /mnt/media_rw/usb3 \
-         /storage/usb0 /storage/usb1 /storage/usb2 /storage/usb3; do
+for d in $R/mnt/media_rw/usb0 $R/mnt/media_rw/usb1 $R/mnt/media_rw/usb2 $R/mnt/media_rw/usb3 \
+         $R/storage/usb0 $R/storage/usb1 $R/storage/usb2 $R/storage/usb3; do
     if [ -f "$d/README-EQENGINE.txt" ]; then
         U="$d"
         break
@@ -33,7 +40,7 @@ if [ -n "$U" ] && mkdir -p "$U/EQENGINE" 2>/dev/null; then
     read up rest < /proc/uptime
     T="${up%%.*}"
     {
-        echo "EQ Engine 0.7.6 preinstall"
+        echo "EQ Engine 0.7.7 preinstall"
         date
         id
         echo "product=$(getprop ro.build.product) sdk=$(getprop ro.build.version.sdk) boot_completed=$(getprop sys.boot_completed)"
@@ -50,11 +57,20 @@ if [ -n "$U" ] && mkdir -p "$U/EQENGINE" 2>/dev/null; then
     } > "$O/install_${T}.txt" 2>&1 < /dev/null
     logcat -v time -f "$O/logcat_install_${T}.txt" < /dev/null > /dev/null 2>&1 &
     LP=$!
+    # for postinstall: "<pid> <file>" (in RAM, gone at the next restart)
+    echo "$LP $O/logcat_install_${T}.txt" > $R/dev/eqengine-install-log
 fi
 
 # After 40 s: stop the log capture and put the folder back the way it was.
 ( sleep 40
-  [ -n "$LP" ] && kill $LP
+  # only that logcat (postinstall may have stopped it already, and its pid used again since)
+  if [ -n "$LP" ] && [ -f /proc/$LP/cmdline ]; then
+    LC=""
+    read -r LC < /proc/$LP/cmdline
+    case "$LC" in
+      *logcat*logcat_install_${T}.txt*) kill $LP ;;
+    esac
+  fi
   [ -n "$OPENED" ] && chmod 700 "$APPS"
   sync ) < /dev/null > /dev/null 2>&1 &
 sync

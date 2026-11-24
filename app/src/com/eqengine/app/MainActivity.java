@@ -29,7 +29,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * EQ Engine 0.7.6. A navigation rail on the left (EQ, Position, Settings, Status) and the pages:
+ * EQ Engine 0.7.7. A navigation rail on the left (EQ, Position, Settings, Status) and the pages:
  * EQ (Easy: ten sliders with the response curve and the output meter; Expert: a parametric curve
  * editor with up to 20 bands and a band card; the live view in both; Flat, four user slots both
  * modes share, Curves on USB and Undo), Position (listening position),
@@ -45,7 +45,7 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements Engine.Listener, EqPanel.Listener, NavRail.Listener,
         CarView.Listener, HSlider.Listener, XPanel.Listener, WSlider.Listener {
-    static final String VERSION = "0.7.6";
+    static final String VERSION = "0.7.7";
     private static final String ACT = "sh /data/eqengine/bin/act.sh";
     private static final String STATE = BootStatus.STATE_DIR;
     private static final String LAB = "/data/eqengine/lab";
@@ -64,8 +64,19 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     private final Handler handler = new Handler();
     private Engine engine;
     private EqSettings s;
-    private volatile boolean busy;
-    private boolean restarting;
+    /*
+     * (after 0.7.6) for the whole app, not this screen: a root action or an audio restart started on a
+     * screen that was then closed (Back) still runs, and a new screen must not start a second one
+     * alongside it
+     */
+    private static volatile boolean busy;
+    private static volatile boolean restarting;
+    /* (after 0.7.6) a result that came while no screen was in front: shown when one is again (never a
+       pop-up over another app, which could cover the rear camera's picture) */
+    private static String unseenText;
+    private static int unseenKind;
+    /* (after 0.7.6) the screen in front now, if any (a result from a closed one is shown there) */
+    private static MainActivity front;
     private boolean resumed;
     private String lastOutWarn = "";
     private String convTarget;
@@ -73,6 +84,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     /** EQ on CarPlay (0.7.4): a cpwatch action running; tried to bring it in step this screen; failure shown */
     private boolean cpBusy, cpSyncTried;
     private String cpFailShown = "";
+    private String crashShown = "";
     private final TextView[] convChips = new TextView[3];
     private static final int RESTART_COOLDOWN_S = 10;
     private boolean turningOff;
@@ -155,14 +167,35 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     protected void onResume() {
         super.onResume();
         resumed = true;
+        front = this;
         engine.setListener(this);
         updatePoll();
         handler.post(uiTick);
+        String t = unseenText;
+        if (t != null) {
+            unseenText = null;
+            overlay.show(t, unseenKind);
+        }
+    }
+
+    /** An action's result: on this screen now, or (after 0.7.6) kept for when a screen is in front again. */
+    private void tell(String text, int kind) {
+        MainActivity f = front;
+        if (f != null && f.resumed && !f.isFinishing()) {
+            f.overlay.show(text, kind);
+        } else {
+            // the latest one counts, but a warning or error is not replaced by a plain "done"
+            if (unseenText == null || kind != Overlay.OK || unseenKind == Overlay.OK) {
+                unseenText = text;
+                unseenKind = kind;
+            }
+        }
     }
 
     @Override
     protected void onPause() {
         resumed = false;
+        if (front == this) front = null;
         engine.setListener(null);
         handler.removeCallbacks(uiTick);
         // the live view is off again whenever the screen is left
@@ -349,7 +382,8 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
 
     /** Live view on or off (EQ page). Off by default, and off again whenever the screen is left. */
     private void setLive(boolean on) {
-        if (on && !engine.attached()) {
+        // (after 0.7.6) CarPlay's EQ shows its own live view: Android's filter is not needed for it
+        if (on && !engine.attached() && !CarPlayEq.present()) {
             swLive.setOn(false, true);
             overlay.show("The live view needs the EQ connected to the music (Status shows why it is not).", Overlay.WARN);
             return;
@@ -377,6 +411,10 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     private int[] largestBoost(EqSettings x) {
         int[] q = engine.peakFor(x);
         if (q != null) return new int[] {Math.max(0, q[0]), q[1]};
+        // (after 0.7.6) Android's filter cannot answer (not loaded in this start, an older one): the
+        // CarPlay watch works the same answer out for the settings in use
+        int[] a = CarPlayEq.answers(x);
+        if (a != null) return new int[] {Math.max(0, a[0]), a[1]};
         int peak = 0;
         if (x.expert) {
             // Expert without the filter's answer: the bands' own curves, drawn from the same formulas
@@ -581,7 +619,18 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     private void startExpert(boolean copy) {
         beginEdit();
         int[] clamped = {0};
-        s.xb = copy ? EqSettings.fromEasy(s, engine.gains(), clamped) : new ArrayList<int[]>();
+        // the solved gains from Android's filter, else (after 0.7.6) from the CarPlay watch, which has
+        // the same solver; without either the sliders are copied as they are (close, not the same)
+        int[] gains = copy ? engine.gains() : null;
+        if (copy && gains == null) {
+            int[] a = CarPlayEq.answers(s);
+            if (a != null) {
+                gains = new int[EqSettings.NB];
+                System.arraycopy(a, 3, gains, 0, EqSettings.NB);
+            }
+        }
+        final boolean same = gains != null;
+        s.xb = copy ? EqSettings.fromEasy(s, gains, clamped) : new ArrayList<int[]>();
         s.xSel = 0;
         s.expert = true;
         s.expertSeen = true;
@@ -597,8 +646,10 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
             overlay.show(clamped[0] + (clamped[0] == 1 ? " band" : " bands") + " of the Easy EQ went past 15 dB and "
                     + (clamped[0] == 1 ? "was" : "were") + " set to 15 dB, the most a band takes here.", Overlay.WARN);
         } else {
-            overlay.show(copy ? "Expert mode: your Easy EQ as 10 bands, with the same sound." : "Expert mode: add bands with + Add band.",
-                    Overlay.INFO);
+            overlay.show(!copy ? "Expert mode: add bands with + Add band."
+                    : same ? "Expert mode: your Easy EQ as 10 bands, with the same sound."
+                    : "Expert mode: your Easy EQ's sliders as 10 bands. The EQ was not reachable to copy its exact curve, "
+                            + "so it can sound a little different; check it on the graph.", Overlay.INFO);
         }
     }
 
@@ -867,7 +918,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                     l = l.trim();
                     if (l.startsWith("EQE_CURVES ")) msg = l.substring(11);
                 }
-                overlay.show(msg != null ? msg : what.equals("save") ? "Curves saved to the stick." : "Curves loaded from the stick.",
+                tell(msg != null ? msg : what.equals("save") ? "Curves saved to the stick." : "Curves loaded from the stick.",
                         Overlay.OK);
                 refresh();
             }
@@ -1265,8 +1316,8 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                 ? "Android's high-quality converter with its own tables: the treble is 3 dB down at about 16 kHz and 17 dB "
                         + "down at 20 kHz."
                 : "Android's default converter, the one the car uses without EQ Engine (lower quality), for comparisons.";
-        body += " With 48 kHz output on, Android Auto's music is not converted at all; this converter handles voice prompts, "
-                + "Bluetooth audio and anything else not at 48 kHz. The choice stays for later car starts. If Android's audio "
+        body += " With 48 kHz output on, Android Auto's music is not converted at all; this converter handles Bluetooth "
+                + "audio and anything else at 44.1 kHz (voice prompts always get Android's simple converter). The choice stays for later car starts. If Android's audio "
                 + "restarts unexpectedly, EQ Engine steps it down one level (very high, high, stock). Restarting gives a few "
                 + "seconds of silence: parked only.";
         overlay.confirm("Switch to " + convName(q) + "?", body, "Later", new Runnable() {
@@ -1507,7 +1558,10 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         syncCpwViews();
         new Thread(new Runnable() {
             public void run() {
-                final String out = Root.run(ACT + " cpwatch " + (on ? 1 : 0));
+                // (after 0.7.6) a quiet "bring it in step" that is refused writes state/cpw_failed, so
+                // the one-time notice says why the switch went off, as every other way it turns
+                // itself off does
+                final String out = Root.run((!loud && on ? "EQE_CPW_NOTIFY=1 " : "") + ACT + " cpwatch " + (on ? 1 : 0));
                 handler.post(new Runnable() {
                     public void run() {
                         cpBusy = false;
@@ -1520,6 +1574,14 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     }
 
     private void cpwDone(boolean on, boolean loud, String out) {
+        // (after 0.7.6) a screen closed meanwhile: the one in front applies it to its own settings, or,
+        // with none in front, this one starts from the engine's settings (not its own old copy)
+        MainActivity f = front;
+        if (f != null && f != this) {
+            f.cpwDone(on, loud, out);
+            return;
+        }
+        if (f == null) s = engine.settings().copy();
         String res = null;
         boolean wait = false;
         for (String l : out.split("\n")) {
@@ -1534,7 +1596,13 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
             if (loud) overlay.show("EQ on CarPlay is already being changed. Try again in a minute.", Overlay.WARN);
             return;
         }
-        if (res == null) res = on ? "refused: " + lastLine(out) : "off";
+        if (res == null) {
+            // (after 0.7.6) act.sh gave no answer (the root channel down, act.sh missing): nothing is
+            // known to have changed, so the switch stays as it is
+            EqLog.w("EQ on CarPlay: no answer: " + lastLine(out));
+            if (loud) tell("EQ on CarPlay could not be changed: " + lastLine(out), Overlay.ERROR);
+            return;
+        }
         if (on && res.startsWith("refused")) {
             String why = res.substring(Math.min(res.length(), 9));
             if (why.startsWith("this unit has no ")) {
@@ -1558,6 +1626,36 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         else overlay.show(res.startsWith("off from the next car start")
                 ? "EQ on CarPlay is off: CarPlay is flat now, and EQ Engine leaves the CarPlay app at the next car start."
                 : "EQ on CarPlay is off.", Overlay.OK);
+    }
+
+    /**
+     * (after 0.7.6) The boot step turned EQ Engine off because Android's audio server kept restarting
+     * (state "crashed"): said once for that car start, with Save logs. (Before, the engine's own state
+     * text was checked, which the service's stop overwrote at once, so this was never shown.)
+     */
+    private void crashCheck(BootStatus bs) {
+        // the start that crashed ("crashed"), or a later one where it is still off for that reason
+        boolean kr = "crashed".equals(bs.state())
+                || "off".equals(bs.state()) && bs.get("reason").contains("audio server kept restarting");
+        if (!kr || "kr".equals(s.crashAck) || "kr".equals(crashShown)) return;
+        // once until EQ Engine is turned back on (setMaster clears it), then again at a new crash
+        crashShown = "kr";
+        s.crashAck = "kr";
+        applyAll("told: EQ Engine turned itself off (Android's audio server kept restarting)", true);
+        overlay.confirm("EQ Engine turned itself off",
+                "Android's audio server kept restarting during this start, so EQ Engine took itself out: the sound is stock "
+                        + "now, and it stays off until you turn it back on (Settings). Please save the logs to a USB stick "
+                        + "(Diagnostics, All logs) and send them so this can be fixed. They hold your phone's name, Bluetooth "
+                        + "addresses and song titles, so share them privately.",
+                "Settings", new Runnable() {
+                    public void run() {
+                        showPage(NavRail.SETTINGS);
+                    }
+                }, "Save logs", new Runnable() {
+                    public void run() {
+                        saveLogs();
+                    }
+                });
     }
 
     /**
@@ -1689,8 +1787,8 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         String t;
         if (warn || o.other()) t = ol;
         else if (o.at48()) t = (o.fps.length() > 0 ? "Measured " + o.fps + " frames/s" : "48 kHz; measured when music plays")
-                + ". CarPlay keeps its own 44.1 kHz";
-        else t = "For Android Auto and Bluetooth. CarPlay keeps its 44.1 kHz";
+                + ". CarPlay keeps its own rate";
+        else t = "For Android Auto and Bluetooth. CarPlay keeps its own rate";
         setText(rate48Sub, t);
         rate48Sub.setTextColor(warn ? Ui.WARN : Ui.ON_SURFACE_VAR);
     }
@@ -1771,16 +1869,16 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                 if (!stuck.isEmpty()) {
                     String who = TextUtils.join(", ", stuck);
                     EqLog.w("after the audio restart, these streams did not play again: " + who);
-                    overlay.show(who + " did not resume after the audio restart (an Android 4.4 issue). Try pause and play, or "
+                    tell(who + " did not resume after the audio restart (an Android 4.4 issue). Try pause and play, or "
                             + "switch to Radio and back; if it stays silent, reconnect the phone.", Overlay.WARN);
                 } else if (ok && "missed".equals(vhq)) {
-                    overlay.show("Android set up its converter before EQ Engine's tables loaded, so it still uses high quality's tables. "
+                    tell("Android set up its converter before EQ Engine's tables loaded, so it still uses high quality's tables. "
                             + "Another audio restart (parked) may catch it.", Overlay.WARN);
                 } else if (ok && "not-loaded".equals(vhq)) {
-                    overlay.show("EQ Engine's tables did not load into Android's audio server, so it uses high quality's tables. "
+                    tell("EQ Engine's tables did not load into Android's audio server, so it uses high quality's tables. "
                             + "Saved logs would show why.", Overlay.WARN);
                 } else if (ok && okText != null) {
-                    overlay.show(okText, Overlay.OK);
+                    tell(okText, Overlay.OK);
                 }
                 if (ok) EqLog.i("audio restart: " + messageLine(out));
                 refresh();
@@ -1811,7 +1909,20 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         restartAudio(null, "Android audio restarted. The EQ reconnects by itself.");
     }
 
+    /**
+     * (after 0.7.6) Another root action or an audio restart is running: EQ Engine's switch is put back
+     * and nothing is stopped. (Turning it off used to stop the EQ first; act.sh off was then refused,
+     * so EQ Engine stayed on for later starts while the switch came back on by itself.)
+     */
+    private boolean masterRefused(boolean on) {
+        if (!busy && !restarting) return false;
+        swMaster.setOn(!on, true);
+        overlay.show("Still working on the last action. Try again when it has finished.", Overlay.WARN);
+        return true;
+    }
+
     private void askMaster(final boolean on) {
+        if (masterRefused(on)) return;
         if (on) {
             setMaster(true);
             return;
@@ -1826,11 +1937,22 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     }
 
     private void setMaster(boolean on) {
+        // (an action may have started while the question was open)
+        if (masterRefused(on)) return;
         swMaster.setOn(on, true);
         if (on) {
             EqLog.i("turning EQ Engine back on");
             turnedOnAt = System.currentTimeMillis();
             onOfferedAt = 0;
+            // (after 0.7.6) EQ Engine off took EQ on CarPlay's preparation away: bring it in step
+            // again on this screen (cpReconcile waits until "on" has finished)
+            cpSyncTried = false;
+            // (after 0.7.6) a later "kept restarting" is told again
+            if (s.crashAck.length() > 0) {
+                s.crashAck = "";
+                saveNow();
+            }
+            crashShown = "";
             rootAsync(ACT + " on", "EQ Engine is on. It loads at every start.", null);
         } else {
             EqLog.i("turning EQ Engine off");
@@ -1859,7 +1981,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                 handler.post(new Runnable() {
                     public void run() {
                         traceEndsAt = 0;
-                        overlay.show(out.contains("EQE_OK") ? "Audio trace saved. Save to USB > All logs copies it to the stick."
+                        tell(out.contains("EQE_OK") ? "Audio trace saved. Save to USB > All logs copies it to the stick."
                                 : "The audio trace failed: " + lastLine(out), out.contains("EQE_OK") ? Overlay.OK : Overlay.ERROR);
                         refresh();
                     }
@@ -1940,9 +2062,9 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                         busy = false;
                         turningOff = false;
                         boolean ok = out.contains("EQE_OK");
-                        if (out.contains("EQE_WAIT")) overlay.show(lastLine(out), Overlay.WARN);
-                        else if (ok && okText != null) overlay.show(okText, Overlay.OK);
-                        else if (!ok) overlay.show((openedName != null ? "Couldn't open " + openedName + ": " : "That didn't work: ")
+                        if (out.contains("EQE_WAIT")) tell(lastLine(out), Overlay.WARN);
+                        else if (ok && okText != null) tell(okText, Overlay.OK);
+                        else if (!ok) tell((openedName != null ? "Couldn't open " + openedName + ": " : "That didn't work: ")
                                 + lastLine(out), Overlay.ERROR);
                         if (after != null) after.done(ok, out);
                         refresh();
@@ -2025,7 +2147,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                     l = l.trim();
                     if (l.startsWith("EQE_REPORT ")) name = l.substring(11);
                 }
-                overlay.show("Car report saved to the stick: EQENGINE/" + (name != null ? name : "report_...txt"), Overlay.OK);
+                tell("Car report saved to the stick: EQENGINE/" + (name != null ? name : "report_...txt"), Overlay.OK);
             }
         });
     }
@@ -2054,11 +2176,24 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
             public void uncaughtException(Thread th, Throwable ex) {
                 try {
-                    EqLog.e("CRASH in thread " + th.getName(), ex);
-                    EqLog.flush(1500);
+                    if (Bg.isIoThread(th)) {
+                        // (after 0.7.6) the background thread itself: nothing posted to it runs any more
+                        EqLog.eNow("CRASH in thread " + th.getName(), ex);
+                    } else {
+                        EqLog.e("CRASH in thread " + th.getName(), ex);
+                        EqLog.flush(1500);
+                    }
+                    // (after 0.7.6) only to a stick already used for EQ Engine (its install stick, or
+                    // one that has EQ Engine's logs on it), never to any stick that happens to be
+                    // plugged in (a music stick): the logs are private. With none, nothing is copied;
+                    // the crash stays in the app's own log on the unit for the next All logs. act.sh
+                    // looks as root (this app cannot see the raw USB mounts), within the time limit.
                     List<String> roots = Root.usbRoots();
-                    if (!roots.isEmpty())
-                        Root.runBlocking(ACT + " save '" + roots.get(0) + "' '" + getFilesDir().getAbsolutePath() + "' 0", 8000);
+                    if (!roots.isEmpty()) {
+                        StringBuilder c = new StringBuilder(ACT + " crashsave '" + getFilesDir().getAbsolutePath() + "'");
+                        for (String r : roots) c.append(" '").append(r).append('\'');
+                        Root.runBlocking(c.toString(), 8000);
+                    }
                 } catch (Throwable ignored) {
                 }
                 if (previous != null) previous.uncaughtException(th, ex);
@@ -2126,10 +2261,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         else if (!attached && !est.equals(lastEngineState) && (notListed && !n.lateList && !onRecently || est.startsWith("attaching failed")
                 || est.startsWith("the stage 1") || est.startsWith("unexpected")))
             overlay.show(est, Overlay.WARN);
-        if (!est.equals(lastEngineState) && est.startsWith("EQ Engine is off (crashed")) {
-            overlay.show("EQ Engine turned itself off because Android's audio server kept restarting. Save logs and send them.",
-                    Overlay.ERROR);
-        }
+        crashCheck(bs);
         wasAttached = attached;
         lastEngineState = est;
         OutState os = n.out;
@@ -2191,7 +2323,12 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
             tile(2, "CarPlay, " + rateName(CarPlayEq.rate(cpv)), "Through EQ Engine in the CarPlay app,\nunconverted");
         } else if (o.other()) {
             boolean cp = "CarPlay".equals(ownerName(o.owner));
-            tile(2, cp ? "CarPlay, 44.1 kHz" : ownerName(o.owner) + " has the link",
+            int lr = 0;
+            try {
+                lr = Integer.parseInt(o.linkRate);
+            } catch (NumberFormatException ignored) {
+            }
+            tile(2, cp ? (lr > 0 ? "CarPlay, " + rateName(lr) : "CarPlay has the link") : ownerName(o.owner) + " has the link",
                     !cp ? "It plays to the speakers itself,\nso EQ Engine can't process it"
                             : !s.cpEq ? "Without EQ Engine:\nEQ on CarPlay is off (Settings)"
                             : "on".equals(snap.cpw.state) ? "Without EQ Engine for now"

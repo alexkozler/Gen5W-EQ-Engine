@@ -28,23 +28,24 @@ It is a plain NEMESIS package. It is **not** an HMG-API mod and does not need HM
 alongside it, including HMG-API's wireless CarPlay and Android Auto package
 ([how](#eq-on-carplay-and-other-add-ons)).
 
-**Current version: 0.7.6**: 0.7.4, tested on the Ioniq 5 below, plus fixes from code reviews (0.7.5
-and 0.7.6); 0.7.6 itself is tested on the Genesis G70 below. What changed:
-[CHANGELOG.md](CHANGELOG.md).
+**Current version: 0.7.7**, tested on the Ioniq 5 below: 0.7.6 plus the fixes from a full code
+review of EQ Engine and of how it works with NEMESIS, HMG-API and their wireless packages, and
+NEMESIS 1.17's package icon. What changed: [CHANGELOG.md](CHANGELOG.md).
 
 ## Verified vehicles
 
 | Car | Region | Audio system | Head unit software | Tested with |
 |---|---|---|---|---|
-| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 | 0.7.4: Android Auto, CarPlay (wired and wireless) |
+| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 | 0.7.7: Android Auto, CarPlay (wired and wireless) |
 | 2024 Hyundai Ioniq 6 Preferred AWD | Canada | Bose | 260903 | 0.6.6: Android Auto |
 | 2025 Hyundai Ioniq 6 Limited | USA | Bose | 260903 | 0.6.6: Android Auto |
 | 2022 Genesis G70 3.3T Sport AWD | Canada | Lexicon | 260903 | 0.7.6: Android Auto, CarPlay (wired and wireless) |
 
 No other car or software version has been tested, including Kia cars and other Genesis models with
 the same head unit. Other cars may have a different amplifier, audio driver, audio settings or
-CarPlay software. The package is marked for US Ioniq 5 software (`os="NEEV.USA.*"`); on other
-software NEMESIS shows it as a partial match. If you try it on another car, please send a
+CarPlay software. The package is marked for the software of the cars above
+(`os="NEEV.USA.*,CEEV.USA.*,CEEV.CAN.*,IKFL.CAN.*"`); on other software NEMESIS shows it as a
+partial match. If you try it on another car, please send a
 [car report](#reporting-a-problem).
 
 ## What it does
@@ -239,9 +240,11 @@ to run inside that app.
   heard within a fraction of a second. Its levels and live view come back the same way.
 - Before it is used, at the install and again after a factory software update, EQ Engine checks it
   in a separate process: that it finds TinyALSA, and that the car's file is the library it expects.
-- EQ Engine **never restarts the CarPlay app**: turning it on or off takes effect at the next car
-  start. Restarting that app while a phone is connected loses the session (seen on the test car
-  with test builds), so it is never done.
+- EQ Engine **does not restart the CarPlay app** to turn EQ on CarPlay on or off: that takes effect
+  at the next car start. Restarting that app while a phone is connected loses the session (seen on
+  the test car with test builds). The one exception: if EQ Engine's layer could not load, CarPlay
+  cannot work in that run of the app anyway, so EQ Engine takes the layer off and restarts the app
+  once, and only when it finds no phone connected; otherwise it asks you to restart the car.
 - If the CarPlay app restarts twice within two minutes with it, or the library cannot load, EQ
   Engine takes it off (from the CarPlay app's next start), turns the switch off and tells you.
 
@@ -385,7 +388,9 @@ With the EQ off, CarPlay's music is passed through untouched too.
   [README](https://github.com/xwtk/hmg_nemesis#readme) covers that. EQ Engine needs nothing else.
 - Get `eqengine-stick-<version>.zip` and `eqengine-rescue-stick-<version>.zip` (the same version)
   from [Releases](https://github.com/alexkozler/Gen5W-EQ-Engine/releases), or build them
-  ([Building from source](#building-from-source)).
+  ([Building from source](#building-from-source)). For installing by hand from a USB stick, always
+  use the **-stick** zip. The release's plain `eqengine-<version>.zip` is the bare package, for the
+  NEMESIS Package Store: put on a stick by itself, it does nothing.
 - Use one or two blank USB sticks formatted exFAT or FAT32.
 - **Other audio add-ons:** EQ Engine never undoes another package's changes. If a package or mod
   has changed Android's audio effects list (`/system/etc/audio_effects.conf`, or added
@@ -406,7 +411,9 @@ With the EQ off, CarPlay's music is passed through untouched too.
    stick. `NEMESIS.data`, `README-EQENGINE.txt`, `packages/` and `EQENGINE-source/` must be at the
    root of the stick, not inside a folder.
 3. With the car on and Android running, plug the install stick into the head unit's USB port.
-4. Confirm the install when NEMESIS asks. Wait for "Operation completed successfully".
+4. Confirm the install when NEMESIS asks, and leave the stick in until it has finished (the
+   install writes its notes there). NEMESIS 1.16 then says "Operation completed successfully";
+   from NEMESIS 1.17, Package Manager opens and lists EQ Engine under Installed.
 5. Remove the stick and **restart the head unit**: turn the car off and on again (or use the head
    unit's reset pinhole). Android's audio server loads EQ Engine's filter when it starts, and EQ on
    CarPlay is laid over the CarPlay app before that app starts.
@@ -423,27 +430,37 @@ If NEMESIS Manager shows "Warning: Activity not started, its current task has be
 front", EQ Engine was already running: that is the output of Android's `am start` command, and EQ
 Engine opens normally.
 
-The install also writes a diagnostic report and a 40-second system log to an `EQENGINE/` folder
-on the install stick. That log can contain personal data ([Reporting a problem](#reporting-a-problem)).
+The install also writes a diagnostic report to an `EQENGINE/` folder on the install stick. It
+records a system log during the install too, so that a failed install keeps the package manager's
+reason; when the install works, that log is deleted again. A log left there after a failed install
+can contain personal data ([Reporting a problem](#reporting-a-problem)).
 
 ## Updating
 
 Install the new version the same way, over the old one. NEMESIS asks "Updating EQ Engine requires
-reinstalling": answer Yes, wait for "Operation completed successfully", then **restart the head
-unit** (turn the car off and on again).
+reinstalling": answer Yes, wait until it has finished ("Operation completed successfully" with
+NEMESIS 1.16; with 1.17, EQ Engine listed under Installed in Package Manager), then **restart the
+head unit** (turn the car off and on again).
 
-- Your EQ settings and User presets are kept. Detailed logging is switched off by every update.
-  An EQ loaded from one of 0.6.6's built-in presets stays as it is (shown as Custom).
-- Until the restart, Android's audio server still has the old filter loaded. The EQ keeps working;
-  features that need the new filter (from 0.6.6: Expert mode) say so and work after the restart.
-  EQ on CarPlay starts at that restart too.
-- An update must be signed with the same key as the installed app. A build signed with another key
-  will not install over it; uninstall first.
+- Your EQ settings and User presets are kept. When the version you update from is this one or
+  later, they are kept even if the power goes off during the update. Detailed logging is switched
+  off by every update. An EQ loaded from one of 0.6.6's built-in presets stays as it is (shown as
+  Custom).
+- During the install the EQ drops out for a few seconds (NEMESIS reinstalls the app), then comes
+  back. Until the restart, Android's audio server still has the old filter loaded: 48 kHz output
+  carries on, and features that need the new filter (from 0.6.6: Expert mode) wait for the
+  restart. If EQ on CarPlay was already running, the CarPlay app keeps the old version's layer,
+  with your EQ, until then; otherwise EQ on CarPlay starts at that restart.
+- NEMESIS removes and reinstalls the app at every update, so a build signed with another key
+  installs too. (The same key matters only for a direct `pm install -r`; see
+  [Building from source](#building-from-source).)
 
-After a **head unit software update**, EQ Engine checks Android's effects list at every start. If
-the update changed that file, EQ Engine does not apply itself, the audio stays stock, and the
-Status page says why. If the update changed the factory CarPlay app's library, EQ on CarPlay checks
-the new one before using it.
+A **head unit software update** (USB or over the air) normally removes NEMESIS itself, and with it
+EQ Engine's start-up step. Reinstall NEMESIS (see its
+[README](https://github.com/xwtk/hmg_nemesis#readme)), and EQ Engine if NEMESIS does not bring it
+back. At the next start EQ Engine checks Android's effects list: if the update changed that file,
+EQ Engine does not apply itself, the audio stays stock, and the Status page says why. If the update
+changed the factory CarPlay app's library, EQ on CarPlay checks the new one before using it.
 
 ## Turning it off and uninstalling
 
@@ -479,9 +496,9 @@ stick. EQ Engine stays off until you turn it back on in the app, or uninstall it
 - **Crash watch:** unexpected audio server restarts, twice within 60 s or three times in one start,
   turn EQ Engine off. A restart of Android's whole framework (which restarts the audio server with
   it) is told apart and logged.
-- **CarPlay guard:** EQ on CarPlay is checked before use, never restarts the CarPlay app, and turns
-  itself off (with a message in the app) if it cannot load or the app restarts twice within two
-  minutes with it.
+- **CarPlay guard:** EQ on CarPlay is checked before use and turns itself off (with a message in the
+  app) if it cannot load or the app restarts twice within two minutes with it. It restarts the
+  CarPlay app only after a failed load, and only with no phone connected.
 - **Audio restarts** happen only when you ask, one at a time and at least 10 s apart, each followed
   by a check that Android Auto's music plays again.
 - **Ways back:** Settings > EQ Engine off, Settings > EQ on CarPlay off, uninstall, the rescue
@@ -534,12 +551,17 @@ The checksum is Google's published SHA-1 for that file. Run the tests below the 
   `EQE_NEW_KEY=1` makes a new one, but an app signed with a new key cannot update one signed with
   another.
 
-`EQE_TOOLS` and `EQE_CAR` can point to `devtools/` and `car-files/` elsewhere. The stick zips are
-named with the version from `pkg/NEMESIS.data`; the build stops if any other file says otherwise.
+`EQE_TOOLS` and `EQE_CAR` can point to `devtools/` and `car-files/` elsewhere. The zips are named
+with the version from `pkg/NEMESIS.data`; the build stops if any other file says otherwise. Besides
+the two stick zips it writes `eqengine-<version>.zip`, the package on its own (the file for the
+NEMESIS Package Store, the same bytes as `packages/eqengine.zip` on the install stick). The zips
+are reproducible: every file gets one fixed time (`SOURCE_DATE_EPOCH`, or 2020-01-01 UTC), its mode
+is set by the build and the files go in a sorted order, so the same source always gives the same
+package.
 
 ```sh
-sh build.sh                                   # native code, app, package and the stick zips
-for s in dash bash mksh; do bash tests/boot/run.sh $s; bash tests/act/run.sh $s; done
+sh build.sh                                   # native code, app, package and the zips
+for s in dash bash mksh; do bash tests/boot/run.sh $s; bash tests/act/run.sh $s; bash tests/install/run.sh $s; done
 bash vhq/host/run.sh 40 9                     # converter tables against Android's converter code, and Android's stock linear converter
 gcc -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I tests -I native \
     -o tests/host_test tests/host_test.c -lm -ldl -lpthread && ./tests/host_test   # after vhq/host
@@ -567,12 +589,12 @@ bash and mksh, with printf missing as on the car.
 | `native/eqe_lab.c` | root helper: the links' real rate, Android's run-time settings, symbol tables for the report, EQ on CarPlay's check before use |
 | `native/drvwatch.c`, `native/gen_tramp.py` | a driver watch for troubleshooting (not in the app's screens since 0.7.5) |
 | `native/aosp44/`, `third_party/aosp-af/` | Android 4.4.2 headers and audio code, for building and testing |
-| `pkg/` | the NEMESIS package: `NEMESIS.data`, the boot step (`bin/boot.sh`), the app's root actions and the 48 kHz keeper (`bin/act.sh`), install scripts, and the effects list overlay |
+| `pkg/` | the NEMESIS package: `NEMESIS.data`, its icon (`favicon.png`), the boot step (`bin/boot.sh`), the app's root actions and the 48 kHz keeper (`bin/act.sh`), install scripts, and the effects list overlay |
 | `app/` | the Android app (Java, no Gradle), and `Hold.java`, the 48 kHz switch's helper |
 | `rescue/` | the rescue stick |
 | `stick/README-EQENGINE.txt` | the README that goes on the install stick |
-| `tests/`, `native/cpwtest/`, `native/drvtest/` | boot step, actions, filter, EQ on CarPlay, effects-list parsing and package metadata tests |
-| `tools/` | the signing helper, a mockup renderer for the app's pages, and the Docker build environment |
+| `tests/`, `native/cpwtest/`, `native/drvtest/` | boot step, actions, install and uninstall scripts, filter, EQ on CarPlay, effects-list parsing and package metadata tests |
+| `tools/` | the signing helper, the package icon's generator (`tools/icon/`), a mockup renderer for the app's pages, and the Docker build environment |
 | `images/` | screenshots for this README |
 
 ## License and credits

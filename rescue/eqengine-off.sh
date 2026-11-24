@@ -8,9 +8,16 @@
 # keeper once it has put 44.1 kHz back (and its helper). Nothing else.
 # Results go to EQENGINE-RESCUE/ on this stick.
 
+# Tests (tests/install/run.sh) point the paths at a simulated unit; on the car R is empty.
+R=${EQE_TEST_ROOT:-}
+PROC=/proc
+if [ -n "$R" ]; then
+    PROC=$R/proc
+    kill() { "$R/stubs/kill" "$@"; }
+fi
 U="$PWD"
-D=/data/eqengine
-TARGET=/system/etc/audio_effects.conf
+D=$R/data/eqengine
+TARGET=$R/system/etc/audio_effects.conf
 read up rest < /proc/uptime
 T="${up%%.*}"
 OUT="$U/EQENGINE-RESCUE"
@@ -19,7 +26,14 @@ mkdir -p "$OUT"
 mounted() {
     while read _d _m _rest; do
         [ "$_m" = "$TARGET" ] && return 0
-    done < /proc/mounts
+    done < $PROC/mounts
+    return 1
+}
+
+mounted_at() {
+    while read _d _m _rest; do
+        [ "$_m" = "$1" ] && return 0
+    done < $PROC/mounts
     return 1
 }
 
@@ -29,6 +43,16 @@ ours() {
     [ -f "$2" ] || return 1
     set -- $(md5 "$1" 2>/dev/null) $(md5 "$2" 2>/dev/null)
     [ -n "$1" ] && [ "$1" = "$3" ]
+}
+
+# 0 = the 48 kHz keeper says another process (the factory CarPlay app) plays to the main link
+# itself (state/output: state=other); it then changes nothing and does not stop by itself
+keep_other() {
+    [ -f $D/state/output ] || return 1
+    while IFS='=' read -r _ok _ov; do
+        [ "$_ok" = state ] && [ "$_ov" = other ] && return 0
+    done < $D/state/output
+    return 1
 }
 
 {
@@ -42,7 +66,7 @@ ours() {
     else
         echo "EQ Engine is not installed here ($D does not exist)"
     fi
-    /system/xbin/nemesis service stop eqengine/boot 2>&1
+    $R/system/xbin/nemesis service stop eqengine/boot 2>&1
     setprop af.resampler.quality 0
     echo "converter setting: Android's default"
     i=0
@@ -58,27 +82,26 @@ ours() {
     else
         echo "overlay removed (or was not there)"
     fi
-    # Lab tests (the driver watch, 0.6.0's 48 kHz policy copy, or the CarPlay watch laid over the
-    # CarPlay app's JNI library), if one was on
-    for t in /system/lib/hw/audio.primary.tcc803x.so /system/etc/audio_policy.conf /system/lib/libCarPlayAndroid.so; do
+    # EQ on CarPlay's layer over the CarPlay app's JNI library, and the Lab driver watch, while the
+    # file there is EQ Engine's own (never another package's mount on the same path)
+    for t in "$R/system/lib/libCarPlayAndroid.so:eqe_cpwatch.so:EQ on CarPlay's layer" \
+             "$R/system/lib/hw/audio.primary.tcc803x.so:eqe_drvwatch.so:the Lab driver watch"; do
+        what=${t##*:}
+        t=${t%:*}
+        f=$D/lib/${t#*:}
+        t=${t%%:*}
         i=0
-        while [ $i -lt 5 ]; do
-            m=0
-            while read _d _m _rest; do
-                [ "$_m" = "$t" ] && m=1
-            done < /proc/mounts
-            [ $m = 0 ] && break
-            # 0.7.6: EQ on CarPlay's layer only while it is EQ Engine's file there (never another
-            # package's mount on that path)
-            case "$t" in
-                */libCarPlayAndroid.so) ours $t $D/lib/eqe_cpwatch.so || break ;;
-            esac
-            umount $t
-            # busy while the audio server has the file loaded: detach it instead
-            [ $i = 0 ] && [ -x $D/bin/eqe_lab ] && $D/bin/eqe_lab umount $t
+        while [ $i -lt 5 ] && mounted_at "$t" && ours "$t" "$f"; do
+            umount "$t"
+            # busy while a process has the file loaded: detach it instead
+            mounted_at "$t" && ours "$t" "$f" && [ -x $D/bin/eqe_lab ] && $D/bin/eqe_lab umount "$t"
             i=$((i + 1))
         done
-        [ $m = 1 ] && echo "Lab test $t still mounted: it goes away when the head unit restarts"
+        if mounted_at "$t" && ours "$t" "$f"; then
+            echo "$what is still laid over $t: it goes away when the head unit restarts"
+        elif mounted_at "$t"; then
+            echo "another package's file is laid over $t: left as it is"
+        fi
     done
     rm -f $D/state/lab_active
     # the CarPlay watch's choice for later car starts (0.6.10), and 0.6.7's setting for the CarPlay
@@ -90,16 +113,18 @@ ours() {
     case "$(getprop wrap.com.daudio.app.dipo)" in
         *eqe_cpwatch.so*) setprop wrap.com.daudio.app.dipo ""; echo "CarPlay watch setting cleared" ;;
     esac
-    # the 48 kHz keeper puts 44.1 kHz back and stops once it sees "disabled"; then it is stopped
+    # the 48 kHz keeper puts 44.1 kHz back and stops once it sees "disabled"; then it is stopped.
+    # (after 0.7.6) Not waited for while the factory CarPlay app plays to the main link itself
+    # (state=other): the keeper can change nothing then, and would only be stopped after 15 s.
     if [ -f $D/state/keep.pid ]; then
         read kp < $D/state/keep.pid
         i=0
-        while [ -n "$kp" ] && [ -f /proc/$kp/cmdline ] && [ $i -lt 15 ]; do
+        while [ -n "$kp" ] && [ -f $PROC/$kp/cmdline ] && [ $i -lt 15 ] && ! keep_other; do
             sleep 1
             i=$((i + 1))
         done
-        if [ -n "$kp" ] && [ -f /proc/$kp/cmdline ]; then
-            read c < /proc/$kp/cmdline
+        if [ -n "$kp" ] && [ -f $PROC/$kp/cmdline ]; then
+            read c < $PROC/$kp/cmdline
             case "$c" in
                 *act.sh*) kill $kp 2>/dev/null; echo "48 kHz keeper stopped" ;;
             esac
@@ -107,8 +132,8 @@ ours() {
     fi
     if [ -f $D/state/hold/pid ]; then
         read hp < $D/state/hold/pid
-        if [ -n "$hp" ] && [ -f /proc/$hp/cmdline ]; then
-            read c < /proc/$hp/cmdline
+        if [ -n "$hp" ] && [ -f $PROC/$hp/cmdline ]; then
+            read c < $PROC/$hp/cmdline
             case "$c" in
                 *app_process*) kill $hp 2>/dev/null; echo "48 kHz helper stopped" ;;
             esac

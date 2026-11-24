@@ -65,6 +65,13 @@ typedef struct {
     uint32_t spec_seq;          /* live view analyses so far (0: none) */
     int32_t spec_ms;            /* CLOCK_MONOTONIC ms (low 32 bits) of the newest */
     int32_t spec[CPL_NSPEC];    /* its band levels, 0.01 dBFS, as eqengine.c's spec_read */
+    /* (after 0.7.6; a watch before that leaves them 0) for the settings in use, what Android's filter
+       answers to EQE_PARAM_PEAK and EQE_PARAM_GAINS, so the app's Auto and Copy Easy EQ also work
+       while only CarPlay's EQ can be reached (Android's filter not loaded in this start) */
+    int32_t ans_seq;            /* the control file's seq they are for (follows ctl_seq); 0 = none */
+    int32_t ans_peak[3];        /* the largest boost: 0.01 dB, Hz, the rate it is at (as EQE_PARAM_PEAK) */
+    int32_t ans_rate;           /* the rate ans_gains are worked out for */
+    int32_t ans_gains[10];      /* Easy settings: the solved filter gains, 0.01 dB (EQE_PARAM_GAINS); else 0 */
 } cpl_live;
 
 #endif

@@ -8,12 +8,14 @@
 #
 # /data/eqengine/settings belongs to the EQ Engine app (its EQ settings and presets live there,
 # and the boot step reads the converter choice from it). Settings saved by the previous version's
-# uninstall step (kept in RAM under /dev, see postun.sh) are put back.
+# uninstall step (on flash during an update, else in RAM under /dev; see postun.sh) are put back.
 
 umask 022
-D=/data/eqengine
+# Tests (tests/install/run.sh) point the paths at a simulated unit; on the car R is empty.
+R=${EQE_TEST_ROOT:-}
+D=$R/data/eqengine
 SET=$D/settings
-KEEP=/dev/eqengine-keep
+KEEP=$R/dev/eqengine-keep
 mkdir -p $D/lib $D/conf $D/state $D/bin $SET
 cp bin/act.sh $D/bin/act.sh.new && mv $D/bin/act.sh.new $D/bin/act.sh
 cp bin/alsactl_dump $D/bin/alsactl_dump.new && mv $D/bin/alsactl_dump.new $D/bin/alsactl_dump
@@ -49,22 +51,24 @@ rm -f $D/state/disabled $D/state/strikes $D/state/lastboot $D/state/expected_res
 echo installed > $D/state/fresh_install
 for f in $D/state/*; do
     case "${f##*/}" in
-        crash.log|crash.prev.log) [ -f "$f" ] && chmod 600 "$f" ;;
+        crash.log|crash.prev.log|lab_now.log|restart_as.log|report_log.txt|report_dump.txt) [ -f "$f" ] && chmod 600 "$f" ;;
         *) [ -f "$f" ] && chmod 644 "$f" ;;
     esac
 done
 
 RESTORED=no
+# the copy an update made on flash (after 0.7.6), else the one in RAM
+[ -d $R/data/eqengine-keep ] && KEEP=$R/data/eqengine-keep
 if [ -d $KEEP ]; then
     for f in $KEEP/*; do
         [ -f "$f" ] && cat "$f" > "$SET/${f##*/}" && RESTORED=yes
     done
-    rm -rf $KEEP
 fi
+rm -rf $R/data/eqengine-keep $R/dev/eqengine-keep
 # Owner of the app's data folder (toolbox ls -ld: owner is the 2nd field).
 OWNER=""
-if [ -d /data/data/com.eqengine.app ]; then
-    set -- $(ls -ld /data/data/com.eqengine.app)
+if [ -d $R/data/data/com.eqengine.app ]; then
+    set -- $(ls -ld $R/data/data/com.eqengine.app)
     OWNER=$2
 fi
 if [ -n "$OWNER" ]; then
@@ -80,7 +84,7 @@ mkdir -p $D/share
 [ -n "$OWNER" ] && chown $OWNER:$OWNER $D/share
 chmod 755 $D/share
 read up rest < /proc/uptime
-echo "${up%%.*} installed EQ Engine 0.7.6 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
+echo "${up%%.*} installed EQ Engine 0.7.7 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
 chmod 644 $D/state/events.log
 # EQ on CarPlay (0.7.4) is on by default: unless the app's settings have it off, it is checked and
 # prepared now for the next car start (nothing is laid over or restarted now). If that fails, the
@@ -104,11 +108,11 @@ fi
 echo "${up%%.*} EQ on CarPlay: ${CPEQ_RES:-no answer}" >> $D/state/events.log
 
 # Note the result on the install stick, if it is still plugged in.
-for d in /mnt/media_rw/usb0 /mnt/media_rw/usb1 /mnt/media_rw/usb2 /mnt/media_rw/usb3 \
-         /storage/usb0 /storage/usb1 /storage/usb2 /storage/usb3; do
+for d in $R/mnt/media_rw/usb0 $R/mnt/media_rw/usb1 $R/mnt/media_rw/usb2 $R/mnt/media_rw/usb3 \
+         $R/storage/usb0 $R/storage/usb1 $R/storage/usb2 $R/storage/usb3; do
     if [ -f "$d/README-EQENGINE.txt" ]; then
         mkdir -p "$d/EQENGINE" && {
-            echo "EQ Engine 0.7.6 installed"
+            echo "EQ Engine 0.7.7 installed"
             echo "EQ on CarPlay: ${CPEQ_RES:-no answer}"
             date
             pm path com.eqengine.app
@@ -119,5 +123,26 @@ for d in /mnt/media_rw/usb0 /mnt/media_rw/usb1 /mnt/media_rw/usb2 /mnt/media_rw/
         break
     fi
 done
+# The install worked, so preinstall's system log (kept only for pm's reason on a failure; it holds
+# personal data) is stopped and deleted from the stick (after 0.7.6). Only that logcat is stopped:
+# its pid is checked against its command line first.
+if [ -f $R/dev/eqengine-install-log ]; then
+    read -r LP LF < $R/dev/eqengine-install-log
+    rm -f $R/dev/eqengine-install-log
+    case "$LP" in
+        ''|*[!0-9]*) LP="" ;;
+    esac
+    if [ -n "$LP" ] && [ -f /proc/$LP/cmdline ]; then
+        LC=""
+        read -r LC < /proc/$LP/cmdline
+        # only the logcat writing that very file (the shells drop the NULs between its arguments)
+        case "$LC" in
+            *logcat*"$LF"*) kill $LP 2>/dev/null ;;
+        esac
+    fi
+    case "$LF" in
+        */EQENGINE/logcat_install_*.txt) rm -f "$LF" ;;
+    esac
+fi
 sync
 exit 0

@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.7.7
+
+All the changes from 0.7.6, and fixes from a full code review of EQ Engine and of how it works with
+NEMESIS, HMG-API and their wireless packages (tested on the Ioniq 5: Android Auto, CarPlay wired
+and wireless, an update over the previous version, an uninstall and a reinstall):
+
+### Installing, updating and uninstalling
+
+- An update keeps your settings on the unit's storage while it runs, so they survive the power
+  going off in the middle of it (a plain uninstall still keeps them in memory only, until the next
+  restart). 48 kHz output carries on through an update.
+- The install's system log on the stick is deleted again when the install works; it is kept only
+  when the install fails, for the package manager's reason.
+- Uninstalling and the rescue stick no longer wait 15 s for the 48 kHz output to be put back while
+  CarPlay is playing (nothing can be changed then).
+- EQ Engine refuses to start, and says why, when another package's file is laid over Android's
+  effects list; it never takes another package's file over the audio driver for its own either.
+- The package now lists the head unit software it has been seen working on (Ioniq 5 and Ioniq 6
+  in the USA, Ioniq 6 and Genesis G70 in Canada).
+- The package has its own icon in NEMESIS Manager's Store and package lists (NEMESIS 1.17's
+  descriptor 1.2; older NEMESIS installs it as before and shows its usual icon).
+
+### EQ on CarPlay
+
+- Before it changes anything in the CarPlay app, the CarPlay layer checks that the CarPlay
+  library is laid out the way it expects in memory. If it is not, the layer leaves CarPlay
+  untouched and EQ on CarPlay stays off.
+- Auto preamp and Copy Easy EQ also work while only CarPlay is playing.
+- The CarPlay layer picks its live file and notes up again when an update replaces them.
+- A lock left by a power cut no longer blocks the EQ on CarPlay switch, and a refusal while
+  the app sets it up in the background is now shown.
+
+### EQ engine (filter 325)
+
+- With the EQ off, or a microphone open, and the clip guard off, samples over full scale are
+  clamped instead of wrapping round.
+
+### App
+
+- An action that finishes while EQ Engine's screen is closed shows its result when you come back,
+  never as a pop-up over another app.
+- The "kept restarting" notice is shown once per car start that needs it.
+- Double-tapping the Position slider centres it.
+- The converter's explanation no longer says it handles voice prompts (Android always gives
+  those its simple converter), and the 48 kHz line says CarPlay keeps its own rate (44.1 or
+  48 kHz).
+- After a crash, the app copies its logs only to a stick already used for EQ Engine, never to
+  another stick that happens to be plugged in.
+
+### Car report and logs
+
+- The report's effects-list check showed the wrong file's checksum, and its list of properties was
+  empty on the car. Both are fixed.
+- The report's 48 kHz check no longer says EQ Engine cannot process CarPlay's sound (EQ on CarPlay
+  has done that since 0.7.3); it says 48 kHz output waits while CarPlay has the speaker link.
+- The report finishes, and says so, when Android's audio server does not answer; a full stick is
+  reported instead of a cut-off file.
+- Files that can hold personal data (crash logs, the Lab's log lines, audio traces, a restart's log
+  lines, an interrupted report's raw files) are readable by root only from the moment they are
+  made.
+
+### Lighter on the head unit
+
+- The 48 kHz output check and the CarPlay check no longer start programs every second.
+- The converter's log capture stops once it has the line it needs.
+- An audio restart's wait follows one log stream instead of reading the whole system log every
+  second.
+- EQ Engine's own mounts use Android's mount program directly.
+
+### Releases and docs
+
+- Each release also has `eqengine-<version>.zip`, the bare package for the NEMESIS Package Store.
+  For installing by hand from a USB stick, use `eqengine-stick-<version>.zip` as before.
+- The build is reproducible: the same source gives byte for byte the same package, so the store's
+  file and the release's are the same bytes.
+- The install steps say how NEMESIS 1.17 shows a finished install (Package Manager lists EQ Engine
+  under Installed, where 1.16 said "Operation completed successfully"), and to leave the stick in
+  until then.
+
 ## 0.7.6
 
 All the changes from 0.7.5, and fixes from two code reviews (tested on a PC; the car-tested build

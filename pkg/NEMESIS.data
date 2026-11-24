@@ -1,13 +1,15 @@
 [nemesis]
-version=1.1
+version=1.2
 id=eqengine
 name=EQ Engine
-type=application
-package-version=0.7.6
+favicon=favicon.png
+type=application,service
+package-version=0.7.7
 short-desc="EQ for Android Auto and CarPlay, 48 kHz output"
-detailed-desc="Accurate 10-band EQ or a 20-band parametric one, live view, preamp, clip guard, user presets and a seat delay, for Android Auto, CarPlay (wired and wireless) and Bluetooth audio. 48 kHz output for Android Auto. Loaded in memory at each start."
-os="NEEV.USA.*"
+detailed-desc="10-band EQ or 20-band parametric EQ, live view, preamp, clip guard, presets and seat delay for Android Auto, CarPlay and Bluetooth audio. 48 kHz output for Android Auto. Loaded in memory at each start. Restart the head unit after installing."
+os="NEEV.USA.*,CEEV.USA.*,CEEV.CAN.*,IKFL.CAN.*"
 models="any"
+depends=""
 preinstall=scripts/pre.sh
 postinstall=scripts/post.sh
 preuninstall=scripts/preun.sh

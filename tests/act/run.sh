@@ -41,10 +41,20 @@ setup() {
     # dash and bash have their own, so this stands in for the car under mksh only.
     printf '#!/bin/sh\necho "printf: not found" >&2\nexit 127\n' > $T/stubs/printf
     chmod +x $T/stubs/printf
+    # the system log's clock, for every test (after 0.7.6: a restart's wait takes only markers
+    # logged after it started, so the real time of day must not decide a test)
+    cat > $T/stubs/date <<'S'
+#!/bin/sh
+case "$1" in
+    +%H%M%S) cat /tmp/eqeact/clock 2>/dev/null || echo 180045 ;;
+    *) exec /bin/date "$@" ;;
+esac
+S
+    chmod +x $T/stubs/date
     echo "700.25 50.00" > $T/proc/uptime
     echo 5056 > $T/mspid; mkdir -p $T/proc/5056 $T/proc/987
     : > $T/as.log
-    echo "11-18 19:28:00.850 E/AudioService(  654): Media server started." >> $T/as.log
+    echo "11-18 17:28:00.850 E/AudioService(  654): Media server started." >> $T/as.log
     echo playing > $T/after   # what the dump shows after the restart: playing | stuck | none
     echo playing > $T/now
     echo 1 > $T/reconnects    # 1 = AudioService logs "Media server started." after a restart
@@ -70,7 +80,16 @@ if [ "$1" = "$p" ]; then
     [ -f /tmp/eqeact/maps_tables ] && [ -f /tmp/eqeact/data/eqengine/state/vhq_load ] && \
         echo "b6a00000-b6a2a000 r-xp 00000000 b3:19 4242   /data/eqengine/lib/libaudio-resampler.so" > /tmp/eqeact/proc/$n/maps
     cp /tmp/eqeact/after /tmp/eqeact/now
-    [ "$(cat /tmp/eqeact/reconnects)" = 1 ] && echo "11-18 19:28:39.850 E/AudioService(  654): Media server started. ($n)" >> /tmp/eqeact/as.log
+    if [ "$(cat /tmp/eqeact/reconnects)" = 1 ]; then
+        # the new audio server's marker, on the log's clock (marker_at: "MM-DD HH:MM:SS.mmm")
+        mt=$(cat /tmp/eqeact/marker_at 2>/dev/null || echo "11-18 18:00:52.850")
+        echo "$mt E/AudioService(  654): Media server started. ($n)" >> /tmp/eqeact/as.log
+        if [ -f /tmp/eqeact/data/eqengine/state/restart_as.log ]; then
+            stat -c %a /tmp/eqeact/data/eqengine/state/restart_as.log > /tmp/eqeact/rs_mode
+            i=0; while [ ! -s /tmp/eqeact/as_follow.pid ] && [ $i -lt 200 ]; do /bin/sleep 0.01; i=$((i + 1)); done
+        fi
+        [ -f /tmp/eqeact/data/eqengine/state/restart_as.log ] && echo "$mt E/AudioService(  654): Media server started. ($n)" >> /tmp/eqeact/data/eqengine/state/restart_as.log
+    fi
     /tmp/eqeact/stubs/server_start $n
 fi
 exit 0
@@ -129,6 +148,7 @@ cat /tmp/eqeact/prop
 S
     cat > $T/stubs/md5 <<'S'
 #!/bin/sh
+echo "$1" >> /tmp/eqeact/md5.log
 md5sum "$1"
 S
     cat > $T/stubs/service <<'S'
@@ -140,8 +160,23 @@ S
     cat > $T/stubs/logcat <<'S'
 #!/bin/sh
 case "$*" in
-    *AudioService*) cat /tmp/eqeact/as.log ;;
-    *audio_hw_primary*) cat /tmp/eqeact/hal.log 2>/dev/null ;;
+    *AudioService*)
+        case " $* " in
+            *" -d "*) echo d >> /tmp/eqeact/as_dumps.log; cat /tmp/eqeact/as.log ;;
+            *" -f "*) cat /tmp/eqeact/as.log ;;
+            # (after 0.7.6) restart_now's follower: what the log holds, then it stays (the kill
+            # stub adds the new audio server's line to its file too, as logcat would). With
+            # partial_backlog only the first line so far (logcat writes the backlog oldest first)
+            *)
+                echo $$ > /tmp/eqeact/as_follow.pid
+                if [ -f /tmp/eqeact/partial_backlog ]; then head -n1 /tmp/eqeact/as.log; else cat /tmp/eqeact/as.log; fi
+                exec /bin/sleep 60 ;;
+        esac ;;
+    *audio_hw_primary*)
+        [ -d /tmp/eqeact/data/eqengine/state/hold ] && echo "read while the tracks are held" >> /tmp/eqeact/hal_held.log
+        # the Lab's log file's mode while it is written (after 0.7.6)
+        case "$*" in *EQEDrv*) stat -c %a /tmp/eqeact/data/eqengine/state/lab_now.log > /tmp/eqeact/labnow_mode 2>/dev/null ;; esac
+        cat /tmp/eqeact/hal.log 2>/dev/null ;;
     *AudioResampler*)
         case "$*" in
             *AudioResampler:D*) echo "11-18 19:28:01.120 D/AudioResampler( 5156): forcing AudioResampler quality to 3" ;;
@@ -166,6 +201,8 @@ mkdumps() {
     dump_playing > $T/dump_playing.txt; dump_stuck > $T/dump_stuck.txt
     cat > $T/stubs/dumpsys <<'S'
 #!/bin/sh
+# (after 0.7.6) an audio server that does not answer, once: the dump hangs
+if [ -f /tmp/eqeact/dump_hang ] && [ "$1" = media.audio_flinger ]; then rm -f /tmp/eqeact/dump_hang; exec /bin/sleep 60; fi
 # one "internals" block per output thread (io handles 101, 102, ...; the main output first), then the tracks
 i=0
 for r in $(cat /tmp/eqeact/rates 2>/dev/null || echo 44100); do
@@ -180,14 +217,15 @@ S
     chmod +x $T/stubs/dumpsys
 }
 run() {
-    ( cd /; EQE_TEST_ROOT=$T EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 30 $SH $ACT "$@" > $T/out.txt 2>&1; echo $? > $T/rc )
+    ( cd /; EQE_TEST_ROOT=$T EQE_RS_MAX=5 EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 30 $SH $ACT "$@" > $T/out.txt 2>&1; echo $? > $T/rc )
 }
 rc() { cat $T/rc; }
 
 echo "== act.sh restart under $SH"
 
-setup; mkdumps; run restart 3
+setup; mkdumps; rm -f $T/as_dumps.log $T/as_follow.pid; run restart 3
 ok "normal restart succeeds" "[ $(rc) = 0 ] && grep -q EQE_OK $T/out.txt"
+ok "the wait follows AudioService with one logcat, stopped afterwards; one log read before the restart only (after 0.7.6)" "[ \$(wc -l < $T/as_dumps.log) = 1 ] && [ -s $T/as_follow.pid ] && ! grep -q sleep /proc/\$(cat $T/as_follow.pid)/cmdline 2>/dev/null && [ ! -f $T/data/eqengine/state/restart_as.log ] && [ \"\$(cat $T/rs_mode)\" = 600 ]"
 ok "it reports Android reconnecting" "grep -q 'Android reconnected' $T/out.txt"
 ok "the converter is set before the audio server is stopped" "[ \"\$(cat $T/setprop.log)\" = 'af.resampler.quality=3' ]"
 ok "nothing is reported stuck when the stream plays again" "! grep -q EQE_STUCK $T/out.txt"
@@ -218,6 +256,10 @@ rm -rf $T/proc/4242
 run restart 3
 ok "a lock left by an interrupted restart is cleared" "[ $(rc) = 0 ] && grep -q EQE_OK $T/out.txt && [ ! -d $T/data/eqengine/state/restart.lock ]"
 
+setup; mkdumps; touch $T/dump_hang
+run restart 3
+ok "an audio server whose dump does not answer: the restart still goes ahead, in time (after 0.7.6)" "[ $(rc) = 0 ] && grep -q EQE_OK $T/out.txt && [ -f $T/kill.log ] && [ ! -f $T/dump_hang ]"
+
 setup; mkdumps; echo stuck > $T/after
 run restart 3
 ok "a stream that stays idle is reported (Android Auto)" "grep -q 'EQE_STUCK com.google.android.projection.sink' $T/out.txt && grep -q EQE_OK $T/out.txt"
@@ -229,6 +271,20 @@ ok "nothing playing before: nothing reported" "[ $(rc) = 0 ] && ! grep -q EQE_ST
 setup; mkdumps; echo 0 > $T/reconnects
 run restart
 ok "no reconnect message: waits, then says so" "[ $(rc) = 0 ] && grep -q 'did not report reconnecting within 25 s' $T/out.txt"
+setup; mkdumps; echo 0 > $T/reconnects; touch $T/partial_backlog
+{ echo "11-18 17:20:00.000 E/AudioService(  654): Media server started."; echo "11-18 17:28:00.850 E/AudioService(  654): Media server started."; } > $T/as.log
+run restart
+ok "an older marker than the last one, while the follower is still writing the log's backlog, does not end the wait (after 0.7.6)" "[ $(rc) = 0 ] && grep -q 'did not report reconnecting within 25 s' $T/out.txt"
+rm -f $T/partial_backlog
+echo "   (after 0.7.6) across midnight"
+setup; mkdumps; echo 0 > $T/reconnects; touch $T/partial_backlog; echo 000030 > $T/clock
+{ echo "12-31 23:59:58.100 E/AudioService(  654): Media server started."; echo "01-01 00:00:14.200 E/AudioService(  654): Media server started."; } > $T/as.log
+run restart
+ok "just after midnight, a marker from just before it (an earlier restart) does not end the wait" "[ $(rc) = 0 ] && grep -q 'did not report reconnecting within 25 s' $T/out.txt"
+setup; mkdumps; echo 235958 > $T/clock; echo "01-01 00:00:05.000" > $T/marker_at
+echo "12-31 23:59:40.000 E/AudioService(  654): Media server started." > $T/as.log
+run restart
+ok "a marker logged just after midnight, for a restart just before it, ends the wait" "[ $(rc) = 0 ] && grep -q 'Android reconnected' $T/out.txt"
 ok "a plain restart does not touch the converter" "[ ! -f $T/setprop.log ]"
 
 setup; mkdumps
@@ -519,6 +575,8 @@ esac
 S
     cat > $T/stubs/dumpsys <<'S'
 #!/bin/sh
+# (after 0.7.6) an audio server that does not answer, once: the dump hangs
+if [ -f /tmp/eqeact/dump_hang ] && [ "$1" = media.audio_flinger ]; then rm -f /tmp/eqeact/dump_hang; exec /bin/sleep 60; fi
 [ "$1" = media.audio_flinger ] && /tmp/eqeact/stubs/afsim dump
 exit 0
 S
@@ -583,8 +641,10 @@ tracks_on_mix() { [ "$(cut -d' ' -f4 $T/af/tracks | sort -u)" = "$(cat $T/af/mix
 ost() { sed -n "s/^$1=//p" $LS/output; }
 
 labsetup
+echo "an earlier Lab action's lines" > $LS/lab_now.log; chmod 644 $LS/lab_now.log
 run lab 1
 ok "watch: mounted over Hyundai's driver, with an exact copy of the driver kept" "[ $(rc) = 0 ] && grep -q \" $HALT \" $T/proc/mounts && [ \"\$(md5sum < $T/data/eqengine/lib/hal/eqe_hal_orig.so | cut -c1-32)\" = 4e23b3753aecde59b180b374745653a7 ]"
+ok "watch: the Lab's log lines are root only already while written, also over an older 644 file (after 0.7.6)" "[ \"\$(cat $T/labnow_mode)\" = 600 ] && [ \"\$(stat -c %a $LS/lab_now.log)\" = 600 ] && ! grep -q 'an earlier Lab action' $LS/lab_now.log"
 ok "watch: one audio restart, the new server runs Hyundai's driver behind the layer" "[ $(nkills) = 1 ] && grep -q 'EQE_LAB watch watching' $T/out.txt && grep -q ' watch' $LS/lab_active"
 run lab 1
 ok "watch again: nothing to do, no restart" "[ $(rc) = 0 ] && grep -q 'already on: watch' $T/out.txt && [ $(nkills) = 1 ]"
@@ -620,9 +680,11 @@ ok "off while the audio server has the driver loaded (umount busy, as on the car
 # --- the 48 kHz keeper
 labsetup
 MIX0=$(cat $T/af/mix)
+rm -f $T/hal_held.log
 keep 4
 ok "keeper: music at 44.1 kHz is switched with one setting to the main output (io 101), no audio restart" "[ \"\$(cat $T/lab_calls.log)\" = 'set 101 sampling_rate=48000' ] && [ $(nkills) = 0 ]"
-ok "keeper: accepted only with Android, the link setting and the measured rate at 48000" "[ \"\$(ost state)\" = 48k ] && [ \"\$(ost out)\" = 48000 ] && [ \"\$(ost link_rate)\" = 48000 ] && [ \"\$(ost fps)\" = 48000 ] && grep -q 'switched to 48000 Hz: output 101 at 48000 Hz, link pcm2p at 48000 Hz, measured 48000 frames/s; driver: start_output_stream' $LS/output.log"
+ok "keeper: the driver's log (seconds on the car) is read after the hold is released, not while the tracks are held (after 0.7.6)" "[ ! -f $T/hal_held.log ] && grep -q \"the driver's line for that switch\" $LS/output.log"
+ok "keeper: accepted only with Android, the link setting and the measured rate at 48000" "[ \"\$(ost state)\" = 48k ] && [ \"\$(ost out)\" = 48000 ] && [ \"\$(ost link_rate)\" = 48000 ] && [ \"\$(ost fps)\" = 48000 ] && grep -q 'switched to 48000 Hz: output 101 at 48000 Hz, link pcm2p at 48000 Hz, measured 48000 frames/s' $LS/output.log && grep -q \"the driver's line for that switch: start_output_stream\" $LS/output.log"
 ok "keeper: the switch is marked for this audio server and timed for the boot step" "[ \"\$(cat $LS/rate48)\" = \"\$(cat $T/mspid) 101\" ] && [ -s $LS/rate48_sent ]"
 ok "keeper: later rounds leave the agreed link alone" "[ $(nsets) = 1 ]"
 ok "keeper: the main output's four sessions were held for the switch and released after it" "grep -q \"holding the main output's audio sessions (13 107 21 111) for the change\" $LS/output.log && [ \"\$(cat $T/hold.log)\" = '13 107 21 111' ] && [ ! -s $T/af/chains ] && [ ! -d $LS/hold ]"
@@ -649,7 +711,7 @@ ok "keeper: the link is played by a thread that is not the audio server's: nothi
 labsetup; rm -f $T/playing; echo 2291 > $T/other; $T/stubs/asound
 keepi 9
 ok "other: the factory CarPlay app has the main link and nothing plays in Android: no switch, no hold, no silent track" "[ $(nsets) = 0 ] && [ ! -f $T/hold.log ] && [ ! -f $T/standby_sets.log ] && ! grep -q 'nothing plays: switching' $LS/output.log && ! grep -q 'no rate change' $LS/output.log"
-ok "other: state other, the owner's name, the link with its rate and frames/s, a plain note" "[ \"\$(ost state)\" = other ] && [ \"\$(ost owner)\" = com.daudio.app.dipo ] && [ \"\$(ost link)\" = pcm2p ] && [ \"\$(ost link_rate)\" = 44100 ] && [ \"\$(ost fps)\" = 44100 ] && [ \"\$(ost server)\" = 5056 ] && [ \"\$(ost note)\" = \"the main speaker link is in use by com.daudio.app.dipo, which plays to it directly, not through Android's audio server; EQ Engine cannot process that sound\" ]"
+ok "other: state other, the owner's name, the link with its rate and frames/s, a plain note" "[ \"\$(ost state)\" = other ] && [ \"\$(ost owner)\" = com.daudio.app.dipo ] && [ \"\$(ost link)\" = pcm2p ] && [ \"\$(ost link_rate)\" = 44100 ] && [ \"\$(ost fps)\" = 44100 ] && [ \"\$(ost server)\" = 5056 ] && [ \"\$(ost note)\" = \"the main speaker link is in use by the factory CarPlay app, which plays to it directly at its own rate, not through Android's audio server; 48 kHz output waits until it lets go (EQ on CarPlay processes its music, when it is on)\" ]"
 ok "other: one log line when it appears, none after that" "[ \$(grep -c 'is in use by com.daudio.app.dipo (thread 2291, RUNNING at 44100 Hz)' $LS/output.log) = 1 ] && [ \$(wc -l < $LS/output.log) -le 3 ]"
 labsetup; rm -f $T/playing; echo 2291 > $T/other; echo "0 704" > $T/other_at; $T/stubs/asound
 QUIET=3 keepi 14
@@ -827,7 +889,7 @@ if [ -n "$f" ]; then
     exit 0
 fi
 case "$*" in
-    *audio_hw_primary*) cat /tmp/eqeact/hal.log 2>/dev/null ;;
+    *audio_hw_primary*) { [ -d /tmp/eqeact/data/eqengine/state/hold ] && echo "read while the tracks are held" >> /tmp/eqeact/hal_held.log; cat /tmp/eqeact/hal.log 2>/dev/null; } ;;
 esac
 exit 0
 S
@@ -863,6 +925,48 @@ sed -n '/^-- CarPlay app.s audio code (symbol tables only)$/,/^====/p' "$RF2" > 
 ok "report: CarPlay probe: the app not running is one line; libtinyalsa.so and the properties still there" "[ \$(grep -c 'CarPlay app' $T/probe2.txt) = 2 ] && grep -qx '  the factory CarPlay app (com.daudio.app.dipo) is not running' $T/probe2.txt && ! grep -q '^  library ' $T/probe2.txt && grep -q 'libtinyalsa.so (factory file, not copied)' $T/probe2.txt && grep -q 'ro.secure' $T/probe2.txt"
 run report $T/nousb $T/app 1
 ok "report: no stick: refused" "[ $(rc) = 1 ] && grep -q 'no USB stick' $T/out.txt"
+# after 0.7.6: the effects list's md5 in the report (mounted_at used to overwrite it with a mount point)
+echo "an effects list" > $T/system/etc/audio_effects.conf
+EFXMD5=$(md5sum < $T/system/etc/audio_effects.conf | cut -c1-32)
+mkdir -p $T/data/eqengine/conf
+[ -f $T/data/eqengine/conf/audio_effects.conf ] && cp $T/data/eqengine/conf/audio_effects.conf $T/efx.keep
+cp $T/system/etc/audio_effects.conf $T/data/eqengine/conf/audio_effects.conf
+cp $T/proc/mounts $T/proc/mounts.keep
+echo "none $T/system/etc/audio_effects.conf none rw 0 0" >> $T/proc/mounts
+echo "/dev/block/data /data ext4 rw 0 0" >> $T/proc/mounts
+mkdir -p $T/usbfx1; run report $T/usbfx1 $T/app 1
+RFX1=$(ls $T/usbfx1/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+ok "report: the effects list laid over: its md5, not its mount point" "grep -q \"ok    effects list: EQ Engine's copy is laid over Android's (md5 $EFXMD5)\" \"$RFX1\" && grep -q \"(EQ Engine's effects list is laid over Android's)\" \"$RFX1\""
+echo "another package's list" > $T/system/etc/audio_effects.conf
+mkdir -p $T/usbfx3; run report $T/usbfx3 $T/app 1
+RFX3=$(ls $T/usbfx3/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+ok "report: another package's file laid over the effects list is named as such (after 0.7.6)" "grep -q \"NO    effects list: another package's file is laid over Android's\" \"$RFX3\" && grep -q \"(another package's file is laid over Android's effects list)\" \"$RFX3\""
+echo "an effects list" > $T/system/etc/audio_effects.conf
+rm -f $T/data/eqengine/conf/audio_effects.conf; [ -f $T/efx.keep ] && mv $T/efx.keep $T/data/eqengine/conf/audio_effects.conf
+cp $T/proc/mounts.keep $T/proc/mounts
+mkdir -p $T/usbfx2; run report $T/usbfx2 $T/app 1
+RFX2=$(ls $T/usbfx2/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+ok "report: a list not laid over and not the stock one: its own md5, not the last mount point" "grep -q \"NO    effects list: md5 $EFXMD5, not the one EQ Engine was built for (4d98c1b38bd1d9eaf929d9b616c0d118)\" \"$RFX2\""
+rm -f $T/system/etc/audio_effects.conf $T/proc/mounts.keep
+echo "   after 0.7.6: the report scans into a file of its own, keeps why EQ on CarPlay turned itself off, and says when the stick is full"
+echo "mix 0xKEEPER" > $T/data/eqengine/state/af.txt
+printf 'id=a-1\nwhen=12:00\nwhy=it could not load the factory CarPlay library\n' > $T/data/eqengine/state/cpw_failed
+echo "taken off: the watch could not load the factory library (pid 2300)" > $T/data/eqengine/state/cpw_result.prev
+mkdir -p $T/usbfx4; run report $T/usbfx4 $T/app 1
+RFX4=$(ls $T/usbfx4/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+ok "report: the keeper's scan file is left as it was, and the report's own is removed" "[ \"\$(cat $T/data/eqengine/state/af.txt)\" = 'mix 0xKEEPER' ] && [ ! -f $T/data/eqengine/state/af_report.txt ]"
+ok "report: why EQ on CarPlay turned itself off, and the previous car start's result" "grep -q 'why=it could not load the factory CarPlay library' \"$RFX4\" && grep -q 'taken off: the watch could not load the factory library (pid 2300)' \"$RFX4\" && tail -n1 \"$RFX4\" | grep -qx -- '-- end of the report'"
+rm -f $T/data/eqengine/state/af.txt $T/data/eqengine/state/cpw_failed $T/data/eqengine/state/cpw_result.prev
+touch $T/dump_hang; mkdir -p $T/usbfx5; run report $T/usbfx5 $T/app 1
+RFX5=$(ls $T/usbfx5/EQENGINE/report_*.txt 2>/dev/null | head -n1)
+ok "report: an audio server whose dump does not answer: the report still finishes, and says so (after 0.7.6)" "[ $(rc) = 0 ] && grep -q 'did not answer its dump within 15 s' \"$RFX5\" && grep -q '(the audio server did not answer its dump)' \"$RFX5\" && [ ! -f $T/dump_hang ] && [ ! -f $T/data/eqengine/state/report_af.txt ]"
+mkdir -p $T/usbfull
+( cd /; trap '' XFSZ; ulimit -f 4; EQE_TEST_ROOT=$T EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 30 $SH $ACT report $T/usbfull $T/app 1 > $T/out.txt 2>&1; echo $? > $T/rc )
+ok "report: a stick that cannot take it all (writes past 4 KB fail): said so, exit 1, no half report left" "[ $(rc) = 1 ] && grep -q 'could not be written to the stick (it may be full)' $T/out.txt && ! grep -q EQE_REPORT $T/out.txt && [ -z \"\$(ls $T/usbfull/EQENGINE 2>/dev/null)\" ]"
+mkdir -p $T/usbfull2
+i=0; while [ $i -lt 300 ]; do echo "$i an event line long enough to take some room"; i=$((i + 1)); done >> $T/data/eqengine/state/events.log
+( cd /; trap '' XFSZ; ulimit -f 4; EQE_TEST_ROOT=$T EQE_APP_PROCESS=$T/stubs/app_process PATH=$T/stubs:/usr/bin:/bin timeout 60 $SH $ACT save $T/usbfull2 $T/app 0 > $T/out.txt 2>&1; echo $? > $T/rc )
+ok "save: a stick that cannot take it all: said so, exit 1" "[ $(rc) = 1 ] && grep -q 'could not save everything to the stick (it may be full)' $T/out.txt && ! grep -q EQE_OK $T/out.txt"
 
 echo "== All logs (save) and the Lab trace under $SH"
 labsetup
@@ -893,10 +997,18 @@ mkdir -p $T/usb4 $T/data/tombstones; echo t > $T/data/tombstones/tombstone_05
 run save $T/usb4 $T/app 0
 SD=$(ls -d $T/usb4/EQENGINE/*/ 2>/dev/null | head -n1)
 ok "save without the Android dumps (the app's crash handler): no tombstones, no probe" "[ $(rc) = 0 ] && [ -n \"$SD\" ] && [ ! -f ${SD}tombstone_05.txt ] && [ ! -f ${SD}carplay_probe.txt ] && grep -q tombstone_05 ${SD}tombstones_list.txt"
+mkdir -p $T/usbmusic $T/usbinst $T/usbused/EQENGINE; echo readme > $T/usbinst/README-EQENGINE.txt
+run crashsave $T/app $T/usbmusic $T/usbinst $T/usbused
+SD=$(ls -d $T/usbinst/EQENGINE/*/ 2>/dev/null | head -n1)
+ok "crashsave (after 0.7.6): to the first stick that is EQ Engine's (here its install stick), as save ... 0; never to a music stick" "[ $(rc) = 0 ] && [ -n \"$SD\" ] && [ -f ${SD}saved_ok.txt ] && [ ! -f ${SD}carplay_probe.txt ] && [ -z \"\$(ls -A $T/usbmusic)\" ] && [ -z \"\$(ls -A $T/usbused/EQENGINE)\" ]"
+rm -rf $T/usbinst/EQENGINE
+run crashsave $T/app $T/usbmusic
+ok "crashsave with no stick of EQ Engine's: nothing written anywhere" "[ $(rc) = 0 ] && grep -q 'nothing copied' $T/out.txt && [ -z \"\$(ls -A $T/usbmusic)\" ]"
 labsetup
 mkdir -p $T/data/eqengine/lab/trace_20260101_000000 $T/data/eqengine/lab/trace_20260102_000000 $T/data/eqengine/lab/trace_20260103_000000
 run trace 1
 ok "trace: the newest 2 traces are kept" "[ $(rc) = 0 ] && [ \$(ls -d $T/data/eqengine/lab/trace_* | wc -l) = 2 ] && [ -d $T/data/eqengine/lab/trace_20260103_000000 ] && grep -q 'trace saved to' $T/out.txt"
+ok "trace: the traces (whole system logs) are root only, the folder list and the ALSA line readable by the app (after 0.7.6)" "[ -z \"\$(find $T/data/eqengine/lab -path '*trace_*' -type f ! -perm 600)\" ] && [ -z \"\$(find $T/data/eqengine/lab -name 'trace_*' -type d ! -perm 700)\" ] && [ \"\$(stat -c %a $T/data/eqengine/lab)\" = 755 ] && [ \"\$(stat -c %a $T/data/eqengine/lab/alsa_summary.txt)\" = 644 ]"
 
 echo "== screenshot to USB (shot) under $SH"
 labsetup
@@ -938,6 +1050,22 @@ printf 'x;0;1:100000:0:1000\nsecond line\n' > $T/usb6/EQENGINE_CURVES/user4.txt
 printf '1,2,x,4\n' > $T/usb6/EQENGINE_CURVES/user1.txt
 run curves load $T/usb6
 ok "curves load: two lines, or an x out of place: not a curve" "[ $(rc) = 0 ] && grep -q 'Left alone, not a curve file: User 1, User 4.' $T/out.txt && [ ! -f $CS2/preset4.txt ]"
+echo "   after 0.7.6: only lines the app can read replace a slot"
+rm -f $T/usb6/EQENGINE_CURVES/user*.txt
+printf '%s\n' '0,0,0,0,0,0,0,0,0,0,0' > $CS2/preset1.txt
+cp $CS2/preset1.txt $CS2/preset2.txt; cp $CS2/preset1.txt $CS2/preset3.txt; cp $CS2/preset1.txt $CS2/preset4.txt
+printf '%s\n' '-500,500,400,200,-100,-200,-100,100,300,400' > $T/usb6/EQENGINE_CURVES/user1.txt
+printf '%s\n' '-500,500,,200,-100,-200,-100,100,300,400,400' > $T/usb6/EQENGINE_CURVES/user2.txt
+printf '%s\n' 'x;' > $T/usb6/EQENGINE_CURVES/user3.txt
+printf '%s\n' 'x;-300;1:100000:250' > $T/usb6/EQENGINE_CURVES/user4.txt
+run curves load $T/usb6
+ok "10 numbers, an empty field, 'x;' with no preamp, a band of 3 numbers: all left alone, the slots kept" "[ $(rc) = 0 ] && grep -q 'Left alone, not a curve file: User 1, User 2, User 3, User 4.' $T/out.txt && [ \"\$(cat $CS2/preset1.txt $CS2/preset2.txt $CS2/preset3.txt $CS2/preset4.txt | sort -u)\" = '0,0,0,0,0,0,0,0,0,0,0' ]"
+printf '%s\n' '-5,-1-2,0,0,0,0,0,0,0,0,0' > $T/usb6/EQENGINE_CURVES/user1.txt
+printf '%s\n' 'x;-300' > $T/usb6/EQENGINE_CURVES/user2.txt
+printf '%s\n' 'x;-300;1:100000:250:1000;3:800000:-600:0' > $T/usb6/EQENGINE_CURVES/user3.txt
+printf '%s\n' 'x;0;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1' > $T/usb6/EQENGINE_CURVES/user4.txt
+run curves load $T/usb6
+ok "a '-' inside a number and 21 bands are left alone; Expert with no bands and with two are loaded" "[ $(rc) = 0 ] && grep -q 'Loaded 2 curve(s)' $T/out.txt && grep -q 'Left alone, not a curve file: User 1, User 4.' $T/out.txt && [ \"\$(cat $CS2/preset2.txt)\" = 'x;-300' ] && [ \"\$(cat $CS2/preset3.txt)\" = 'x;-300;1:100000:250:1000;3:800000:-600:0' ]"
 rm -rf $T/usb6/EQENGINE_CURVES
 run curves load $T/usb6
 ok "curves load: no folder on the stick: refused, says how to make one" "[ $(rc) = 1 ] && grep -q 'has no EQENGINE_CURVES folder' $T/out.txt"
@@ -953,6 +1081,10 @@ ok "curves save: nothing saved yet: says so" "[ $(rc) = 0 ] && grep -q 'No user 
 CARLESS=$(grep -nE "(^|[;&|({\`]|\bthen|\bdo|\belse)[[:space:]]*(printf|tr|sed|awk|grep|egrep|head|tail|cut|sort|uniq|wc|xargs|basename|dirname|seq|expr|find|readlink|stat|tee|od|hexdump|which|timeout|nohup|pgrep|pkill|killall)([[:space:]]|\$|\))" \
     $R/pkg/bin/*.sh $R/pkg/scripts/*.sh $R/rescue/*.sh | grep -vE "^[^:]+:[0-9]+:[[:space:]]*#" | grep -v "CR=\$(printf '.r' 2>/dev/null)")
 ok "the car's scripts call no program the car lacks (printf, grep, sed, head and the like)" "[ -z \"\$CARLESS\" ] || { echo \"\$CARLESS\" > $T/out.txt; false; }"
+# after 0.7.6: an unclosed bracket in a ${x#...} pattern (${x#[}) strips nothing on the car's mksh,
+# though the PC's shells strip the "[": the report's property list was mostly empty on the car
+BRACKET=$(grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*(#|##|%|%%)\[\}' $R/pkg/bin/*.sh $R/pkg/scripts/*.sh $R/rescue/*.sh)
+ok "the car's scripts strip no unclosed '[' in a \${x#...} pattern (it does nothing on the car's mksh)" "[ -z \"\$BRACKET\" ] || { echo \"\$BRACKET\" > $T/out.txt; false; }"
 
 echo "== converter choice without a restart (conv) under $SH"
 setup; vhqsetup good map
@@ -1177,8 +1309,13 @@ ok "probe: a process whose status has none of the parent, groups or capabilities
 rm -f $T/cp_connected; $T/stubs/nettcp
 
 echo "-- the keeper's guard (cpwguard)"
+rm -f $T/md5.log
+# a decoy that a process scan would find first (1999 sorts before 2300) and take the watch off for
+mkdir -p $T/proc/1999; printf 'com.daudio.app.dipo\000' > $T/proc/1999/cmdline; printf 'state=failed\n' > $CW/status.1999
 run cpwguard
 ok "guard: the same app process: nothing done" "[ $(rc) = 0 ] && [ \"\$(cst pid)\" = 2300 ] && [ ! -f $CS/cpw_restarts ] && [ $(nkill) = 0 ]"
+ok "guard: the same app process, its watch not failed: no md5 and no process scan (the keeper runs it every 3 s; after 0.7.6)" "[ ! -f $T/md5.log ] && [ \"\$(cst state)\" = on ] && jmounted"
+rm -rf $T/proc/1999; rm -f $CW/status.1999
 $T/stubs/kill -9 2300
 run cpwguard
 ok "guard: the app started again (a crash, an install): noted, the watch stays on (the mount is still there)" "[ $(rc) = 0 ] && [ \"\$(cst state)\" = on ] && [ \"\$(cst pid)\" = 2310 ] && [ \$(wc -l < $CS/cpw_restarts) = 1 ] && jmounted && grep -q 'started again (pid 2300 -> 2310); the watch stays on' $CS/cpw_result"
@@ -1203,6 +1340,8 @@ cpwsetup; run cpwatch 1; touch $T/cps_nowatch; carstart; run cpwguard
 ok "guard: loaded, but it left TinyALSA's functions alone: on (the app says so from the watch's status)" "[ \"\$(cst state)\" = on ] && jmounted && grep -q 'state=not watching' $CW/status.2300"
 cpwsetup; run cpwatch 1; touch $T/cps_noload; carstart; run cpwguard
 ok "guard: the app runs but has not loaded the watch: still waiting, nothing done" "[ \"\$(cst state)\" = waiting ] && jmounted && [ $(nkill) = 0 ]"
+cpwsetup; run cpwatch 1; carstart; run cpwguard; printf 'version=2\npid=2300\nstate=failed\n' > $CW/status.2300; run cpwguard
+ok "guard: on, then the watch in that same process says failed: still taken off (the usual case's shortcut does not skip it; after 0.7.6)" "[ \"\$(cst state)\" = failed ] && ! jmounted && grep -q 'taken off: the watch could not load the factory library (pid 2300)' $CS/cpw_result"
 
 echo "-- off (from the next car start)"
 cpwsetup; run cpwatch 1; carstart; run cpwguard
@@ -1299,6 +1438,16 @@ ok "EQ Engine off: the watch's choice and mount gone, the app not restarted, 0.6
 cpwsetup; mkdir -p $CS/cpwatch.lock; cut -d. -f1 $T/proc/uptime > $CS/cpwatch.lock/at
 run cpwatch 1
 ok "cpwatch: one switch at a time" "[ $(rc) = 3 ] && grep -q 'already being switched' $T/out.txt && [ ! -f $CS/cpw_want ]"
+cpwsetup; mkdir -p $T/proc/77777 $CS/cpwatch.lock; echo "$(( $(cut -d. -f1 $T/proc/uptime) + 3000 )) 77777" > $CS/cpwatch.lock/at
+run cpwatch 1
+ok "cpwatch: a lock left by a power cut in an earlier drive (stamped later than now, its pid used again) does not block it (after 0.7.6)" "[ $(rc) = 0 ] && [ -f $CS/cpw_want ]"
+cpwsetup; mkdir -p $CS/cpwatch.lock; echo "$(cut -d. -f1 $T/proc/uptime) 99999" > $CS/cpwatch.lock/at
+run cpwatch 1
+ok "cpwatch: a lock whose act.sh is gone does not block it (after 0.7.6)" "[ $(rc) = 0 ] && [ -f $CS/cpw_want ]"
+cpwsetup; mkdir -p $T/proc/77777 $CS/cpwatch.lock; echo "$(cut -d. -f1 $T/proc/uptime) 77777" > $CS/cpwatch.lock/at
+run cpwatch 1
+ok "cpwatch: a lock whose act.sh still runs, from just now, blocks it" "[ $(rc) = 3 ] && grep -q 'already being switched' $T/out.txt && [ ! -f $CS/cpw_want ]"
+rm -rf $T/proc/77777 $CS/cpwatch.lock
 run cpwatch 2
 ok "cpwatch with a wrong value: usage" "[ $(rc) = 2 ]"
 

@@ -54,7 +54,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
-#define EQE_LIB_VERSION 0x00000324 /* 0x324 (0.7.6): EQE_PARAM_PEAK answers the largest boost over this rate, 44.1 and 48 kHz;
+#define EQE_LIB_VERSION 0x00000325 /* 0x325 (after 0.7.6): the bit-exact path clamps what the processing path left in the look-ahead
+                                         (EQ off, or a microphone on CarPlay, with the clip guard off: no wrap to the opposite sign);
+                                      0x324 (0.7.6): EQE_PARAM_PEAK answers the largest boost over this rate, 44.1 and 48 kHz;
                                       0x323 (0.7.4): the bands run a chunk at a time (bands_block), bit for bit 0x322's output;
                                       0x322: settings layout 3 (Expert mode: up to EQE_NX bands of its own);
                                       0x321: EQE_PARAM_PEAK, and SET_CONFIG refuses all but 16-bit stereo;
@@ -900,8 +902,13 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
             c->dl[0][w] = xl;
             c->dl[1][w] = xr;
             c->li = rd;
-            ol = (int32_t)(dl * 32768.0);
-            orr = (int32_t)(dr * 32768.0);
+            /* 0x325: right after the processing path hands back (EQ turned off, a microphone opened on
+               CarPlay), the look-ahead still holds up to LA - 1 of its samples, which can be over full
+               scale when the clip guard is off: clamped here instead of wrapping to the opposite
+               sign (a crack). The path's own samples are always in range, so it stays bit-exact. */
+            double tl = dl * 32768.0, tr = dr * 32768.0;
+            ol = tl >= 32767.0 ? 32767 : tl <= -32768.0 ? -32768 : (int32_t)tl;
+            orr = tr >= 32767.0 ? 32767 : tr <= -32768.0 ? -32768 : (int32_t)tr;
             if (transparent) {
                 /* the seat delay keeps its history, for a later change */
                 c->dbuf[0][c->dpos] = xl;

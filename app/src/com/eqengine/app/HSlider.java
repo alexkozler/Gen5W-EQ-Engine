@@ -22,6 +22,7 @@ final class HSlider extends View {
     private int value;
     private boolean dragging;
     private long lastDown;
+    private boolean centred;
 
     HSlider(Context c) {
         super(c);
@@ -91,10 +92,18 @@ final class HSlider extends View {
             if (now - lastDown < 350) {
                 lastDown = 0;
                 set(0, true);
+                // (after 0.7.6) the rest of this touch is ignored: its lift used to put the slider
+                // back under the finger at once, so a double tap never centred it
+                centred = true;
                 return true;
             }
             lastDown = now;
+            centred = false;
             dragging = true;
+        }
+        if (centred) {
+            if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) centred = false;
+            return true;
         }
         if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_MOVE || a == MotionEvent.ACTION_UP) {
             float f = (e.getX() - left()) / (right() - left());

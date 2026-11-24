@@ -62,6 +62,7 @@ final class EqSettings {
     int xSel;                     // the selected Expert band
     boolean cpEq = true;          // EQ on CarPlay (Settings; 0.7.4: on by default, one switch for the watch and its EQ)
     String cpwAck = "";           // 0.7.4: the last state/cpw_failed the app has told the user about (its id)
+    String crashAck = "";         // after 0.7.6: the car start whose "kept restarting" the app has told the user about (its boot id)
     /** Loaded from settings another app version saved (or from none): detailed logging was reset. */
     boolean fromOtherVersion;
     static final int SEAT_DELAY_MIN = 500, SEAT_DELAY_MAX = 3000, SEAT_DELAY_STEP = 100;
@@ -87,6 +88,7 @@ final class EqSettings {
         s.xPreset = xPreset;
         s.cpEq = cpEq;
         s.cpwAck = cpwAck;
+        s.crashAck = crashAck;
         return s;
     }
 
@@ -359,6 +361,7 @@ final class EqSettings {
                     else if (k.equals("xpreset")) s.xPreset = v.length() > 0 && v.length() < 40 ? v : "Custom";
                     else if (k.equals("cp_eq")) s.cpEq = !"0".equals(v);
                     else if (k.equals("cpw_ack")) s.cpwAck = v.length() < 120 ? v : "";
+                    else if (k.equals("crash_ack")) s.crashAck = v.length() < 120 ? v : "";
                     else if (k.equals("bands")) {
                         String[] f = v.split(",");
                         for (int i = 0; i < NB && i < f.length; i++)
@@ -467,6 +470,7 @@ final class EqSettings {
         sb.append("xpreset=").append(xPreset).append('\n');
         sb.append("cp_eq=").append(cpEq ? 1 : 0).append('\n');
         sb.append("cpw_ack=").append(cpwAck).append('\n');
+        sb.append("crash_ack=").append(crashAck).append('\n');
         sb.append("app=").append(MainActivity.VERSION).append('\n');
         sb.append("bands=");
         for (int i = 0; i < NB; i++) sb.append(i == 0 ? "" : ",").append(bands[i]);

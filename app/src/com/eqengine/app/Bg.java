@@ -16,6 +16,7 @@ import java.util.concurrent.TimeUnit;
  */
 final class Bg {
     private static Handler io;
+    private static Thread ioThread;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
     private Bg() {}
@@ -24,9 +25,15 @@ final class Bg {
         if (io == null) {
             HandlerThread t = new HandlerThread("eqengine-io", Process.THREAD_PRIORITY_BACKGROUND);
             t.start();
+            ioThread = t;
             io = new Handler(t.getLooper());
         }
         return io;
+    }
+
+    /** (after 0.7.6) t is the background thread (whose loop has ended when it is the one crashing). */
+    static synchronized boolean isIoThread(Thread t) {
+        return t != null && t == ioThread;
     }
 
     /** Runs r on the background thread. */

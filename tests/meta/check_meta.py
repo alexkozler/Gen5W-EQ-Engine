@@ -44,6 +44,13 @@ m = parse(open(sys.argv[1], encoding="utf-8").read())
 get = lambda k: m.get(("nemesis", k))
 errs = []
 if not get("id"): errs.append("missing id")
+# (NEMESIS 1.17) a descriptor newer than the running NEMESIS reads is refused even with the risk
+# accepted; 1.2 is the newest one (1.16 reads 1.2 too, ignoring favicon)
+ver = get("version") or "1.0"
+if not re.fullmatch(r"\d+(\.\d+)*", ver): errs.append("bad version=%s" % ver)
+elif [int(x) for x in ver.split(".")] + [0] * 3 > [1, 2] + [0] * (len(ver.split(".")) + 1): errs.append("version=%s is newer than NEMESIS 1.17 reads (1.2)" % ver)
+fav = get("favicon")
+if fav and (fav.startswith("/") or ".." in fav or "\\" in fav): errs.append("favicon must be a path inside the package: %s" % fav)
 pv = get("package-version")
 if pv and not re.fullmatch(r"\d+(\.\d+)*", pv): errs.append("package-version must be dotted numbers: %s" % pv)
 if get("short-desc") and len(get("short-desc")) > SHORT_MAX: errs.append("short-desc is %d characters (max %d)" % (len(get("short-desc")), SHORT_MAX))

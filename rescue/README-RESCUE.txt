@@ -5,10 +5,13 @@ Keep this on its own USB stick, in the glovebox. Don't leave it plugged in.
 
 What it does
 Turns EQ Engine off: later starts skip EQ Engine's boot step, the boot step is
-stopped, the in-memory change to Android's effects list is removed, and
+stopped, the in-memory change to Android's effects list is removed, EQ on
+CarPlay's layer is taken off the CarPlay app's library (a CarPlay app already
+running keeps it until the head unit restarts), the 48 kHz keeper stops, and
 Android's audio converter setting goes back to its default (this also turns
-off the very high quality converter test). It changes nothing else. A report
-goes to EQENGINE-RESCUE/ on this stick.
+off the very high quality converter test). Another package's files are left
+as they are. It changes nothing else. A report goes to EQENGINE-RESCUE/ on
+this stick.
 
 When to use it
 Only if something is wrong and you can't reach the EQ Engine app or NEMESIS

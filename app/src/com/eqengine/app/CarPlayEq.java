@@ -26,10 +26,12 @@ final class CarPlayEq {
     private static final int CPE_MAGIC = 0x31455043, CPE_VERSION = 1, CPE_HDR = 6, CPE_NSET = 99;
     private static final int CPL_MAGIC = 0x314c5043, CPL_BYTES = 4096;
     /* cpl_live, as int32 indexes */
-    private static final int L_MAGIC = 0, L_SEQ = 2, L_STATE = 4, L_WHY = 5, L_RATE = 6, L_FRAMES = 7, L_BLKSEQ = 8,
+    private static final int L_MAGIC = 0, L_SEQ = 2, L_PID = 3, L_STATE = 4, L_WHY = 5, L_RATE = 6, L_FRAMES = 7, L_BLKSEQ = 8,
             L_BLKMS = 9, L_PEAK = 10, L_RMS = 11, L_AVG = 12, L_MAX = 13, L_MING = 14, L_LIMITED = 15, L_CLIPPED = 16,
             L_INCLIP = 17, L_CTLSEQ = 18, L_LIB = 19, L_SPECSEQ = 20, L_SPECMS = 21, L_SPEC = 22;
-    static final int NSPEC = 48, L_N = L_SPEC + NSPEC;
+    /* (after 0.7.6) the answers for the settings in use: their seq, the largest boost (3), the rate, the solved gains (10) */
+    private static final int L_ANSSEQ = L_SPEC + 48, L_ANSPEAK = L_ANSSEQ + 1, L_ANSRATE = L_ANSPEAK + 3, L_ANSGAINS = L_ANSRATE + 1;
+    static final int NSPEC = 48, L_N = L_ANSGAINS + 10;
     static final int IDLE = 0, PASSING = 1, PROCESSING = 2;
     static final int WHY_NONE = 0, WHY_SWITCH = 1, WHY_NOSET = 2, WHY_OFF = 3, WHY_FORMAT = 4, WHY_MIC = 5, WHY_STARTED = 6;
 
@@ -37,6 +39,13 @@ final class CarPlayEq {
     private static byte[] nextSet, lastSet;
     private static boolean nextOn, lastOn, queued, warned;
     private static int seq = (int) (SystemClock.uptimeMillis() & 0x3fffffff);
+    /**
+     * the last control file written: its seq and settings, and the seq of the first write with
+     * those settings (the live view's once-a-second rewrites keep them) (for the watch's answers;
+     * under LOCK)
+     */
+    private static int writtenSeq, setSince;
+    private static byte[] writtenSet;
     private static volatile int liveUntil;
     private static long lastLive;
     private static volatile MappedByteBuffer map;
@@ -127,6 +136,11 @@ final class CarPlayEq {
             o = null;
             tmp.setReadable(true, false); // the CarPlay app reads it (apps write with umask 077)
             if (!tmp.renameTo(f)) throw new java.io.IOException("rename failed");
+            synchronized (LOCK) {
+                if (writtenSet == null || !java.util.Arrays.equals(writtenSet, set)) setSince = h[2];
+                writtenSeq = h[2];
+                writtenSet = set;
+            }
         } catch (Throwable t) {
             if (!warned) EqLog.e("writing the CarPlay EQ's settings failed", t);
             warned = true;
@@ -215,6 +229,39 @@ final class CarPlayEq {
 
     static int state(int[] v) {
         return v == null ? IDLE : v[L_STATE];
+    }
+
+    /**
+     * (after 0.7.6) The watch's answers for settings x, when they are the ones it has in use (the
+     * last control file written, and its seq): {largest boost 0.01 dB, Hz, rate, solved gain 0..9
+     * in 0.01 dB}; null when it has none for them (an older watch, not mapped, not caught up yet).
+     */
+    static int[] answers(EqSettings x) {
+        byte[] want = x.toParam(3);
+        int ws, since;
+        byte[] wb;
+        synchronized (LOCK) {
+            ws = writtenSeq;
+            since = setSince;
+            wb = writtenSet;
+        }
+        if (wb == null || !java.util.Arrays.equals(want, wb)) return null;
+        int[] v = snapshot();
+        // for a write with these same settings: from the first such write to the last one
+        if (v == null || v[L_ANSSEQ] == 0 || v[L_ANSSEQ] - since < 0 || ws - v[L_ANSSEQ] < 0) return null;
+        int[] a = new int[3 + 10];
+        System.arraycopy(v, L_ANSPEAK, a, 0, 3);
+        System.arraycopy(v, L_ANSGAINS, a, 3, 10);
+        return a;
+    }
+
+    /**
+     * The watch is in a CarPlay app that runs now, with its live file (it can show CarPlay's levels
+     * and live view); a live file left by an app that has gone does not count.
+     */
+    static boolean present() {
+        int[] v = snapshot();
+        return v != null && v[L_LIB] != 0 && v[L_PID] > 0 && new File("/proc/" + v[L_PID]).exists();
     }
 
     static int why(int[] v) {

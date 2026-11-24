@@ -1,4 +1,4 @@
-EQ Engine 0.7.6 (NEMESIS package "eqengine")
+EQ Engine 0.7.7 (NEMESIS package "eqengine")
 ===========================================
 
 A 10-band EQ (or a parametric one with up to 20 bands), clip guard and
@@ -17,9 +17,13 @@ Install
    onto the top level of its own USB stick and keep it in the glovebox.
 2. Unzip eqengine-stick-<version>.zip onto the top level of this stick
    (NEMESIS.data, README-EQENGINE.txt, packages/ and EQENGINE-source/ at the
-   root).
+   root). Always the -stick zip: the plain eqengine-<version>.zip of a
+   release is the bare package for the NEMESIS Package Store, and does
+   nothing on a stick by itself.
 3. With the car on and Android running, plug this stick in, confirm the
-   install, and wait for "Operation completed successfully".
+   install, and leave the stick in until it has finished (the install writes
+   its notes here): NEMESIS 1.16 says "Operation completed successfully";
+   from NEMESIS 1.17, Package Manager lists EQ Engine under Installed.
 4. Remove the stick and restart the head unit: turn the car off and on again
    (or use its reset pinhole). Until then EQ Engine is not loaded.
 5. Open EQ Engine (NEMESIS Manager > My Packages > EQ Engine > Launch) and
@@ -29,16 +33,35 @@ Install
 If NEMESIS Manager shows "Warning: Activity not started, its current task
 has been brought to the front", EQ Engine was already running: that is the
 output of Android's am command, and EQ Engine opens normally.
+Other audio add-ons: EQ Engine never undoes another package's changes. If a
+package or mod has changed Android's audio effects list
+(/system/etc/audio_effects.conf, or added /vendor/etc/audio_effects.conf),
+EQ Engine does not start at all (Android Auto, Bluetooth audio and CarPlay
+alike), and its Status page says why. If one has laid its own file over the
+CarPlay app's library, only EQ on CarPlay stays off, and the app tells you.
+HMG-API and its wireless package are fine: the tested car runs them.
 
 Install over an earlier version
 Plug in this stick, answer Yes to "Updating EQ Engine requires reinstalling",
-wait for "Operation completed successfully", then restart the head unit (turn
-the car off and on again). Your EQ
-settings and User presets are kept. Until the restart Android's audio still
-has the old filter, and CarPlay gets the EQ from that restart on. Detailed
-logging is switched off by every update. There are no built-in genre presets
-since 0.7.5 (0.6.6 had them): an EQ loaded from one stays as it is (shown as
-Custom).
+wait until it has finished (as in step 3 above), then restart the head unit
+(turn the car off and on again). Your EQ
+settings and User presets are kept (when the version you update from is this
+one or later, even if the power goes off during the update). During the
+install the EQ drops out for a few seconds, then comes back. Until the restart
+Android's audio still has the old filter: 48 kHz output carries on, and the
+new filter's features wait for the restart. If EQ on CarPlay was already
+running, the CarPlay app keeps the old version's layer, with your EQ, until
+then; otherwise CarPlay gets the EQ from that restart on. Detailed logging is
+switched off by every update. There are no built-in genre presets since 0.7.5
+(0.6.6 had them): an EQ loaded from one stays as it is (shown as Custom).
+NEMESIS reinstalls the app at every update, so the signing key does not
+matter here. A head unit software update (USB or over the air) normally
+removes NEMESIS itself: reinstall NEMESIS (see its own README), and EQ Engine
+if NEMESIS does not bring it back.
+The install writes a diagnostic note to EQENGINE/ on this stick. It also
+records a system log during the install, deleted again when the install
+works; a log left there after a failed install holds personal data (phone
+names, Bluetooth addresses, songs), so share it only privately.
 
 Pages (rail on the left)
 - EQ, Easy (the default): drag a slider up or down anywhere in its column (a
@@ -138,7 +161,10 @@ CarPlay's music does not go through Android's audio server: the factory
 CarPlay app plays it to the speaker link itself. So at each car start, before
 the CarPlay app starts, EQ Engine lays a layer over the app's JNI library (in
 memory; nothing on the car is written). The app starts as it always does and
-is never restarted for it. The layer loads an unchanged copy of the car's own
+is not restarted for it (one exception: if the layer could not load, CarPlay
+cannot work in that run of the app anyway, so EQ Engine takes the layer off
+and restarts the app once, only with no phone connected; otherwise it asks
+you to restart the car). The layer loads an unchanged copy of the car's own
 library, hands everything to it, and runs EQ Engine's own filter on CarPlay's
 music: the EQ page's settings (Easy or Expert), the preamp, clip guard and
 listening position. It is checked first in a separate process, at the install
