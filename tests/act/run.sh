@@ -109,6 +109,14 @@ S
 #!/bin/sh
 read u r < /tmp/eqeact/proc/uptime; u=${u%%.*}; echo "$((u + $1)).10 50.00" > /tmp/eqeact/proc/uptime
 T=/tmp/eqeact
+# Android's zygote starting after that many sleeps (zygote_in; after 0.7.8)
+if [ -f $T/zygote_in ]; then
+    n=$(($(cat $T/zygote_in) - 1))
+    if [ $n -le 0 ]; then
+        rm -f $T/zygote_in; mkdir -p $T/proc/150
+        echo "150 (zygote) S 1 150 0 0 -1 4194560 9000 0 4 0 300 120 0 0 20 0 60 0 300 893760000 18277 4294967295" > $T/proc/150/stat
+    else echo $n > $T/zygote_in; fi
+fi
 [ -d $T/data/eqengine/state/hold ] && /bin/sleep 0.03
 # music that starts a moment after a switch made while nothing played (start_after_set)
 if [ -f $T/start_in ]; then
@@ -389,20 +397,24 @@ else
     echo closed > $d/status; echo closed > $d/hw_params
 fi
 S
+    # (after 0.7.8) mount and umount follow symlinks on their target as the kernel does (a NEMESIS
+    # LivePatch farm's), and the mount is listed at the file it landed on
     cat > $T/stubs/mount <<'S'
 #!/bin/sh
 # mount -o bind SRC DST
 [ "$1" = "-o" ] && [ "$2" = "bind" ] || exit 1
-cp "$4" "$4.under" && cp "$3" "$4" && echo "none $4 none rw 0 0" >> /tmp/eqeact/proc/mounts
+p=$(readlink -f "$4"); [ -n "$p" ] || p=$4
+cp "$p" "$p.under" && cp "$3" "$p" && echo "none $p none rw 0 0" >> /tmp/eqeact/proc/mounts
 S
     cat > $T/stubs/umount <<'S'
 #!/bin/sh
-grep -q " $1 " /tmp/eqeact/proc/mounts || exit 1
+p=$(readlink -f "$1"); [ -n "$p" ] || p=$1
+grep -q " $p " /tmp/eqeact/proc/mounts || exit 1
 [ -f /tmp/eqeact/umount_fail ] && { echo "failed: Device or resource busy" >&2; exit 1; }
 # the audio server has the file loaded
 [ -f /tmp/eqeact/busy ] && { echo "failed: Device or resource busy" >&2; exit 1; }
-cp "$1.under" "$1" && rm -f "$1.under"
-grep -v " $1 " /tmp/eqeact/proc/mounts > /tmp/eqeact/proc/mounts.n; mv /tmp/eqeact/proc/mounts.n /tmp/eqeact/proc/mounts
+cp "$p.under" "$p" && rm -f "$p.under"
+grep -v " $p " /tmp/eqeact/proc/mounts > /tmp/eqeact/proc/mounts.n; mv /tmp/eqeact/proc/mounts.n /tmp/eqeact/proc/mounts
 S
     # eqe_lab: link rates from the simulated kernel, sampling_rate through the simulated mixer and driver
     cat > $T/data/eqengine/bin/eqe_lab <<'S'
@@ -413,10 +425,11 @@ case "$1" in
 check) echo "symbols 4 of 4" ;;
 umount)
     echo "umount $2" >> $T/umount.log
-    grep -q " $2 " $T/proc/mounts || { echo "failed: Invalid argument"; exit 1; }
+    p=$(readlink -f "$2"); [ -n "$p" ] || p=$2
+    grep -q " $p " $T/proc/mounts || { echo "failed: Invalid argument"; exit 1; }
     [ -f $T/umount_fail ] && { echo "failed: Device or resource busy"; exit 1; }
-    cp "$2.under" "$2" && rm -f "$2.under"
-    grep -v " $2 " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
+    cp "$p.under" "$p" && rm -f "$p.under"
+    grep -v " $p " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
     echo "detached $2" ;;
 rate)
     # rate_none: that many counts get nothing (the link stopped during the count)
@@ -1205,7 +1218,8 @@ cp $T/dipo_maps $T/proc/$n/maps
 $T/stubs/dipo_fd $n
 echo "b2800000-b2810000 r-xp 00000000 b3:19 88   /system/lib/libCarPlayAndroid.so" >> $T/proc/$n/maps
 m=0
-grep -q " $T/system/lib/libCarPlayAndroid.so " $T/proc/mounts && m=1
+# (after 0.7.8) the app gets the watch when the file it opens is the watch (through a farm too)
+cmp -s $T/system/lib/libCarPlayAndroid.so $T/data/eqengine/lib/eqe_cpwatch.so && m=1
 if [ $m = 1 ] && [ ! -f $T/cps_noload ]; then
     [ -f $T/cps_nocopy ] || echo "b2700000-b2710000 r-xp 00000000 b3:19 89   /data/eqengine/lib/libCarPlayAndroid.car.so" >> $T/proc/$n/maps
     st=watching
@@ -1389,6 +1403,70 @@ ok "turning it off leaves another package's mount alone" "[ $(rc) = 0 ] && grep 
 foreign; echo "1 $FMD5 1000" > $CS/cpw_want; run off
 ok "EQ Engine off leaves another package's mount alone" "grep -qx \"another package's CarPlay library\" $JNI && jmounted"
 rm -f $CS/disabled; cp $JNI.under $JNI; rm -f $JNI.under; grep -v " $JNI " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
+
+echo "-- a NEMESIS LivePatch farm over /system/lib (after 0.7.8: NEMESIS 1.17 with Enhanced Phone Projection)"
+LP=$T/data/nemesis/livepatch
+STK=$LP/stock/system/lib/libCarPlayAndroid.so
+STKD=$LP/stock/system/lib
+# LivePatch's farm, as native/livepatch.c builds it: the folder's stock view (a bind of /system's
+# folder, without the mounts made on files in it) and a tmpfs of symlinks into it laid over the
+# folder. A mount made at the file's path before stays listed there, hidden.
+farm() {
+    mkdir -p $STKD $LP/out/system/lib
+    if [ -f $JNI.under ]; then cp $JNI.under $STK; else cp $JNI $STK; fi
+    rm -f $JNI $JNI.under
+    ln -s $STK $JNI
+    { echo "/dev/block/system $T/system ext4 ro 0 0"; echo "/dev/block/userdata $T/data ext4 rw 0 0"
+      echo "/dev/block/system $STKD ext4 ro 0 0"; echo "tmpfs $T/system/lib tmpfs ro 0 0"; } >> $T/proc/mounts
+}
+stkmounted() { grep -q " $STK " $T/proc/mounts; }
+# a car start with the farm in place (LivePatch builds it before the zygote): no mount of EQ
+# Engine's left, the boot step, then the app from the zygote
+farmstart() {
+    rm -rf $T/proc/$(cat $T/dipo_pid)
+    [ -f $STK.under ] && cp $STK.under $STK && rm -f $STK.under
+    grep -v -e " $JNI " -e " $STK " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
+    rm -f $CS/cpwatch $CS/cpw_restarts
+    run cpwboot
+    cp $T/out.txt $T/boot_out.txt
+    $T/stubs/dipo_start
+}
+cpwsetup; run cpwatch 1; carstart; run cpwguard; farm; rm -rf $T/proc/2300; $T/stubs/dipo_start
+ok "farm laid over after the watch's mount (the owner's report): the app's next start gets the factory library" "grep -qx 'start 2310 mounted=0' $T/dipo_starts.log && jmounted && [ -L $JNI ]"
+export EQE_CPW_NOTIFY=1; run cpwatch 1; unset EQE_CPW_NOTIFY
+ok "... turning it on there is not refused as another package's file (its own hidden mount); on from the next car start" "[ $(rc) = 0 ] && ! grep -q 'another package' $T/out.txt && grep -q 'EQE_CPW on from the next car start' $T/out.txt && [ ! -f $CS/cpw_failed ] && [ \"\$(cat $CS/cpw_want)\" = \"1 $FMD5 1000\" ] && [ \"\$(md5sum < $COPY | cut -c1-32)\" = $FMD5 ]"
+farmstart
+ok "... the next car start with the farm: laid over the file the farm shows, the app gets the watch" "grep -q 'EQE_CPW laid over the CarPlay app.s JNI library at the car start' $T/boot_out.txt && stkmounted && ! jmounted && cmp -s $JNI $CPWF && [ -L $JNI ] && grep -qx 'start 2320 mounted=1' $T/dipo_starts.log"
+run cpwguard
+ok "... the guard: on in the app" "[ \"\$(cst state)\" = on ] && [ \"\$(cst pid)\" = 2320 ]"
+run cpwatch 1
+ok "... cpwatch on: already on there" "[ $(rc) = 0 ] && grep -q 'EQE_CPW already on' $T/out.txt && [ \$(grep -c \" $STK \" $T/proc/mounts) = 1 ]"
+# the farm taken down and built again (nemesis remount rw --bypass-livepatch, then ro): the stock
+# view is new, without the watch's mount
+cp $STK.under $STK; rm -f $STK.under; grep -v " $STK " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
+run cpwguard
+ok "the farm built again after a step-aside: the guard lays the watch over again for the app's next start" "grep -q 'laid over again: the CarPlay app.s next start would have opened the factory library' $CS/cpw_result && stkmounted && cmp -s $JNI $CPWF && [ \"\$(cst state)\" = on ]"
+run cpwatch 0
+ok "off with the farm: the watch taken off the file the farm shows, the factory library back there" "[ $(rc) = 0 ] && ! stkmounted && [ \"\$(md5sum < $JNI | cut -c1-32)\" = $FMD5 ] && [ \"\$(cst state)\" = ending ]"
+run cpwguard
+ok "... the guard does not lay it over again once it is off" "! stkmounted && [ \$(grep -c 'laid over again' $CS/cpw_result) = 1 ]"
+cpwsetup; farm; run cpwatch 1; farmstart
+ok "the farm already there at the first car start: laid over the file the farm shows" "stkmounted && cmp -s $JNI $CPWF && grep -qx 'start 2300 mounted=1' $T/dipo_starts.log && [ \"\$(cst state)\" = waiting ]"
+run off
+ok "... EQ Engine off: taken off there" "! stkmounted && [ \"\$(md5sum < $JNI | cut -c1-32)\" = $FMD5 ] && [ ! -f $CS/cpw_want ]"
+rm -f $CS/disabled
+cpwsetup; farm; echo "another package's CarPlay library" > $LP/out/system/lib/libCarPlayAndroid.so; rm -f $JNI; ln -s $LP/out/system/lib/libCarPlayAndroid.so $JNI
+run cpwatch 1
+ok "another package's LivePatch file behind the farm (on /data): refused, nothing laid over it" "[ $(rc) = 1 ] && grep -q 'EQE_CPW refused: another package has a file laid over' $T/out.txt && ! grep -q \" $LP/out\" $T/proc/mounts && grep -qx \"another package's CarPlay library\" $JNI"
+
+echo "-- the car start waits for Android's zygote (after 0.7.8: LivePatch's farms are built by then)"
+cpwsetup; run cpwatch 1; rm -rf $T/proc/150; echo 3 > $T/zygote_in; rm -rf $T/proc/$(cat $T/dipo_pid)
+run cpwboot
+ok "cpwboot waits for the zygote, then lays the watch over" "[ ! -f $T/zygote_in ] && [ -f $T/proc/150/stat ] && jmounted && grep -q 'EQE_CPW laid over the CarPlay app.s JNI library at the car start' $T/out.txt && ! grep -q 'had not started' $T/out.txt"
+cpwsetup; run cpwatch 1; rm -rf $T/proc/150 $T/proc/$(cat $T/dipo_pid); export EQE_CPW_ZWAIT=2
+run cpwboot
+unset EQE_CPW_ZWAIT
+ok "no zygote after the wait: laid over anyway, and said" "jmounted && grep -q 'EQE_CPW Android.s zygote had not started after 2 s; laid over now' $T/out.txt"
 
 echo "-- refusals and failures"
 cpwsetup; touch $CS/disabled

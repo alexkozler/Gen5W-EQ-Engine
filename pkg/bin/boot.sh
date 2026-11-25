@@ -49,7 +49,7 @@
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.7.8
+VER=0.7.9
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -91,9 +91,53 @@ event() {
     echo "$(up) $*" >> $S/events.log
 }
 
+# (after 0.7.8) NEMESIS 1.17's LivePatch shows a folder in which a package adds a new file through a
+# "farm": a read-only tmpfs of symlinks laid over the folder, each pointing at a view of the stock
+# folder that has no mount made on a file inside it. A mount made at a file's path before the farm
+# is hidden by it (though /proc/mounts still lists it there); one made after it lands on the file
+# the symlink points to, which is what the audio server opens. real_path <path>: the path with
+# every symlink on the way followed, into RP. Builtins only, plus one ls for each symlink
+# found (none without a farm), so it may run before the mount.
+real_path() {
+    RP=""
+    _rp_r=${1#/}
+    _rp_n=0
+    while [ -n "$_rp_r" ]; do
+        case "$_rp_r" in
+            */*) _rp_c=${_rp_r%%/*}; _rp_r=${_rp_r#*/} ;;
+            *) _rp_c=$_rp_r; _rp_r="" ;;
+        esac
+        case "$_rp_c" in
+            ''|.) continue ;;
+            ..) RP=${RP%/*}; continue ;;
+        esac
+        if [ -L "$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
+            _rp_n=$((_rp_n + 1))
+            # the link's target from toolbox ls -l ("... name -> target")
+            _rp_l=""
+            set -f
+            set -- $(ls -l "$RP/$_rp_c" 2>/dev/null)
+            set +f
+            while [ $# -gt 1 ]; do
+                [ "$1" = "->" ] && { _rp_l=$2; break; }
+                shift
+            done
+            case "$_rp_l" in
+                '') ;;
+                /*) RP=""; _rp_r=${_rp_l#/}${_rp_r:+/$_rp_r}; continue ;;
+                *) _rp_r=$_rp_l${_rp_r:+/$_rp_r}; continue ;;
+            esac
+        fi
+        RP=$RP/$_rp_c
+    done
+    [ -n "$RP" ] || RP=/
+}
+
+# something is mounted where the audio server opens its effects list (through a farm too)
 mounted() {
+    real_path $TARGET
     while read _d _m _rest; do
-        [ "$_m" = "$TARGET" ] && return 0
+        [ "$_m" = "$RP" ] && return 0
     done < $PROC/mounts
     return 1
 }
@@ -442,12 +486,35 @@ unmount_all() {
     lab_off
     _i=0
     while mounted && ours $TARGET $OURS && [ $_i -lt 5 ]; do
-        umount $TARGET
+        umount $RP
         _i=$((_i + 1))
         mounted && sleep 1
     done
     mounted && ours $TARGET $OURS && return 1
     return 0
+}
+
+# (after 0.7.8) Once the zygote runs, NEMESIS 1.17's LivePatch has built its farms (from its script
+# at app_process, just before the zygote). A farm laid over /system/etc after the car start's
+# overlay hides it: the audio server running now has EQ Engine's list, but the next one (an audio
+# restart) would read the factory list. Then the overlay is laid again where the farm shows the
+# file, when that is the factory list (never over another package's). Once per zygote.
+FX_FARM=""
+fx_farm_check() {
+    FX_FARM=$ZYPID
+    [ "$OVERLAY" = 1 ] || return 0
+    real_path $TARGET
+    [ "$RP" = "$TARGET" ] && return 0
+    mounted && ours $TARGET $OURS && return 0
+    if [ "$(md5of $TARGET)" != "$EXPECT_ORIG" ]; then
+        event "a NEMESIS LivePatch farm shows Android's effects list from $RP, and it is not the factory list: left alone; the next audio server may not load EQ Engine"
+        return 0
+    fi
+    if $MOUNT -o bind $OURS $RP && mounted && ours $TARGET $OURS; then
+        event "effects list overlay laid again at $RP: a NEMESIS LivePatch farm was laid over its folder after the car start's overlay"
+    else
+        event "a NEMESIS LivePatch farm hides the effects list overlay, and it could not be laid again at $RP: the next audio server may not load EQ Engine"
+    fi
 }
 
 stop_here() {
@@ -679,7 +746,9 @@ else
         PHASE=applied
         [ $FRESH = 1 ] && PHASE=installed
         echo "$BID $PHASE" > $S/lastboot
-        if $MOUNT -o bind $OURS $TARGET; then
+        # (after 0.7.8) on the file the audio server really opens (real_path: a LivePatch farm's)
+        real_path $TARGET
+        if $MOUNT -o bind $OURS $RP; then
             up_at
             T_MOUNT=$UP_AT
             snap_ms
@@ -872,6 +941,7 @@ while :; do
     # Android's zygote, to tell a framework restart from an audio server crash (looked up again
     # only while not known)
     [ -z "$ZYPID" ] && ZYPID=$(zygote_pid)
+    [ -n "$ZYPID" ] && [ "$FX_FARM" != "$ZYPID" ] && fx_farm_check
     cap_check
     if [ $GOOD = 0 ] && [ $OVERLAY = 1 ] && [ $MSR = 0 ] && [ $((NOW - APPLIED_AT)) -ge $GOOD_AFTER ] && \
        [ $((NOW - CR48_AT)) -ge $GOOD_AFTER ]; then

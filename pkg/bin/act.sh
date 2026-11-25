@@ -39,7 +39,7 @@
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
-VER=0.7.8
+VER=0.7.9
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -121,10 +121,80 @@ ms_pid() {
 # never overwritten. Through 0.7.6 they used _m, and the report's effects-list check printed a
 # mount point where the md5 belonged.)
 mounted() {
+    real_path $TARGET
     while read _mt_d _mt_m _mt_r; do
-        [ "$_mt_m" = "$TARGET" ] && return 0
+        [ "$_mt_m" = "$RP" ] && return 0
     done < /proc/mounts
     return 1
+}
+
+# (after 0.7.8) NEMESIS 1.17's LivePatch shows a folder in which a package adds a new file through a
+# "farm": a read-only tmpfs of symlinks laid over the folder, each pointing at a view of the stock
+# folder (/data/nemesis/livepatch/stock/...) that has no mount made on a file inside it (Enhanced
+# Phone Projection 3.0.0's libCarPlayConverter.so farms /system/lib). A mount made at a file's path
+# before the farm is hidden by it, although /proc/mounts still lists it there; a mount made after it
+# lands on the file the symlink points to, which is what a process opening the path gets. So EQ
+# Engine's mounts are made, found and taken off at the path real_path gives.
+# real_path <path>: the path with every symlink on the way followed, into RP. Builtins, plus one
+# ls for each symlink found (none without a farm).
+real_path() {
+    RP=""
+    _rp_r=${1#/}
+    _rp_n=0
+    while [ -n "$_rp_r" ]; do
+        case "$_rp_r" in
+            */*) _rp_c=${_rp_r%%/*}; _rp_r=${_rp_r#*/} ;;
+            *) _rp_c=$_rp_r; _rp_r="" ;;
+        esac
+        case "$_rp_c" in
+            ''|.) continue ;;
+            ..) RP=${RP%/*}; continue ;;
+        esac
+        if [ -L "$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
+            _rp_n=$((_rp_n + 1))
+            # the link's target from toolbox ls -l ("... name -> target")
+            _rp_l=""
+            set -f
+            set -- $(ls -l "$RP/$_rp_c" 2>/dev/null)
+            set +f
+            while [ $# -gt 1 ]; do
+                [ "$1" = "->" ] && { _rp_l=$2; break; }
+                shift
+            done
+            case "$_rp_l" in
+                '') ;;
+                /*) RP=""; _rp_r=${_rp_l#/}${_rp_r:+/$_rp_r}; continue ;;
+                *) _rp_r=$_rp_l${_rp_r:+/$_rp_r}; continue ;;
+            esac
+        fi
+        RP=$RP/$_rp_c
+    done
+    [ -n "$RP" ] || RP=/
+}
+
+# dev_at <mount point>: the device of the last mount listed there, into DV ("" if none)
+dev_at() {
+    DV=""
+    while read _dv_d _dv_m _dv_r; do
+        [ "$_dv_m" = "$1" ] && DV=$_dv_d
+    done < $PROC/mounts
+}
+
+# dev_of <path>: the device of the mount the file at <path> is on (the last of the longest mount
+# points that is the path itself or a folder above it), into DV
+dev_of() {
+    DV=""
+    _dv_l=-1
+    while read _dv_d _dv_m _dv_r; do
+        case "$1" in
+            "$_dv_m"|"$_dv_m"/*) ;;
+            *) [ "$_dv_m" = / ] || continue ;;
+        esac
+        if [ ${#_dv_m} -ge $_dv_l ]; then
+            DV=$_dv_d
+            _dv_l=${#_dv_m}
+        fi
+    done < $PROC/mounts
 }
 
 # 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its
@@ -386,6 +456,13 @@ mounted_at() {
         [ "$_mt_m" = "$1" ] && return 0
     done < $PROC/mounts
     return 1
+}
+
+# something is mounted where a process opening Android's effects list gets it (after 0.7.8: through
+# a LivePatch farm too, real_path)
+efx_mounted() {
+    real_path $EFX_T
+    mounted_at $RP
 }
 
 # While the audio server has the file open (the driver watch is loaded in it), a plain umount
@@ -1686,6 +1763,9 @@ cp_process_probe() {
     [ -n "$_ppp" ] && [ "$_ppp" = "$_pz" ] && _ppn=" (the zygote)"
     echo "  its parent: pid ${_ppp:-?}$_ppn; groups: ${_pgr:-none}; effective capabilities: ${_pce:-?}; personality: ${_pper:-?}"
     maps_has $_pp ${CPW_COPY##*/} && echo "  EQ Engine's CarPlay watch is loaded in it (in place of libCarPlayAndroid.so; started from the zygote as usual)"
+    # (after 0.7.8) its JNI library seen through a symlink: a NEMESIS LivePatch farm over its folder
+    real_path $CPW_T
+    [ "$RP" != "$CPW_T" ] && echo "  its JNI library is reached through a symlink (a NEMESIS LivePatch farm over its folder): $RP"
     dumpsys package $CP_APP 2>/dev/null | {
         _pn=0
         while read -r _pl; do
@@ -2172,26 +2252,48 @@ cpw_file_ok() {
 }
 
 # 0.7.6: what is mounted at the CarPlay app's JNI library path is checked by whose file it is.
+# (after 0.7.8) at the path the app really opens (real_path: through a LivePatch farm over
+# /system/lib, the stock view's file), which is left in CPW_MP.
 # 0 = EQ Engine's watch is the file there now (the top of anything mounted there).
 cpw_mounted() {
-    mounted_at $CPW_T || return 1
+    real_path $CPW_T
+    CPW_MP=$RP
+    mounted_at $CPW_MP || return 1
     _mw=""
     [ -f $CPWSUM ] && read _mw < $CPWSUM
-    [ -n "$_mw" ] && [ "$(md5of $CPW_T)" = "$_mw" ]
+    [ -n "$_mw" ] && [ "$(md5of $CPW_MP)" = "$_mw" ]
 }
 
-# 0 = something that is not EQ Engine's watch is mounted there (another package's file)
+# (after 0.7.8) 0 = the file the app opens there is the factory one: nothing mounted on it, and it
+# is on /system's own filesystem (directly, or through LivePatch's stock view, a bind of /system).
+# Where /system is not a mount of its own (the tests' plain folders), nothing mounted on it.
+cpw_factory() {
+    real_path $CPW_T
+    CPW_MP=$RP
+    mounted_at $CPW_MP && return 1
+    dev_at $SYS/system
+    [ -n "$DV" ] || return 0
+    _fsd=$DV
+    dev_of $CPW_MP
+    [ "$DV" = "$_fsd" ]
+}
+
+# 0 = another package's file is the one the app opens there: neither EQ Engine's watch nor the
+# factory file. (Through 0.7.8: anything mounted at the path itself, which a LivePatch farm laid
+# over /system/lib after the watch's mount made of EQ Engine's own, hidden, mount.)
 cpw_foreign() {
-    mounted_at $CPW_T && ! cpw_mounted
+    ! cpw_mounted && ! cpw_factory
 }
 
 # Takes EQ Engine's watch off that path, and only it: one mount at a time while the file on top is
 # the watch, never another package's mount there. A plain umount says "busy" while a process has
 # the file mapped: then it is detached (eqe_lab umount). 0 = the watch is not mounted there now.
+# (A mount of the watch hidden under a farm cannot be reached; it is not the app's file either,
+# and it goes at the next car start.)
 cpw_unmount() {
     _ui=0
     while cpw_mounted && [ $_ui -lt 4 ]; do
-        umount $CPW_T 2>/dev/null || { [ -x $LABBIN ] && $LABBIN umount $CPW_T > /dev/null 2>&1; }
+        umount $CPW_MP 2>/dev/null || { [ -x $LABBIN ] && $LABBIN umount $CPW_MP > /dev/null 2>&1; }
         _ui=$((_ui + 1))
         cpw_mounted && sleep 1
     done
@@ -2209,13 +2311,31 @@ cpw_copy() {
 }
 
 # Lays the watch over the CarPlay app's JNI library and checks that what is there now is the watch
-# (its md5 from the install): 0, else the mount is taken off again and 1.
+# (its md5 from the install): 0, else the mount is taken off again and 1. (after 0.7.8) On the file
+# the app really opens (real_path), which mount would follow a farm's symlink to anyway.
 cpw_mount() {
-    if ! $MOUNT -o bind $CPW $CPW_T || ! cpw_mounted; then
+    real_path $CPW_T
+    if ! $MOUNT -o bind $CPW $RP || ! cpw_mounted; then
         cpw_unmount
         return 1
     fi
     return 0
+}
+
+# (after 0.7.8) cpwboot waits for Android's zygote before laying the watch over: NEMESIS 1.17's
+# LivePatch builds its farms from its script at /system/bin/app_process just before the zygote
+# starts (after checking every file it patches), and a farm built after the mount would hide it.
+# The CarPlay app is started from the zygote, seconds later, so it never starts first. Without
+# LivePatch the zygote is up by the time the boot step gets here (about 3 s).
+CPW_ZWAIT=${EQE_CPW_ZWAIT:-30}
+cpw_zygote_wait() {
+    _zw=0
+    while :; do
+        zygote_pid > /dev/null && return 0
+        [ $_zw -ge $CPW_ZWAIT ] && return 1
+        sleep 1
+        _zw=$((_zw + 1))
+    done
 }
 
 # act.sh cpwatch 1: checks the watch and the copy now, and records the choice for the next car start.
@@ -2349,6 +2469,8 @@ cpw_boot() {
     case "$_bu" in
         ''|*[!0-9]*) _bu=1000 ;;
     esac
+    # (after 0.7.8) not before the zygote runs (NEMESIS's LivePatch farms are built by then)
+    cpw_zygote_wait || cpw_result "Android's zygote had not started after $CPW_ZWAIT s; laid over now (the keeper's guard lays it over again if a LivePatch farm hides it)"
     # already laid over at this car start (the boot step runs again when EQ Engine is turned on)
     cpw_mounted && return 0
     if cpw_foreign; then
@@ -2406,6 +2528,27 @@ cpw_boot() {
 # over: the app's first start with it is noted (on), a later start too (it keeps the watch, the
 # mount is still there), a second later start within two minutes takes it off, and so does a watch
 # that says the factory library did not load.
+# (after 0.7.8) Is the watch still what the app's next start opens? A LivePatch farm laid over
+# /system/lib after the watch's mount (cpwboot gave up waiting for the zygote, or the farm was
+# rebuilt after `nemesis remount rw --bypass-livepatch`, whose step-aside takes the stock view and
+# the watch's mount on it away) leaves the factory file there: the watch is laid over again where
+# the app looks; the app running now keeps what it has. Never over another package's file. Builtins
+# only, plus one ls while the path goes through a symlink; at most 3 tries per keeper.
+CPW_RELAYS=0
+cpw_relay() {
+    [ $CPW_RELAYS -lt 3 ] || return 0
+    [ -f $CPW_WANT ] && [ ! -f $S/disabled ] || return 0
+    real_path $CPW_T
+    mounted_at $RP && return 0
+    cpw_factory || return 0
+    CPW_RELAYS=$((CPW_RELAYS + 1))
+    if cpw_mount; then
+        cpw_result "laid over again: the CarPlay app's next start would have opened the factory library (a NEMESIS LivePatch farm laid over its folder after the watch); the app running now keeps what it has"
+    else
+        cpw_result "could not be laid over again where the CarPlay app opens its library ($CPW_MP)"
+    fi
+}
+
 cpw_guard() {
     # state and pid with builtins (the keeper runs this every 3 s for the whole drive)
     _gst=""; _gp=""
@@ -2421,6 +2564,7 @@ cpw_guard() {
         waiting|on) ;;
         *) return 0 ;;
     esac
+    cpw_relay
     # (after 0.7.6) the usual case, with no process started: on in the app process it was found
     # in, that process still the CarPlay app, its status not "failed". The full check below (the
     # mount's md5, a scan of every process) would find the same and change nothing.
@@ -2623,9 +2767,9 @@ report_checks() {
     _m=$(md5of $EFX_T)
     if [ ! -f $EFX_T ]; then
         check NO "effects list: $EFX_T is missing"
-    elif mounted_at $EFX_T && ours $EFX_T $D/conf/audio_effects.conf; then
+    elif efx_mounted && ours $EFX_T $D/conf/audio_effects.conf; then
         check ok "effects list: EQ Engine's copy is laid over Android's (md5 $_m)"
-    elif mounted_at $EFX_T; then
+    elif efx_mounted; then
         check NO "effects list: another package's file is laid over Android's (md5 $_m); EQ Engine does not start while it is there"
     elif [ "$_m" = $EFX_MD5 ]; then
         check ok "effects list: the stock one EQ Engine was built for (md5 $_m), not laid over now"
@@ -2781,9 +2925,9 @@ report() {
             echo "  $(md5of $_f) $4 bytes $_f"
         done
         lab_watch_on && echo "  (the driver watch is laid over the driver; the factory driver's copy: $(md5of $HAL_COPY))"
-        if mounted_at $EFX_T && ours $EFX_T $D/conf/audio_effects.conf; then
+        if efx_mounted && ours $EFX_T $D/conf/audio_effects.conf; then
             echo "  (EQ Engine's effects list is laid over Android's)"
-        elif mounted_at $EFX_T; then
+        elif efx_mounted; then
             echo "  (another package's file is laid over Android's effects list)"
         fi
         for _f in $SYS/system/etc/audio_policy.conf $SYS/vendor/etc/audio_policy.conf; do

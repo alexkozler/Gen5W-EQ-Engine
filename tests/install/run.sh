@@ -21,18 +21,22 @@ set -- $(md5sum "$1") "$1"
 echo "$1  $3"
 S
     # mount -o bind <file> <path>: the file laid over the path (the old one kept underneath)
+    # (after 0.7.8) as the kernel: symlinks on the path are followed (a NEMESIS LivePatch farm's), and
+    # the mount is listed at the file it landed on
     cat > $T/stubs/mount <<'S'
 #!/bin/sh
 [ "$1" = -o ] && [ "$2" = bind ] || exit 1
-cp "$4" "$4.under.$$" && cat "$3" > "$4" && echo "none $4 none rw 0 0" >> /tmp/eqeinst/proc/mounts
-mv "$4.under.$$" "$4.under"
+p=$(readlink -f "$4"); [ -n "$p" ] || p=$4
+cp "$p" "$p.under.$$" && cat "$3" > "$p" && echo "none $p none rw 0 0" >> /tmp/eqeinst/proc/mounts
+mv "$p.under.$$" "$p.under"
 S
     cat > $T/stubs/umount <<'S'
 #!/bin/sh
-grep -q " $1 " /tmp/eqeinst/proc/mounts || exit 1
+p=$(readlink -f "$1"); [ -n "$p" ] || p=$1
+grep -q " $p " /tmp/eqeinst/proc/mounts || exit 1
 echo "umount $1" >> /tmp/eqeinst/umount.log
-[ -f "$1.under" ] && mv "$1.under" "$1"
-grep -v " $1 " /tmp/eqeinst/proc/mounts > /tmp/eqeinst/proc/mounts.n; mv /tmp/eqeinst/proc/mounts.n /tmp/eqeinst/proc/mounts
+[ -f "$p.under" ] && mv "$p.under" "$p"
+grep -v " $p " /tmp/eqeinst/proc/mounts > /tmp/eqeinst/proc/mounts.n; mv /tmp/eqeinst/proc/mounts.n /tmp/eqeinst/proc/mounts
 S
     cat > $T/stubs/setprop <<'S'
 #!/bin/sh
@@ -212,6 +216,26 @@ rm -f $T/umount.log; mkdir -p $T/stick; RUNDIR=$T/stick runs $R/rescue/eqengine-
 RF=$(ls $T/stick/EQENGINE-RESCUE/rescue_*.txt 2>/dev/null | head -n1)
 ok "rescue: another package's file over the CarPlay library is left alone, and named as such (not as a Lab test)" "grep -q \"another package's file is laid over $T/system/lib/libCarPlayAndroid.so: left as it is\" \"$RF\" && ! grep -q 'Lab test' \"$RF\" && grep -q ' $T/system/lib/libCarPlayAndroid.so ' $T/proc/mounts"
 ok "rescue: another package's driver file is left alone and named as such (after 0.7.6)" "grep -qx \"another package's driver\" $T/system/lib/hw/audio.primary.tcc803x.so && grep -q \"another package's file is laid over $T/system/lib/hw/audio.primary.tcc803x.so: left as it is\" \"$RF\" && [ ! -s $T/umount.log ]"
+
+echo "== (after 0.7.8) NEMESIS LivePatch farms over /system/lib and /system/etc: EQ Engine's mounts are on the files they show"
+ifarm() {  # $1 = folder under /system, $2 = file: the stock view's copy, and the farm's symlink at the path
+    mkdir -p $T/data/nemesis/livepatch/stock/system/$1
+    mv $T/system/$1/$2 $T/data/nemesis/livepatch/stock/system/$1/$2
+    ln -s $T/data/nemesis/livepatch/stock/system/$1/$2 $T/system/$1/$2
+}
+setup; runs $R/pkg/scripts/post.sh
+ifarm lib libCarPlayAndroid.so; ifarm etc audio_effects.conf
+$T/stubs/mount -o bind $D/conf/audio_effects.conf $T/system/etc/audio_effects.conf
+$T/stubs/mount -o bind $D/lib/eqe_cpwatch.so $T/system/lib/libCarPlayAndroid.so
+runs $R/pkg/scripts/preun.sh
+ok "preuninstall: the effects list and EQ on CarPlay's layer taken off the files the farms show" "[ \"\$(cat $T/system/etc/audio_effects.conf)\" = 'factory effects list' ] && [ \"\$(cat $T/system/lib/libCarPlayAndroid.so)\" = 'factory CarPlay JNI library' ] && ! grep -q livepatch $T/proc/mounts && [ -L $T/system/lib/libCarPlayAndroid.so ]"
+setup; runs $R/pkg/scripts/post.sh
+ifarm lib libCarPlayAndroid.so; ifarm etc audio_effects.conf
+$T/stubs/mount -o bind $D/conf/audio_effects.conf $T/system/etc/audio_effects.conf
+$T/stubs/mount -o bind $D/lib/eqe_cpwatch.so $T/system/lib/libCarPlayAndroid.so
+mkdir -p $T/stick; RUNDIR=$T/stick runs $R/rescue/eqengine-off.sh
+RF=$(ls $T/stick/EQENGINE-RESCUE/rescue_*.txt 2>/dev/null | head -n1)
+ok "rescue: the same, said as removed (not as another package's file)" "[ \"\$(cat $T/system/etc/audio_effects.conf)\" = 'factory effects list' ] && [ \"\$(cat $T/system/lib/libCarPlayAndroid.so)\" = 'factory CarPlay JNI library' ] && ! grep -q livepatch $T/proc/mounts && grep -q 'overlay removed' \"$RF\" && ! grep -q 'another package' \"$RF\""
 
 echo "$SH: $pass passed, $fail failed"
 [ $fail = 0 ]

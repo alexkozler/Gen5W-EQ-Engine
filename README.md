@@ -33,6 +33,10 @@ alongside it, including HMG-API's wireless CarPlay and Android Auto package
 [stereo width and mono bass](#positional-sound), Expert bands on the mid or the side only, and a
 Positional Sound page that shows the width on the car. What changed: [CHANGELOG.md](CHANGELOG.md).
 
+**0.7.9 is a pre-release**: 0.7.8 plus EQ on CarPlay with Enhanced Phone Projection 3.x on NEMESIS
+1.17 or later ([why 0.7.8 cannot](#eq-on-carplay-and-other-add-ons)). It should work on older
+NEMESIS as before, but has not been tested on a car yet.
+
 ## Verified vehicles
 
 | Car | Region | Audio system | Head unit software | Tested with |
@@ -293,7 +297,21 @@ EQ Engine keeps out of their way:
 - if another package has laid a file of its own over `libCarPlayAndroid.so`, EQ on CarPlay stays
   off (and says so) rather than covering it, and turning EQ Engine off, uninstalling it or the
   rescue stick never take another package's mount away: EQ Engine unmounts only its own files
-  (checked by md5).
+  (checked by md5);
+- **NEMESIS 1.17's LivePatch** shows a folder in which a package adds a new file through a
+  read-only layer of symlinks laid over the whole folder, pointing at a view of the stock files.
+  Enhanced Phone Projection 3.x adds one to `/system/lib`. A file EQ Engine laid over
+  `libCarPlayAndroid.so` before that layer was built is hidden by it, and the CarPlay app gets the
+  factory library. Through 0.7.8, EQ Engine then took the factory file it saw for another
+  package's, so EQ on CarPlay stayed off and said "another package has a file laid over
+  /system/lib/libCarPlayAndroid.so". From 0.7.9, EQ Engine lays its file over once Android's zygote
+  runs (LivePatch builds its layers just before it), on the file the layer points to, and tells
+  another package's file from the factory one by what the CarPlay app would open. If the layer is
+  built again later, EQ Engine's background check lays it over again for the CarPlay app's next
+  start.
+  This needs NEMESIS 1.17 and a package that adds a file there: NEMESIS 1.17 on its own, HMG-API's
+  wireless package, or Enhanced Phone Projection on older NEMESIS (which writes `/system` itself)
+  do not build such a layer. Not yet tested on a car with Enhanced Phone Projection.
 
 ## The 48 kHz switch
 
@@ -426,7 +444,10 @@ With the EQ off, CarPlay's music is passed through untouched too.
   `/vendor/etc/audio_effects.conf`), EQ Engine does not start at all (Android Auto, Bluetooth
   audio and CarPlay alike), and its Status page says why. If one has laid its own file over the
   CarPlay app's library, only EQ on CarPlay stays off, and the app tells you. HMG-API and its
-  wireless package are fine: the tested car runs them.
+  wireless package are fine: the tested car runs them. With **Enhanced Phone Projection 3.x on
+  NEMESIS 1.17 or later**, EQ on CarPlay needs 0.7.9 (a pre-release, not yet tested on a car):
+  0.7.8 and older keep it off there and wrongly say another package's file is in the way
+  ([why](#eq-on-carplay-and-other-add-ons)). Android Auto and Bluetooth audio are not affected.
 - Do this **parked**, never while reversing. The install itself restarts nothing, but you restart
   the head unit afterwards, and Android's audio server, which also runs the rear camera service,
   starts again with it.

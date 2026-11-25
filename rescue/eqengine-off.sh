@@ -23,18 +23,56 @@ T="${up%%.*}"
 OUT="$U/EQENGINE-RESCUE"
 mkdir -p "$OUT"
 
-mounted() {
+# (after 0.7.8) NEMESIS 1.17's LivePatch can lay a "farm" over a folder (a tmpfs of symlinks to a
+# view of the stock folder); EQ Engine's mounts are then on the file a symlink points to, and
+# umount follows the symlink there too. real_path <path>: the path with every symlink on the way
+# followed, into RP (as in act.sh).
+real_path() {
+    RP=""
+    _rp_r=${1#/}
+    _rp_n=0
+    while [ -n "$_rp_r" ]; do
+        case "$_rp_r" in
+            */*) _rp_c=${_rp_r%%/*}; _rp_r=${_rp_r#*/} ;;
+            *) _rp_c=$_rp_r; _rp_r="" ;;
+        esac
+        case "$_rp_c" in
+            ''|.) continue ;;
+            ..) RP=${RP%/*}; continue ;;
+        esac
+        if [ -L "$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
+            _rp_n=$((_rp_n + 1))
+            # the link's target from toolbox ls -l ("... name -> target")
+            _rp_l=""
+            set -f
+            set -- $(ls -l "$RP/$_rp_c" 2>/dev/null)
+            set +f
+            while [ $# -gt 1 ]; do
+                [ "$1" = "->" ] && { _rp_l=$2; break; }
+                shift
+            done
+            case "$_rp_l" in
+                '') ;;
+                /*) RP=""; _rp_r=${_rp_l#/}${_rp_r:+/$_rp_r}; continue ;;
+                *) _rp_r=$_rp_l${_rp_r:+/$_rp_r}; continue ;;
+            esac
+        fi
+        RP=$RP/$_rp_c
+    done
+    [ -n "$RP" ] || RP=/
+}
+
+# something is mounted where a process opening $1 gets it (through a farm too)
+mounted_at() {
+    real_path "$1"
     while read _d _m _rest; do
-        [ "$_m" = "$TARGET" ] && return 0
+        [ "$_m" = "$RP" ] && return 0
     done < $PROC/mounts
     return 1
 }
 
-mounted_at() {
-    while read _d _m _rest; do
-        [ "$_m" = "$1" ] && return 0
-    done < $PROC/mounts
-    return 1
+mounted() {
+    mounted_at $TARGET
 }
 
 # 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its

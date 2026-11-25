@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.7.9 (pre-release)
+
+All the changes from 0.7.8, and EQ on CarPlay with NEMESIS 1.17's LivePatch (tested on a PC, with
+real mounts laid out as LivePatch makes them; not yet tested on a car):
+
+### EQ on CarPlay with Enhanced Phone Projection on NEMESIS 1.17 or later
+
+- NEMESIS 1.17's LivePatch shows a folder in which a package adds a new file through a read-only
+  layer of symlinks laid over the folder; Enhanced Phone Projection 3.x adds one to `/system/lib`.
+  That layer hid EQ on CarPlay's file, and 0.7.8 then took the factory file it saw for another
+  package's: EQ on CarPlay stayed off and said "another package has a file laid over
+  /system/lib/libCarPlayAndroid.so". Android Auto and Bluetooth audio were not affected.
+- At the car start, EQ on CarPlay is laid over once Android's zygote runs (LivePatch builds its
+  layers just before it; the CarPlay app is started from the zygote seconds later), on the file the
+  layer points to.
+- Whether another package's file is in the way is judged by the file the CarPlay app would open:
+  EQ Engine's own, the factory file (on `/system`'s own filesystem, directly or through LivePatch's
+  stock view) or something else.
+- If LivePatch builds the layer again later, EQ Engine's background check lays EQ on CarPlay over
+  again for the CarPlay app's next start (a few tries at most, never over another package's file).
+- Turning it off, EQ Engine off, uninstalling and the rescue stick take EQ Engine's files off where
+  the layer shows them.
+- The same for Android's effects list, should a package ever add a file to `/system/etc`: the
+  overlay is laid again where the layer shows the list, so a later audio restart still loads EQ
+  Engine.
+- The car report notes when the CarPlay library is reached through such a layer.
+
 ## 0.7.8
 
 All the changes from 0.7.7, and stereo width, mono bass and Expert bands on the mid or the side

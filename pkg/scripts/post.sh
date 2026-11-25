@@ -84,7 +84,7 @@ mkdir -p $D/share
 [ -n "$OWNER" ] && chown $OWNER:$OWNER $D/share
 chmod 755 $D/share
 read up rest < /proc/uptime
-echo "${up%%.*} installed EQ Engine 0.7.8 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
+echo "${up%%.*} installed EQ Engine 0.7.9 (settings folder owner ${OWNER:-unknown}, kept settings restored: $RESTORED)" >> $D/state/events.log
 chmod 644 $D/state/events.log
 # EQ on CarPlay (0.7.4) is on by default: unless the app's settings have it off, it is checked and
 # prepared now for the next car start (nothing is laid over or restarted now). If that fails, the
@@ -112,7 +112,7 @@ for d in $R/mnt/media_rw/usb0 $R/mnt/media_rw/usb1 $R/mnt/media_rw/usb2 $R/mnt/m
          $R/storage/usb0 $R/storage/usb1 $R/storage/usb2 $R/storage/usb3; do
     if [ -f "$d/README-EQENGINE.txt" ]; then
         mkdir -p "$d/EQENGINE" && {
-            echo "EQ Engine 0.7.8 installed"
+            echo "EQ Engine 0.7.9 installed"
             echo "EQ on CarPlay: ${CPEQ_RES:-no answer}"
             date
             pm path com.eqengine.app

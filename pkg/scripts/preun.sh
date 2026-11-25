@@ -83,6 +83,44 @@ mounted_at() {
     return 1
 }
 
+# (after 0.7.8) NEMESIS 1.17's LivePatch can lay a "farm" over a folder (a tmpfs of symlinks to a
+# view of the stock folder); EQ Engine's mounts are then on the file a symlink points to. real_path
+# <path>: the path with every symlink on the way followed, into RP (as in act.sh).
+real_path() {
+    RP=""
+    _rp_r=${1#/}
+    _rp_n=0
+    while [ -n "$_rp_r" ]; do
+        case "$_rp_r" in
+            */*) _rp_c=${_rp_r%%/*}; _rp_r=${_rp_r#*/} ;;
+            *) _rp_c=$_rp_r; _rp_r="" ;;
+        esac
+        case "$_rp_c" in
+            ''|.) continue ;;
+            ..) RP=${RP%/*}; continue ;;
+        esac
+        if [ -L "$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
+            _rp_n=$((_rp_n + 1))
+            # the link's target from toolbox ls -l ("... name -> target")
+            _rp_l=""
+            set -f
+            set -- $(ls -l "$RP/$_rp_c" 2>/dev/null)
+            set +f
+            while [ $# -gt 1 ]; do
+                [ "$1" = "->" ] && { _rp_l=$2; break; }
+                shift
+            done
+            case "$_rp_l" in
+                '') ;;
+                /*) RP=""; _rp_r=${_rp_l#/}${_rp_r:+/$_rp_r}; continue ;;
+                *) _rp_r=$_rp_l${_rp_r:+/$_rp_r}; continue ;;
+            esac
+        fi
+        RP=$RP/$_rp_c
+    done
+    [ -n "$RP" ] || RP=/
+}
+
 # 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its
 # own mounts, never another package's at the same path)
 ours() {
@@ -91,10 +129,12 @@ ours() {
     [ -n "$1" ] && [ "$1" = "$3" ]
 }
 i=0
-while mounted_at $TARGET && ours $TARGET $D/conf/audio_effects.conf && [ $i -lt 5 ]; do
-    umount $TARGET
+real_path $TARGET
+TP=$RP
+while mounted_at $TP && ours $TP $D/conf/audio_effects.conf && [ $i -lt 5 ]; do
+    umount $TP
     i=$((i + 1))
-    mounted_at $TARGET && sleep 1
+    mounted_at $TP && sleep 1
 done
 # The other bind mounts, while the file there is EQ Engine's own (never another package's mount on
 # the same path; 0.7.6, and after 0.7.6 for the driver watch too): EQ on CarPlay's layer over the
@@ -104,7 +144,8 @@ done
 # Engine's and is left alone.)
 for t in /system/lib/hw/audio.primary.tcc803x.so:eqe_drvwatch.so /system/lib/libCarPlayAndroid.so:eqe_cpwatch.so; do
     f=$D/lib/${t#*:}
-    t=$R${t%%:*}
+    real_path $R${t%%:*}
+    t=$RP
     i=0
     while [ $i -lt 5 ] && mounted_at $t && ours $t $f; do
         umount $t

@@ -1,4 +1,4 @@
-EQ Engine 0.7.8 (NEMESIS package "eqengine")
+EQ Engine 0.7.9 (NEMESIS package "eqengine")
 ===========================================
 
 A 10-band EQ (or a parametric one with up to 20 bands), clip guard,
@@ -40,6 +40,11 @@ EQ Engine does not start at all (Android Auto, Bluetooth audio and CarPlay
 alike), and its Status page says why. If one has laid its own file over the
 CarPlay app's library, only EQ on CarPlay stays off, and the app tells you.
 HMG-API and its wireless package are fine: the tested car runs them.
+NEMESIS 1.17 or later with Enhanced Phone Projection 3.x: NEMESIS then shows
+/system/lib through a layer of its own (LivePatch). EQ on CarPlay works with
+that from 0.7.9 on (not yet tested on a car); 0.7.8 and older keep EQ on
+CarPlay off there and wrongly say another package's file is laid over the
+CarPlay library. Android Auto and Bluetooth audio are not affected.
 
 Install over an earlier version
 Plug in this stick, answer Yes to "Updating EQ Engine requires reinstalling",

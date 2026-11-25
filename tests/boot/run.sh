@@ -32,10 +32,14 @@ S
 [ "$1" = "-o" ] && [ "$2" = "bind" ] || exit 1
 e=/tmp/eqeboot/root/data/eqengine/state/events.log; n=0; [ -f $e ] && n=$(wc -l < $e | tr -d " ")
 echo "mount after $n event lines" >> /tmp/eqeboot/mount.log
-cp "$4" "$4.under.$$" && cp "$3" "$4" && echo "$4.under.$$" >> /tmp/eqeboot/stack && echo "none $4 none rw 0 0" >> /tmp/eqeboot/proc/mounts
+# (after 0.7.8) as the kernel: symlinks on the target are followed (a NEMESIS LivePatch farm's), and
+# the mount is listed at the file it landed on
+p=$(readlink -f "$4"); [ -n "$p" ] || p=$4
+cp "$p" "$p.under.$$" && cp "$3" "$p" && echo "$p.under.$$" >> /tmp/eqeboot/stack && echo "none $p none rw 0 0" >> /tmp/eqeboot/proc/mounts
 S
     cat > $T/stubs/umount <<'S'
 #!/bin/sh
+p=$(readlink -f "$1"); [ -n "$p" ] || p=$1; set -- "$p"
 last=$(tail -n1 /tmp/eqeboot/stack 2>/dev/null); [ -n "$last" ] || exit 1
 cp "$last" "$1"; rm -f "$last"; sed -i '$d' /tmp/eqeboot/stack
 grep -n " $1 " /tmp/eqeboot/proc/mounts | tail -n1 | cut -d: -f1 | while read n; do sed -i "${n}d" /tmp/eqeboot/proc/mounts; done
@@ -711,5 +715,36 @@ runboot 300
 U=$(st updated)
 UE=$(cut -d. -f1 $T/proc/uptime)
 ok "written when it changed only: last at uptime $U, the run went on to $UE (confirmed good long before the end)" "[ -n \"$U\" ] && [ \"$U\" -lt 1000 ] && [ \"$UE\" -gt 5000 ] && [ \"\$(st good)\" = 1 ] && grep -q 'confirmed good' $T/out.txt"
+
+echo "== 33. (after 0.7.8) a NEMESIS LivePatch farm over /system/etc"
+# LivePatch's farm as native/livepatch.c builds it: the folder's stock view (a bind of /system's
+# folder, without mounts made on files in it) and a tmpfs of symlinks into it over the folder
+FSTK=$T/root/data/nemesis/livepatch/stock/system/etc
+fxfarm() {  # $1 = the factory list to show
+    mkdir -p $FSTK; cp "$1" $FSTK/audio_effects.conf
+    rm -f $T/root/system/etc/audio_effects.conf; ln -s $FSTK/audio_effects.conf $T/root/system/etc/audio_effects.conf
+    { echo "/dev/block/system $FSTK ext4 ro 0 0"; echo "tmpfs $T/root/system/etc tmpfs ro 0 0"; } >> $T/proc/mounts
+}
+setup bootLP1; fxfarm $ORIG; zy 165
+echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; [ $u -ge 130 ] && touch /tmp/eqeboot/stop' > $T/hook
+rununtilstop
+ok "the farm already there: the overlay goes on the file the farm shows, the audio server gets EQ Engine's list" "grep -q 'effects list overlay applied' $VS/events.log && grep -q \" $FSTK/audio_effects.conf \" $T/proc/mounts && [ \"\$(tm)\" = $OURSMD5 ] && ! grep -q 'laid again' $VS/events.log && [ \"\$(st state)\" = applied ]"
+setup bootLP2
+{ echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; T=/tmp/eqeboot'
+  # the farm built after the overlay (EQ Engine's mount stays listed, hidden), then the zygote
+  echo 'if [ $u -ge 110 ] && [ ! -f $T/farmed ]; then mkdir -p '"$FSTK"'; cp '"$ORIG"' '"$FSTK"'/audio_effects.conf; rm -f $T/root/system/etc/audio_effects.conf; ln -s '"$FSTK"'/audio_effects.conf $T/root/system/etc/audio_effects.conf; echo "/dev/block/system '"$FSTK"' ext4 ro 0 0" >> $T/proc/mounts; echo "tmpfs $T/root/system/etc tmpfs ro 0 0" >> $T/proc/mounts; touch $T/farmed; fi'
+  echo 'if [ $u -ge 120 ] && [ ! -d $T/proc/165 ]; then mkdir -p $T/proc/165; echo "165 (zygote) S 1 165 0 0 -1 4194560 100 0 0 0 10 5 0 0 20 0 9 0 292 30000000 2000 4294967295" > $T/proc/165/stat; fi'
+  echo 'if [ $u -ge 160 ] && [ ! -f $T/laid ]; then cp $T/root/data/eqengine/state/events.log $T/events_at60; md5sum < $T/root/system/etc/audio_effects.conf | cut -c1-32 > $T/md5_at60; cp $T/proc/mounts $T/mounts_at60; touch $T/laid; fi'
+  echo '[ $u -ge 170 ] && echo "turned off in the app" > $T/root/data/eqengine/state/disabled'; } > $T/hook
+runboot 200
+ok "the farm built after the overlay: laid again where the farm shows the list once the zygote runs" "grep -q 'effects list overlay laid again at $FSTK/audio_effects.conf' $T/events_at60 && [ \"\$(cat $T/md5_at60)\" = $OURSMD5 ] && grep -q \" $FSTK/audio_effects.conf \" $T/mounts_at60 && grep -q 'confirmed good' $T/events_at60"
+ok "... turned off: the overlay taken off the file the farm shows, the factory list back there" "[ \"\$(st state)\" = off ] && [ \"\$(tm)\" = $ORIGMD5 ] && ! grep -q \" $FSTK/audio_effects.conf \" $T/proc/mounts"
+setup bootLP3
+{ echo 'read u r < /tmp/eqeboot/proc/uptime; u=${u%%.*}; T=/tmp/eqeboot'
+  echo 'if [ $u -ge 110 ] && [ ! -f $T/farmed ]; then mkdir -p '"$FSTK"'; echo "another package list" > '"$FSTK"'/audio_effects.conf; rm -f $T/root/system/etc/audio_effects.conf; ln -s '"$FSTK"'/audio_effects.conf $T/root/system/etc/audio_effects.conf; touch $T/farmed; fi'
+  echo 'if [ $u -ge 120 ] && [ ! -d $T/proc/165 ]; then mkdir -p $T/proc/165; echo "165 (zygote) S 1 165 0 0 -1 4194560 100 0 0 0 10 5 0 0 20 0 9 0 292 30000000 2000 4294967295" > $T/proc/165/stat; fi'
+  echo '[ $u -ge 150 ] && touch $T/stop'; } > $T/hook
+rununtilstop
+ok "the farm shows another list: left alone, and said" "grep -q 'it is not the factory list: left alone' $VS/events.log && ! grep -q 'laid again' $VS/events.log && grep -qx 'another package list' $T/root/system/etc/audio_effects.conf"
 
 echo "$SH: $pass passed, $fail failed"
