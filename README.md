@@ -18,8 +18,9 @@ EQ Engine is a [NEMESIS](https://github.com/xwtk/hmg_nemesis) package for the Ge
    resampled, and Bluetooth audio, which still has to be, goes through a better converter. CarPlay
    plays at the rate the phone sends (44.1 or 48 kHz) and is never resampled.
 2. **Tone and imaging, if you want them**, on Android Auto, CarPlay and Bluetooth audio: an
-   accurate 10-band EQ whose end bands can be shelves, or a parametric EQ with up to 20 bands, a
-   preamp, a clip guard, a listening-position delay, and a live view of the music behind the EQ
+   accurate 10-band EQ whose end bands can be shelves, or a parametric EQ with up to 20 bands
+   (each on both speakers, or on the mid or the side only), a preamp, a clip guard, a
+   listening-position delay, stereo width, mono bass, and a live view of the music behind the EQ
    curve.
 
 ![The EQ page with the live view on](images/eq-live.png)
@@ -28,15 +29,16 @@ It is a plain NEMESIS package. It is **not** an HMG-API mod and does not need HM
 alongside it, including HMG-API's wireless CarPlay and Android Auto package
 ([how](#eq-on-carplay-and-other-add-ons)).
 
-**Current version: 0.7.7**, tested on the Ioniq 5 below: 0.7.6 plus the fixes from a full code
-review of EQ Engine and of how it works with NEMESIS, HMG-API and their wireless packages, and
-NEMESIS 1.17's package icon. What changed: [CHANGELOG.md](CHANGELOG.md).
+**Current version: 0.7.8**: 0.7.7 plus [stereo width and mono bass](#positional-sound), Expert
+bands on the mid or the side only, and a Positional Sound page that shows the width on the car.
+Tested on the Ioniq 5 below with Android Auto (stereo width and mono bass). What changed:
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Verified vehicles
 
 | Car | Region | Audio system | Head unit software | Tested with |
 |---|---|---|---|---|
-| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 | 0.7.7: Android Auto, CarPlay (wired and wireless) |
+| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 | 0.7.8: Android Auto; 0.7.7: CarPlay (wired and wireless) |
 | 2024 Hyundai Ioniq 6 Preferred AWD | Canada | Bose | 260903 | 0.6.6: Android Auto |
 | 2025 Hyundai Ioniq 6 Limited | USA | Bose | 260903 | 0.6.6: Android Auto |
 | 2022 Genesis G70 3.3T Sport AWD | Canada | Lexicon | 260903 | 0.7.6: Android Auto, CarPlay (wired and wireless) |
@@ -98,6 +100,11 @@ other one.
     what you hear. Bands may overlap, and where they do their boosts and cuts add up, so several
     wide boosts side by side make a much bigger total than any one dot. The graph's scale grows
     (±15, 27, 39 or 51 dB) so the whole line always fits.
+  - **L+R, Mid or Side:** a chip in the band card's top row sets what a band works on: both speakers
+    as usual (L+R), only what the two speakers have in common (Mid: a centred voice, the bass, a
+    kick drum) or only what differs between them (Side: the stereo spread, reverb and the room).
+    While a band is on Mid or Side, or stereo width or mono bass is set, the orange line is the
+    mid's response and a dashed green line the side's.
 - **Preamp and Auto:** Auto, under the preamp slider, sets the preamp to the largest boost the EQ
   makes anywhere from 0 Hz to half the sample rate. It turns amber when the preamp leaves more
   than 3 dB of boost to the clip guard.
@@ -117,20 +124,33 @@ other one.
 
 ### EQ on CarPlay (on by default)
 
-CarPlay's music, wired or wireless, gets the same EQ (Easy or Expert), preamp, clip guard and
-listening position as Android Auto, with the same filter code, at CarPlay's own rate (44.1 or
-48 kHz) and with nothing converted. The meter, the live view and the Status page show CarPlay's
-music while it plays. Siri and calls are never processed. Added delay: 1.4 ms (the clip guard's
+CarPlay's music, wired or wireless, gets the same EQ (Easy or Expert), preamp, clip guard,
+listening position, stereo width and mono bass as Android Auto, with the same filter code, at
+CarPlay's own rate (44.1 or 48 kHz) and with nothing converted. The meter, the live view and the
+Status page show CarPlay's music while it plays. Siri and calls are never processed. Added delay: 1.4 ms (the clip guard's
 look-ahead), plus the seat delay if you set one.
 
 Settings > EQ on CarPlay turns it off (CarPlay is flat at once) or on again (from the next car
 start, or at once when it was on at this car start). If it cannot load, or the CarPlay app keeps restarting with it, it turns itself off and the
 app says so the next time you open it. [How it works](#how-eq-on-carplay-works).
 
-### Listening position
+### Positional Sound
 
-The side nearer the chosen seat is delayed, so both sides arrive there together (1.7 ms by
-default; a seat offset adjusts it). Volumes stay with the car's balance and fader.
+The Position page. Each of these works on Android Auto, CarPlay and Bluetooth audio, and is a
+setting of its own (not part of User 1-4 or Undo).
+
+- **Listening position:** the side nearer the chosen seat is delayed, so both sides arrive there
+  together (1.7 ms by default; a seat offset adjusts it). Volumes stay with the car's balance and
+  fader. Driver means the left seat and Passenger the right one.
+- **Stereo width**, 0 % (mono) to 150 % in 10 % steps; Off is 100 %, as recorded. It turns only
+  what differs between the two speakers (the side) up or down; what they have in common (the mid,
+  usually the voice and the bass) stays as it is. On the car picture the width is the line across
+  the windshield, and dragging that line sets it. Wider also raises a sound panned to one side (at
+  150 % a sound only in the left speaker comes out 1.9 dB louder there); Auto preamp and the clip
+  guard allow for it.
+- **Mono bass**, off or below 80, 120 or 150 Hz: below that frequency both speakers play the same
+  bass (the side is cut there, 12 dB an octave). Most music's deep bass is mono already, so it
+  matters only for recordings whose bass differs between the two sides.
 
 <img src="images/position.png" alt="The Position page" width="640">
 
@@ -180,6 +200,15 @@ get.
 filter with the frequency, gain and width you set, and the bands add up, as on any parametric EQ.
 The dots show each band's own setting; the orange line shows the sum.
 
+**Mid and side.** While stereo width or mono bass is set, or an Expert band is on Mid or Side, the
+filter turns left and right into mid ((L+R)/2) and side ((L-R)/2), runs each band on each with its
+own settings (an L+R band the same on both), scales the side by the width, cuts the side below the
+mono bass frequency, and turns the two back into left and right. Moving into and out of this mode
+carries the filters' state over, and the width glides over 1024 samples, so nothing clicks; a
+centred signal comes back within 2 LSB of the original across the switch (PC tests). Without any
+of these settings the bands run on left and right exactly as in 0.7.7, bit for bit. Auto preamp
+then takes the largest level any input within full scale can reach at either speaker.
+
 **Bands one octave wide, all the way up.** The common filter formula makes bands narrower near
 the top of the range, so the 8 kHz and 16 kHz bands were narrower than the rest and left a dip of
 about 2 dB around 11-12 kHz when both were raised. The width is corrected (Expert's peaks too),
@@ -208,6 +237,8 @@ All ten Easy sliders at +4 dB, at 48 kHz (calculated with the filter's own code)
   the CarPlay app: 20 Expert bands came to about 3-4% with 0.7.3. 0.7.5 runs each band over a block
   of samples, with 8-12% fewer instructions (counted in an ARM emulator) and the same output bit
   for bit.
+- In mid/side mode (above) each band runs on two signals with two sets of settings; what that
+  costs on the car has not been measured yet.
 - The live view, a 4096-point FFT of the output in 48 bands about 22 times a second, adds about
   1.5% while the EQ page shows it. It is shown when that audio reaches the speakers, about 0.15 s
   after the filter sees it.
@@ -447,9 +478,10 @@ head unit** (turn the car off and on again).
   Custom).
 - During the install the EQ drops out for a few seconds (NEMESIS reinstalls the app), then comes
   back. Until the restart, Android's audio server still has the old filter loaded: 48 kHz output
-  carries on, and features that need the new filter (from 0.6.6: Expert mode) wait for the
-  restart. If EQ on CarPlay was already running, the CarPlay app keeps the old version's layer,
-  with your EQ, until then; otherwise EQ on CarPlay starts at that restart.
+  carries on, and features that need the new filter (from 0.7.7: stereo width, mono bass and
+  Mid/Side bands) wait for the restart; the app says so. If EQ on CarPlay was already running,
+  the CarPlay app keeps the old version's layer, with your EQ, until then; otherwise EQ on CarPlay
+  starts at that restart.
 - NEMESIS removes and reinstalls the app at every update, so a build signed with another key
   installs too. (The same key matters only for a direct `pm install -r`; see
   [Building from source](#building-from-source).)
@@ -594,7 +626,7 @@ bash and mksh, with printf missing as on the car.
 | `stick/README-EQENGINE.txt` | the README that goes on the install stick |
 | `tests/`, `native/cpwtest/`, `native/drvtest/` | boot step, actions, install and uninstall scripts, filter, EQ on CarPlay, effects-list parsing and package metadata tests |
 | `tools/` | the signing helper, the package icon's generator (`tools/icon/`), a mockup renderer for the app's pages, and the Docker build environment |
-| `images/` | screenshots for this README |
+| `images/` | screenshots for this README (`position.png`: the page drawn at the car's size, with a real status bar) |
 
 ## License and credits
 

@@ -9,8 +9,9 @@
  *   [3] on: 1 = EQ on CarPlay's music, 0 = CarPlay plays untouched (Diagnostics' switch)
  *   [4] live_until: CLOCK_MONOTONIC ms (Android's uptimeMillis) until which the live view is wanted
  *   [5] 0
- *   [6 ..] the EQ settings, exactly what the app sends Android's filter (eqengine.c eqe_settings,
- *          layout 3, EQE_SET_COUNT values)
+ *   [6 ..] the EQ settings, exactly what the app sends Android's filter (eqengine.c eqe_settings:
+ *          layout 4, CPE_NSET values, for a watch from 0.7.8 on; layout 3, CPE_NSET3 values, which
+ *          every watch takes; the app writes layout 4 only to a watch whose cpl_live.lib is 0x326 or later)
  *   Written to a temporary file and renamed, so the watch never reads half of one.
  *
  * The watch's live file, CPW_DIR "/live.bin" (CPL_BYTES long, written by the watch, read by the app
@@ -24,7 +25,8 @@
 #define CPE_MAGIC 0x31455043u   /* "CPE1" */
 #define CPE_VERSION 1
 #define CPE_HDR 6               /* int32 values before the settings */
-#define CPE_NSET 99             /* EQE_SET_COUNT (layout 3) */
+#define CPE_NSET 101            /* EQE_SET_COUNT (layout 4, 0.7.8) */
+#define CPE_NSET3 99            /* layout 3 (0.7.3 .. 0.7.7) */
 
 #define CPL_MAGIC 0x314c5043u   /* "CPL1" */
 #define CPL_VERSION 1

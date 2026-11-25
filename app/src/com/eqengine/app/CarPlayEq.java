@@ -23,7 +23,7 @@ import java.nio.channels.FileChannel;
 final class CarPlayEq {
     static final String CTL = "/data/eqengine/share/cp_eq.bin";
     static final String LIVE = "/data/eqengine/cpw/live.bin";
-    private static final int CPE_MAGIC = 0x31455043, CPE_VERSION = 1, CPE_HDR = 6, CPE_NSET = 99;
+    private static final int CPE_MAGIC = 0x31455043, CPE_VERSION = 1, CPE_HDR = 6, CPE_NSET3 = 99, CPE_NSET4 = 101;
     private static final int CPL_MAGIC = 0x314c5043, CPL_BYTES = 4096;
     /* cpl_live, as int32 indexes */
     private static final int L_MAGIC = 0, L_SEQ = 2, L_PID = 3, L_STATE = 4, L_WHY = 5, L_RATE = 6, L_FRAMES = 7, L_BLKSEQ = 8,
@@ -56,9 +56,19 @@ final class CarPlayEq {
 
     // ------------------------------------------------------------------ the control file
 
+    /**
+     * 0.7.8: the settings layout the watch in the CarPlay app takes: 4 (stereo width, mono bass,
+     * mid/side bands) from a watch with filter 0x326 on, else 3 (every watch takes it; the CarPlay
+     * app keeps the watch it loaded at the car start, so an older one runs until the next).
+     */
+    static int layout() {
+        int[] v = snapshot();
+        return v != null && Engine.msLib(v[L_LIB]) ? 4 : 3;
+    }
+
     /** The settings as they are now (called with every push to Android's filter, and at the start). */
     static void push(EqSettings s) {
-        byte[] b = s.toParam(3);
+        byte[] b = s.toParam(layout());
         synchronized (LOCK) {
             lastSet = b;
             lastOn = s.cpEq;
@@ -83,15 +93,18 @@ final class CarPlayEq {
 
     /** Every few seconds: writes the file again if it went away (EQ Engine off and on), maps the live file. */
     static void tick(EqSettings s) {
-        final byte[] b = s.toParam(3);
+        final byte[] b = s.toParam(layout());
         final boolean on = s.cpEq;
+        final boolean changed;
         synchronized (LOCK) {
+            // 0.7.8: the layout follows the watch (mapped later, or a new one at a car start)
+            changed = lastSet != null && !java.util.Arrays.equals(lastSet, b);
             lastSet = b;
             lastOn = on;
         }
         Bg.run(new Runnable() {
             public void run() {
-                if (!new File(CTL).exists()) write(b, on);
+                if (changed || !new File(CTL).exists()) write(b, on);
                 if (map == null || stale()) mapLive();
             }
         });
@@ -120,11 +133,11 @@ final class CarPlayEq {
 
     /** On the background thread: a temporary file, then renamed, so the watch never reads half of one. */
     private static void write(byte[] set, boolean on) {
-        if (set == null || set.length != CPE_NSET * 4) return;
+        if (set == null || (set.length != CPE_NSET3 * 4 && set.length != CPE_NSET4 * 4)) return;
         File f = new File(CTL), dir = f.getParentFile();
         if (dir == null || !dir.isDirectory()) return; // made by the installer (an older install has none yet)
         int[] h = {CPE_MAGIC, CPE_VERSION, ++seq, on ? 1 : 0, liveUntil, 0};
-        byte[] all = new byte[(CPE_HDR + CPE_NSET) * 4];
+        byte[] all = new byte[CPE_HDR * 4 + set.length];
         System.arraycopy(Engine.intsToBytes(h), 0, all, 0, CPE_HDR * 4);
         System.arraycopy(set, 0, all, CPE_HDR * 4, set.length);
         File tmp = new File(dir, "cp_eq.bin.tmp");
@@ -237,7 +250,7 @@ final class CarPlayEq {
      * in 0.01 dB}; null when it has none for them (an older watch, not mapped, not caught up yet).
      */
     static int[] answers(EqSettings x) {
-        byte[] want = x.toParam(3);
+        byte[] want = x.toParam(layout());
         int ws, since;
         byte[] wb;
         synchronized (LOCK) {

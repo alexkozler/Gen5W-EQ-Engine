@@ -49,7 +49,7 @@
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.7.7
+VER=0.7.8
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf

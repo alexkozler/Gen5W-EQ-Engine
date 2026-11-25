@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.8
+
+All the changes from 0.7.7, and stereo width, mono bass and Expert bands on the mid or the side
+(tested on the Ioniq 5: an update over 0.7.7, then stereo width and mono bass with Android Auto).
+
+### Positional Sound (the Position page)
+
+- **Stereo width**, 0 % (mono) to 150 % in 10 % steps; Off is 100 %, as recorded. Only what
+  differs between the two speakers (the side) is turned up or down; what they have in common (the
+  mid) stays as it is.
+- **Mono bass**, off or below 80, 120 or 150 Hz: below that frequency both speakers play the same
+  bass.
+- Both work on Android Auto, CarPlay and Bluetooth audio, and are settings of their own, like the
+  listening position (not part of User 1-4 or Undo).
+- The page is titled Positional Sound (the rail still says Position). Its car picture is zoomed in
+  on the cabin, with LEFT and RIGHT at the sides and each seat drawn with its back. No steering
+  wheel is drawn, since Driver and Passenger mean the left and right seats in any car. The stereo
+  width is shown as a line across the windshield: drag it to set the width (a tap there changes
+  nothing; a drag lower down still moves the listening position).
+- Card and tile titles are in title case (Driver's Seat, Audio Trace, Boot Step, EQ Filter).
+
+### EQ
+
+- An Expert band can work on both speakers (L+R, as before), on the mid only or on the side only:
+  a chip in the band card's top row switches it. While mid/side is in use, the Expert graph shows
+  the mid's response (orange) and the side's (dashed green).
+- Auto preamp allows for the stereo width and for Mid and Side bands: it takes the largest level
+  any input within full scale can reach at either speaker.
+- User 1-4 and Curves on USB keep a band's channel. An older version of EQ Engine leaves a Mid or
+  Side band out when it loads such a curve.
+
+### EQ engine (filter 326)
+
+- While stereo width or mono bass is set, or a band is on Mid or Side, the filter works on mid and
+  side instead of left and right, then turns them back. Moving into and out of that mode carries
+  the filters' state over, and width changes glide over 1024 samples, so nothing clicks. Without
+  those settings the output is the same as filter 325's, bit for bit.
+- The CarPlay layer takes the same settings. An older layer still in the CarPlay app (until the
+  next car start after an update) keeps getting the settings it understands.
+- After an update, stereo width, mono bass and Mid/Side bands play from the head unit restart;
+  until then the app says so, and the rest of the EQ works at once, as before.
+
 ## 0.7.7
 
 All the changes from 0.7.6, and fixes from a full code review of EQ Engine and of how it works with

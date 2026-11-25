@@ -52,7 +52,8 @@ static int32_t get_param(effect_handle_t h, int32_t id, void *value, uint32_t vs
 static eqe_settings mk(int eq_on, int pre, int guard, const int *bands) {
     eqe_settings s;
     memset(&s, 0, sizeof(s));
-    s.layout = 3;
+    s.layout = 4;
+    s.width_pct = 100;
     s.eq_on = eq_on;
     s.preamp_cdb = pre;
     s.guard_on = guard;
@@ -140,6 +141,41 @@ static double sine_gain_db(effect_handle_t h, double rate, double f, double amp,
     return 10.0 * log10(sout_sum / sin_sum);
 }
 
+/* 0x326: a tone with level al on the left and ar on the right (fractions of full scale, same phase;
+ * a negative level is the opposite phase) through h for `seconds`; each speaker's level at the tone
+ * over the last half (whole cycles), in dB relative to the larger of the two input levels. */
+static void tone_lr(effect_handle_t h, double rate, double f, double al, double ar, double seconds, int16_t *buf, int frames,
+                    double *gl, double *gr) {
+    int total = (int)(seconds * rate), start = total / 2, done = 0;
+    double ph = 0.0, sl = 0.0, cl = 0.0, sr = 0.0, cr = 0.0;
+    double *phs = (double *)malloc(sizeof(double) * frames);
+    audio_buffer_t b = { (size_t)frames, { buf } };
+    while (done < total) {
+        for (int i = 0; i < frames; i++) {
+            phs[i] = ph;
+            double v = sin(ph);
+            buf[2 * i] = (int16_t)floor(al * v * 32767.0 + 0.5);
+            buf[2 * i + 1] = (int16_t)floor(ar * v * 32767.0 + 0.5);
+            ph += 2.0 * EQE_PI * f / rate;
+        }
+        (*h)->process(h, &b, &b);
+        for (int i = 0; i < frames; i++) {
+            int k = done + i;
+            if (k < start || k >= total) continue;
+            sl += buf[2 * i] * sin(phs[i]);
+            cl += buf[2 * i] * cos(phs[i]);
+            sr += buf[2 * i + 1] * sin(phs[i]);
+            cr += buf[2 * i + 1] * cos(phs[i]);
+        }
+        done += frames;
+    }
+    free(phs);
+    double n = total - start, ref = (fabs(al) > fabs(ar) ? fabs(al) : fabs(ar)) * 32767.0;
+    double al_out = 2.0 * sqrt(sl * sl + cl * cl) / n, ar_out = 2.0 * sqrt(sr * sr + cr * cr) / n;
+    *gl = al_out > 0 ? 20.0 * log10(al_out / ref) : -999.0;
+    *gr = ar_out > 0 ? 20.0 * log10(ar_out / ref) : -999.0;
+}
+
 int main(void) {
     /* the loader runs once, at the library's first call: the marker must exist before that */
     { FILE *m = fopen(VHQ_MARK, "w"); if (m) fclose(m); }
@@ -183,7 +219,7 @@ int main(void) {
 
     /* ---- parameter checks */
     int32_t ver = 0;
-    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x325);
+    CHECK(get_param(h, EQE_PARAM_VERSION, &ver, 4, &got) == 0 && ver == 0x326);
     {
         /* very high quality loader: the marker was there at the first call, so the PC build of
            libaudio-resampler.so is loaded and its status is readable */
@@ -198,7 +234,9 @@ int main(void) {
     CHECK(apply(h, bad) == -EINVAL);
     bad.layout = 2; /* layout 2 is 17 values */
     CHECK(apply(h, bad) == -EINVAL);
-    bad.layout = 4;
+    bad.layout = 3; /* layout 3 is 99 values, not the whole struct */
+    CHECK(apply(h, bad) == -EINVAL);
+    bad.layout = 5;
     CHECK(apply(h, bad) == -EINVAL);
     bad = mk(1, 0, 1, NULL);
     bad.ends = 4;
@@ -215,7 +253,7 @@ int main(void) {
         o2.nx = 5;
         CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &o2, EQE_SET2_BYTES) == 0);
         eqe_ctx *cc = (eqe_ctx *)h;
-        CHECK(cc->set.layout == 3 && cc->set.mode == 0 && cc->set.nx == 0 && cc->set.ends == EQE_ENDS_HIGH && cc->set.band_cdb[2] == -400);
+        CHECK(cc->set.layout == 4 && cc->set.width_pct == 100 && cc->set.mode == 0 && cc->set.nx == 0 && cc->set.ends == EQE_ENDS_HIGH && cc->set.band_cdb[2] == -400);
     }
     {
         /* an app from before 0.6.6 sends layout 1 (16 values): accepted, both ends peaks */
@@ -223,7 +261,7 @@ int main(void) {
         old.layout = 1;
         old.band_cdb[0] = 300;
         CHECK(set_param_raw(h, EQE_PARAM_SETTINGS, &old, EQE_SET1_BYTES) == 0);
-        CHECK(((eqe_ctx *)h)->set.layout == 3 && ((eqe_ctx *)h)->set.mode == 0 && ((eqe_ctx *)h)->set.ends == 0 && ((eqe_ctx *)h)->set.band_cdb[0] == 300);
+        CHECK(((eqe_ctx *)h)->set.layout == 4 && ((eqe_ctx *)h)->set.width_pct == 100 && ((eqe_ctx *)h)->set.mode == 0 && ((eqe_ctx *)h)->set.ends == 0 && ((eqe_ctx *)h)->set.band_cdb[0] == 300);
     }
     bad = mk(1, 0, 1, NULL);
     bad.band_cdb[3] = 1501;
@@ -368,7 +406,7 @@ int main(void) {
         CHECK(c->clipped > 0);
         int32_t st[EQE_STATS_COUNT];
         CHECK(get_param(h, EQE_PARAM_STATS, st, sizeof(st), &got) == 0 && got == sizeof(st));
-        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x325 && st[6] == 70 && st[16] > 0 && st[23] == 1);
+        CHECK(st[0] == 3 && st[1] == 44100 && st[19] == 0x326 && st[6] == 70 && st[16] > 0 && st[23] == 1);
         AELI.release_effect(h);
     }
 
@@ -1228,6 +1266,241 @@ int main(void) {
         free(in);
         free(oa);
         free(ob);
+    }
+
+    /* ---- 0x326, mid/side: stereo width, mono bass, Expert bands on the mid or the side only. Tones
+     * with chosen left and right levels go through the real filter at 48 kHz; each speaker's level
+     * at the tone is measured over whole cycles. */
+    {
+        enum { NF = 2048 };
+        int16_t *buf = (int16_t *)malloc(NF * 4);
+        const double R48 = 48000.0;
+        double gl, gr;
+        effect_handle_t hm;
+        eqe_settings s;
+        /* width: a centred tone never changes; a side-only one scales by the width; a left-only one
+           spreads as (1 + w) / 2 left and (1 - w) / 2 right */
+        hm = make(R48, buf, buf, NF, 0);
+        cmd_int(hm, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+        s = mk(1, 0, 1, NULL);
+        s.width_pct = 150;
+        CHECK(apply(hm, s) == 0);
+        tone_lr(hm, R48, 1000, 0.25, 0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl) < 0.02 && fabs(gr) < 0.02);
+        double cl = gl;
+        tone_lr(hm, R48, 1000, 0.25, -0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - 20 * log10(1.5)) < 0.02 && fabs(gr - 20 * log10(1.5)) < 0.02);
+        double sl = gl;
+        tone_lr(hm, R48, 1000, 0.25, 0.0, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - 20 * log10(1.25)) < 0.02 && fabs(gr - 20 * log10(0.25)) < 0.05);
+        printf("width 150%%: centred tone %+.2f dB, side-only %+.2f dB, left-only: left %+.2f dB, right %+.2f dB\n", cl, sl, gl, gr);
+        CHECK(((eqe_ctx *)hm)->ms == 1);
+        s.width_pct = 0;
+        CHECK(apply(hm, s) == 0);
+        tone_lr(hm, R48, 1000, 0.25, -0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(gl < -80 && gr < -80);
+        sl = gl > gr ? gl : gr;
+        tone_lr(hm, R48, 1000, 0.25, 0.0, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - 20 * log10(0.5)) < 0.02 && fabs(gr - 20 * log10(0.5)) < 0.02);
+        printf("width 0%% (mono): side-only tone %.0f dB, left-only: left %+.2f dB, right %+.2f dB\n", sl, gl, gr);
+        /* back to 100 %: the lanes are left and right again once the ramp is over */
+        s.width_pct = 100;
+        CHECK(apply(hm, s) == 0);
+        tone_lr(hm, R48, 1000, 0.25, 0.0, 0.5, buf, NF, &gl, &gr);
+        CHECK(((eqe_ctx *)hm)->ms == 0 && fabs(gl) < 0.02 && gr < -80);
+        AELI.release_effect(hm);
+
+        /* an Expert peak of +6 dB at 1 kHz on the mid only, then on the side only */
+        hm = make(R48, buf, buf, NF, 0);
+        cmd_int(hm, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+        s = mk(1, -600, 1, NULL);
+        s.mode = 1;
+        s.nx = 1;
+        s.x[0][0] = EQE_X_PEAK | (EQE_CH_MID << 4);
+        s.x[0][1] = 100000;
+        s.x[0][2] = 600;
+        s.x[0][3] = 1000;
+        s.preamp_cdb = 0;
+        CHECK(apply(hm, s) == 0);
+        tone_lr(hm, R48, 1000, 0.25, 0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - 6.0) < 0.03 && fabs(gr - 6.0) < 0.03);
+        cl = gl;
+        tone_lr(hm, R48, 1000, 0.25, -0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl) < 0.03 && fabs(gr) < 0.03);
+        sl = gl;
+        tone_lr(hm, R48, 1000, 0.25, 0.0, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - 20 * log10(1.5)) < 0.03 && fabs(gr - 20 * log10(0.5)) < 0.05);
+        printf("mid-only +6 dB at 1 kHz: centred tone %+.2f dB, side-only %+.2f dB, left-only: left %+.2f dB, right %+.2f dB\n",
+               cl, sl, gl, gr);
+        int32_t pk[3];
+        CHECK(set_param_raw(hm, EQE_PARAM_PEAK, &s, sizeof(s)) == 0 && get_param(hm, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0);
+        CHECK(pk[0] >= 600 && pk[0] <= 601 && abs(pk[1] - 1000) < 20);
+        s.x[0][0] = EQE_X_PEAK | (EQE_CH_SIDE << 4);
+        CHECK(apply(hm, s) == 0);
+        tone_lr(hm, R48, 1000, 0.25, -0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - 6.0) < 0.03 && fabs(gr - 6.0) < 0.03);
+        tone_lr(hm, R48, 1000, 0.25, 0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl) < 0.03 && fabs(gr) < 0.03);
+        /* the largest boost: side +6 dB (x 1.995) with a width of 150 %, at 1 kHz:
+           (|1 + 1.5 x 1.995| + |1 - 1.5 x 1.995|) / 2 = 2.993, +9.52 dB (a side-only signal) */
+        s.width_pct = 150;
+        double g6 = pow(10.0, 6.0 / 20.0), want_pk = 20 * log10((fabs(1 + 1.5 * g6) + fabs(1 - 1.5 * g6)) / 2);
+        CHECK(set_param_raw(hm, EQE_PARAM_PEAK, &s, sizeof(s)) == 0 && get_param(hm, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0);
+        CHECK(pk[0] >= (int)ceil(want_pk * 100 - 1e-6) && pk[0] <= (int)ceil(want_pk * 100 - 1e-6) + 1 && abs(pk[1] - 1000) < 20);
+        CHECK(apply(hm, s) == 0);
+        tone_lr(hm, R48, 1000, 0.1, -0.1, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - want_pk) < 0.03);
+        printf("side +6 dB at 1 kHz, width 150%%: largest boost answered %+.2f dB at %d Hz, side-only tone measured %+.2f dB\n",
+               pk[0] / 100.0, pk[1], gl);
+        /* only a width: +3.52 dB */
+        s = mk(1, 0, 1, NULL);
+        s.width_pct = 150;
+        CHECK(set_param_raw(hm, EQE_PARAM_PEAK, &s, sizeof(s)) == 0 && get_param(hm, EQE_PARAM_PEAK, pk, sizeof(pk), &got) == 0);
+        CHECK(pk[0] >= 352 && pk[0] <= 353);
+        AELI.release_effect(hm);
+
+        /* mono bass below 120 Hz: the side's 40 Hz goes (the low cut's own response), the mid's stays */
+        hm = make(R48, buf, buf, NF, 0);
+        cmd_int(hm, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+        s = mk(1, 0, 1, NULL);
+        s.mono_hz = 120;
+        CHECK(apply(hm, s) == 0);
+        coefs_t lc = lowcut(120, 0.70710678118654752, R48);
+        double want = coefs_db(&lc, 40, R48);
+        tone_lr(hm, R48, 40, 0.25, -0.25, 2.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl - want) < 0.1 && fabs(gr - want) < 0.1);
+        sl = gl;
+        tone_lr(hm, R48, 40, 0.25, 0.25, 2.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl) < 0.03 && fabs(gr) < 0.03);
+        tone_lr(hm, R48, 1000, 0.25, -0.25, 1.0, buf, NF, &gl, &gr);
+        CHECK(fabs(gl) < 0.05);
+        printf("mono bass below 120 Hz: side-only 40 Hz tone %+.2f dB (the low cut: %+.2f), centred 40 Hz %+.2f dB\n", sl, want, gl);
+        AELI.release_effect(hm);
+
+        /* switching to mid/side and back while playing carries the filters' states over: an Easy EQ
+           with a centred signal, then the mono bass turned on (which a centred signal never feels), then
+           off again: the output follows an untouched copy of the same filter within 2 LSB (rounding
+           and dither only) */
+        {
+            int16_t *in = (int16_t *)malloc(NF * 4), *oa = (int16_t *)malloc(NF * 4), *ob = (int16_t *)malloc(NF * 4);
+            effect_handle_t ha = make(R48, in, oa, NF, 0), hb = make(R48, in, ob, NF, 0);
+            cmd_int(ha, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+            cmd_int(hb, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+            int eb[EQE_NB] = {600, 300, -300, 0, 200, -400, 300, 0, -200, 500};
+            s = mk(1, -800, 1, eb);
+            CHECK(apply(ha, s) == 0 && apply(hb, s) == 0);
+            int worst = 0, msseen = 0;
+            double ph = 0.0;
+            audio_buffer_t ba = { NF, { in } }, bo = { NF, { oa } }, bp = { NF, { ob } };
+            for (int round = 0; round < 60; round++) {
+                if (round == 20) { eqe_settings t = s; t.mono_hz = 150; CHECK(apply(ha, t) == 0); }
+                if (round == 40) CHECK(apply(ha, s) == 0);
+                for (int i = 0; i < NF; i++) {
+                    ph += 2 * EQE_PI * 55.0 / R48;
+                    double v = 9000 * sin(ph) + 6000 * sin(ph * 7.3) + 3000 * sin(ph * 41.1);
+                    in[2 * i] = in[2 * i + 1] = (int16_t)floor(v + 0.5);
+                }
+                (*ha)->process(ha, &ba, &bo);
+                (*hb)->process(hb, &ba, &bp);
+                msseen |= ((eqe_ctx *)ha)->ms;
+                for (int i = 0; i < 2 * NF; i++) {
+                    int d = abs(oa[i] - ob[i]);
+                    if (d > worst) worst = d;
+                }
+            }
+            printf("left/right -> mid/side -> left/right while playing (a centred signal): largest difference %d LSB\n", worst);
+            CHECK(msseen && ((eqe_ctx *)ha)->ms == 0 && worst <= 2);
+            AELI.release_effect(ha);
+            AELI.release_effect(hb);
+            free(in);
+            free(oa);
+            free(ob);
+        }
+
+        /* random mid/side settings changed while playing (ramps across all of it): always finite;
+           neutral settings at the end bring the lanes back to left and right */
+        {
+            hm = make(R48, buf, buf, NF, 0);
+            cmd_int(hm, EFFECT_CMD_ENABLE, 0, NULL, &reply);
+            eqe_ctx *c = (eqe_ctx *)hm;
+            int finite = 1, msrounds = 0;
+            double ph = 0.0;
+            for (int round = 0; round < 400; round++) {
+                if (round % 4 == 0) {
+                    int bands[EQE_NB];
+                    for (int i = 0; i < EQE_NB; i++) bands[i] = (int)floor((rnd() * 2 - 1) * 1200) / 50 * 50;
+                    s = mk(1, -(int)(rnd() * 1200) / 50 * 50, rnd() < 0.8, bands);
+                    s.width_pct = rnd() < 0.3 ? 100 : (int)(rnd() * 151);
+                    s.mono_hz = rnd() < 0.5 ? 0 : 40 + (int)(rnd() * 211);
+                    if (rnd() < 0.6) {
+                        s.mode = 1;
+                        s.nx = (int)(rnd() * (EQE_NX + 1));
+                        for (int j = 0; j < s.nx; j++) {
+                            int t = 1 + (int)(rnd() * 4);
+                            s.x[j][0] = t | ((int)(rnd() * 3) << 4);
+                            s.x[j][1] = 2000 + (int)(pow(rnd(), 2) * 1998000);
+                            s.x[j][2] = t == EQE_X_LOW_CUT ? 0 : (int)((rnd() * 2 - 1) * 1500);
+                            s.x[j][3] = t == EQE_X_PEAK ? 100 + (int)(rnd() * 3900) : t == EQE_X_LOW_CUT ? 500 + (int)(rnd() * 1500) : 0;
+                        }
+                    }
+                    CHECK(apply(hm, s) == 0);
+                }
+                int n = 1 + (int)(rnd() * (NF - 1));
+                audio_buffer_t bb = { (size_t)n, { buf } };
+                for (int i = 0; i < n; i++) {
+                    ph += 0.05;
+                    buf[2 * i] = (int16_t)(12000 * sin(ph) + 4000 * (rnd() * 2 - 1));
+                    buf[2 * i + 1] = (int16_t)(12000 * sin(ph * 1.3) + 4000 * (rnd() * 2 - 1));
+                }
+                (*hm)->process(hm, &bb, &bb);
+                msrounds += c->ms;
+                for (int j = 0; j < EQE_NFILT; j++)
+                    for (int ch = 0; ch < 2; ch++)
+                        if (!isfinite(c->band[j].z1[ch]) || !isfinite(c->band[j].z2[ch])) finite = 0;
+                if (!isfinite(c->wd_cur)) finite = 0;
+            }
+            s = mk(1, 0, 1, NULL);
+            CHECK(apply(hm, s) == 0);
+            for (int k = 0; k < 3; k++) (*hm)->process(hm, &b, &b);
+            printf("random mid/side settings while playing: %d of 400 buffers on mid and side, all finite: %s; "
+                   "back to left and right: %s\n", msrounds, finite ? "yes" : "no", c->ms == 0 ? "yes" : "no");
+            CHECK(finite && msrounds > 100 && c->ms == 0);
+            AELI.release_effect(hm);
+        }
+
+        /* what layout 4 refuses, and layout 3 still taken (as as recorded) */
+        hm = make(R48, buf, buf, NF, 0);
+        s = mk(1, 0, 1, NULL);
+        s.width_pct = 151;
+        CHECK(apply(hm, s) == -EINVAL);
+        s.width_pct = -1;
+        CHECK(apply(hm, s) == -EINVAL);
+        s = mk(1, 0, 1, NULL);
+        s.mono_hz = 39;
+        CHECK(apply(hm, s) == -EINVAL);
+        s.mono_hz = 251;
+        CHECK(apply(hm, s) == -EINVAL);
+        s = mk(1, 0, 1, NULL);
+        s.mode = 1;
+        s.nx = 1;
+        s.x[0][0] = EQE_X_PEAK | (3 << 4);
+        s.x[0][1] = 100000;
+        s.x[0][3] = 1000;
+        CHECK(apply(hm, s) == -EINVAL);
+        s.x[0][0] = EQE_X_PEAK | (EQE_CH_SIDE << 4);
+        CHECK(apply(hm, s) == 0);
+        {
+            eqe_settings o3 = s; /* an app before 0.7.8: layout 3, 99 values, no channel bits */
+            o3.layout = 3;
+            CHECK(set_param_raw(hm, EQE_PARAM_SETTINGS, &o3, EQE_SET3_BYTES) == -EINVAL);
+            o3.x[0][0] = EQE_X_PEAK;
+            o3.width_pct = 0; /* past the 99 values: not sent */
+            CHECK(set_param_raw(hm, EQE_PARAM_SETTINGS, &o3, EQE_SET3_BYTES) == 0);
+            eqe_ctx *c = (eqe_ctx *)hm;
+            CHECK(c->set.layout == 4 && c->set.width_pct == 100 && c->set.mono_hz == 0 && c->set.x[0][0] == EQE_X_PEAK);
+        }
+        AELI.release_effect(hm);
+        free(buf);
     }
 
     CHECK(AELI.release_effect(NULL) == -EINVAL);

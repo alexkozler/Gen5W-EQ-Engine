@@ -28,6 +28,11 @@
  * - Dither: triangular (TPDF) +-1 LSB, only for samples that were actually changed.
  * - EQ off is bit-exact: the input comes out unchanged, only delayed by the 63-sample look-ahead
  *   (1.4 ms at 44.1 kHz), so on/off comparisons are honest.
+ * - Mid/side (0x326): while a stereo width other than 100 %, mono bass or an Expert band on the mid
+ *   ((L + R) / 2) or the side ((L - R) / 2) only is set, the bands run on mid and side instead of
+ *   left and right (each filter with each lane's own coefficients; the mono bass is a low cut on the
+ *   side), the side is scaled by the width, and the two go back to left and right before the seat
+ *   delay. Without any of them the bands run on left and right exactly as before.
  * - Listening position (0.4): an extra delay of up to 5 ms on the left or right channel, so the
  *   nearer speakers' sound arrives together with the farther ones' at the chosen seat. Changes
  *   crossfade between the old and new delay over 1024 samples (no clicks, no pitch bend).
@@ -54,7 +59,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
-#define EQE_LIB_VERSION 0x00000325 /* 0x325 (after 0.7.6): the bit-exact path clamps what the processing path left in the look-ahead
+#define EQE_LIB_VERSION 0x00000326 /* 0x326 (0.7.8): settings layout 4: stereo width, mono bass and a channel (L+R, mid or
+                                         side) for each Expert band; the bands run on mid and side while any of them is used;
+                                      0x325 (after 0.7.6): the bit-exact path clamps what the processing path left in the look-ahead
                                          (EQ off, or a microphone on CarPlay, with the clip guard off: no wrap to the opposite sign);
                                       0x324 (0.7.6): EQE_PARAM_PEAK answers the largest boost over this rate, 44.1 and 48 kHz;
                                       0x323 (0.7.4): the bands run a chunk at a time (bands_block), bit for bit 0x322's output;
@@ -86,10 +93,13 @@ static void vhq_status(int32_t *v);
 #define EQE_NB 10               /* Easy mode: the ten sliders */
 #define EQE_NX 20               /* Expert mode: at most 20 bands of its own */
 #define EQE_NBAND EQE_NX        /* band filters in the audio path (Easy uses the first EQE_NB) */
+#define EQE_MONO EQE_NBAND      /* 0x326: the mono bass filter (a low cut on the side only), after the bands */
+#define EQE_NFILT (EQE_NBAND + 1) /* every filter in the audio path */
 #define EQE_NRESP 96
 #define EQE_NSPEC 48            /* live view bands, 20 Hz .. 20 kHz, log spaced */
 #define EQE_STATS_COUNT 28
-#define EQE_SET_COUNT (19 + 4 * EQE_NX) /* layout 3 */
+#define EQE_SET_COUNT (21 + 4 * EQE_NX) /* layout 4 */
+#define EQE_SET3_BYTES ((19 + 4 * EQE_NX) * 4) /* layout 3 (0.7.1 .. 0.7.7): no width, mono bass or band channels */
 #define EQE_SET2_BYTES (17 * 4)  /* layout 2 (0.6.6 .. 0.6.10): no Expert mode */
 #define EQE_SET1_BYTES (16 * 4)  /* layout 1 (0.4 .. 0.6.4): no "ends" */
 /* Expert band types, and the ranges of their values */
@@ -103,6 +113,14 @@ static void vhq_status(int32_t *v);
 #define EQE_X_BWMAX 4000        /* 4 octaves */
 #define EQE_X_QMIN 500          /* low cut Q 0.5 .. 2 */
 #define EQE_X_QMAX 2000
+#define EQE_X_TYPE(t) ((t) & 0xF) /* layout 4: an Expert band's type field also holds its channel */
+#define EQE_X_CH(t) (((t) >> 4) & 0xF)
+#define EQE_CH_LR 0             /* left and right alike (as every band before 0x326) */
+#define EQE_CH_MID 1            /* the mid only ((L + R) / 2: what both sides share) */
+#define EQE_CH_SIDE 2           /* the side only ((L - R) / 2: what differs) */
+#define EQE_WIDTH_MAX 150       /* stereo width, percent: 0 mono, 100 as recorded */
+#define EQE_MONO_MIN 40         /* mono bass below this many Hz (0 = off) */
+#define EQE_MONO_MAX 250
 #define EQE_ENDS_LOW 1          /* the 31 Hz band is a low shelf */
 #define EQE_ENDS_HIGH 2         /* the 16 kHz band is a high shelf */
 #define LOW_SHELF_HZ 50.0       /* shelf midpoints: between the end band and its neighbour */
@@ -135,17 +153,24 @@ typedef struct {
     int32_t ends;              /* layout 2: EQE_ENDS_LOW | EQE_ENDS_HIGH, shelves for the end bands */
     int32_t mode;              /* layout 3: 0 = Easy (band_cdb, ends), 1 = Expert (x) */
     int32_t nx;                /* layout 3: Expert bands in x, 0 .. EQE_NX */
-    int32_t x[EQE_NX][4];      /* layout 3, each Expert band: type (EQE_X_*), frequency (0.01 Hz), gain
-                                  (0.01 dB; not for the low cut), width (peak: bandwidth in 0.001 octave;
-                                  low cut: Q x 1000; shelves: unused) */
+    int32_t x[EQE_NX][4];      /* layout 3, each Expert band: type (EQE_X_*; layout 4: plus its channel
+                                  EQE_CH_* << 4), frequency (0.01 Hz), gain (0.01 dB; not for the low cut),
+                                  width (peak: bandwidth in 0.001 octave; low cut: Q x 1000; shelves: unused) */
+    int32_t width_pct;         /* layout 4: stereo width, 0 .. EQE_WIDTH_MAX percent (100 = as recorded) */
+    int32_t mono_hz;           /* layout 4: mono bass below this frequency, Hz (0 = off) */
 } eqe_settings;
 
 typedef struct { double b0, b1, b2, a1, a2; } coefs_t;
 
+/* 0x326: a filter has coefficients for each of the two lanes the bands run on. While no mid/side
+   setting is used (c->ms == 0) the lanes are left and right, both take lane 0's coefficients, and
+   the lane 1 set (cur1, inc1) is not kept up to date; while one is (c->ms == 1) the lanes are mid
+   and side and each takes its own. */
 typedef struct {
     coefs_t cur, tgt, inc;
     double z1[2], z2[2];
     int active;                /* cur/tgt not identity, or state not yet zero */
+    coefs_t cur1, tgt1, inc1;  /* lane 1 (the side) while c->ms */
 } band_t;
 
 /* live view: allocated at the first EQE_PARAM_SPECTRUM read */
@@ -184,8 +209,12 @@ typedef struct eqe_ctx {
     int32_t design_ends;       /* the end-band types binv was made for */
     double binv[EQE_NB][EQE_NB];
     double gains[EQE_NB];      /* solved filter gains, dB (Easy mode) */
-    band_t band[EQE_NBAND];
+    band_t band[EQE_NFILT];    /* the bands, then the mono bass filter */
     int ramp_left;
+    /* 0x326: mid/side */
+    int ms;                    /* the bands run on mid and side (see band_t) */
+    double wd_cur, wd_tgt, wd_inc; /* stereo width as a factor on the side, ramped like the bands */
+    int wd_left;
     /* preamp, crossfade */
     double pre_cur, pre_tgt, pre_k;
     double w, w_tgt, w_step;
@@ -357,7 +386,7 @@ static coefs_t shelf(int high, double f0, double gain_db, double rate);
 /* An Expert band (eqe_settings.x[j]). */
 static coefs_t xband_coefs(const int32_t b[4], double rate) {
     double f = b[1] / 100.0, g = b[2] / 100.0;
-    switch (b[0]) {
+    switch (EQE_X_TYPE(b[0])) {
     case EQE_X_PEAK: return bell_bw(f, g, b[3] / 1000.0, rate);
     case EQE_X_LOW_SHELF: return shelf(0, f, g, rate);
     case EQE_X_HIGH_SHELF: return shelf(1, f, g, rate);
@@ -483,11 +512,28 @@ static void solve_gains(eqe_ctx *c, double g[EQE_NB]) {
     }
 }
 
+/* 0x326: a filter is identity on both lanes (lane 1 counts only while the bands run on mid and side,
+   or when its target differs from lane 0's) */
+static int band_identity(const eqe_ctx *c, const band_t *b) {
+    if (!(is_identity(&b->cur) && is_identity(&b->tgt))) return 0;
+    if (!is_identity(&b->tgt1)) return 0;
+    return !c->ms || is_identity(&b->cur1);
+}
+
+/* A new filter: every band and the mono bass off on both lanes, the width as recorded. */
+static void filters_init(eqe_ctx *c) {
+    for (int j = 0; j < EQE_NFILT; j++) {
+        band_t *b = &c->band[j];
+        b->cur = b->tgt = b->cur1 = b->tgt1 = kIdentity;
+    }
+    c->wd_cur = c->wd_tgt = 1.0;
+}
+
 static void reset_states(eqe_ctx *c) {
-    for (int j = 0; j < EQE_NBAND; j++) {
+    for (int j = 0; j < EQE_NFILT; j++) {
         band_t *b = &c->band[j];
         b->z1[0] = b->z1[1] = b->z2[0] = b->z2[1] = 0.0;
-        b->active = !(is_identity(&b->cur) && is_identity(&b->tgt));
+        b->active = !band_identity(c, b);
     }
     memset(c->dbuf, 0, sizeof(c->dbuf));
     for (int ch = 0; ch < 2; ch++) {
@@ -539,37 +585,69 @@ static inline double guard_min_push(eqe_ctx *c, double req) {
 static void apply_settings(eqe_ctx *c, int jump) {
     c->pre_tgt = pow(10.0, c->set.preamp_cdb / 2000.0);
     c->w_tgt = c->set.eq_on ? 1.0 : 0.0;
-    if (c->rate <= 0.0) return;
+    /* 0x326: the stereo width (the settings before the first arrive, layout 0, mean as recorded) */
+    double wd = c->set.layout >= 4 ? c->set.width_pct / 100.0 : 1.0;
+    if (c->rate <= 0.0) {
+        c->wd_tgt = c->wd_cur = wd;
+        c->wd_left = 0;
+        return;
+    }
+    /* while the lanes are left and right, lane 1's coefficients are lane 0's (not kept apart) */
+    if (!c->ms)
+        for (int j = 0; j < EQE_NFILT; j++) c->band[j].cur1 = c->band[j].cur;
     if (c->set.mode == 1) {
-        /* Expert: each band is what it says (no solver); the rest are off */
+        /* Expert: each band is what it says (no solver), on its channel; the rest are off */
         for (int j = 0; j < EQE_NB; j++) c->gains[j] = 0.0;
-        for (int j = 0; j < EQE_NBAND; j++)
-            c->band[j].tgt = j < c->set.nx ? xband_coefs(c->set.x[j], c->rate) : kIdentity;
+        for (int j = 0; j < EQE_NBAND; j++) {
+            band_t *b = &c->band[j];
+            coefs_t k = j < c->set.nx ? xband_coefs(c->set.x[j], c->rate) : kIdentity;
+            int ch = j < c->set.nx ? EQE_X_CH(c->set.x[j][0]) : EQE_CH_LR;
+            b->tgt = ch == EQE_CH_SIDE ? kIdentity : k;
+            b->tgt1 = ch == EQE_CH_MID ? kIdentity : k;
+        }
     } else {
         if (c->set.ends != c->design_ends) prepare_matrix(c);
         solve_gains(c, c->gains);
         for (int j = 0; j < EQE_NBAND; j++)
-            c->band[j].tgt = j < EQE_NB ? band_coefs(c->set.ends, j, c->gains[j], c->rate) : kIdentity;
+            c->band[j].tgt = c->band[j].tgt1 = j < EQE_NB ? band_coefs(c->set.ends, j, c->gains[j], c->rate) : kIdentity;
     }
+    /* mono bass: the side's lows taken away (12 dB an octave below mono_hz) */
+    c->band[EQE_MONO].tgt = kIdentity;
+    c->band[EQE_MONO].tgt1 = c->set.layout >= 4 && c->set.mono_hz > 0 ? lowcut(c->set.mono_hz, 0.70710678118654752, c->rate) : kIdentity;
     /* (a ramp between two stable biquads stays stable: the stable (a1, a2) region is convex) */
-    for (int j = 0; j < EQE_NBAND; j++) {
+    for (int j = 0; j < EQE_NFILT; j++) {
         band_t *b = &c->band[j];
-        if (jump) b->cur = b->tgt;
-        if (!(is_identity(&b->cur) && is_identity(&b->tgt))) b->active = 1;
+        if (jump) {
+            b->cur = b->tgt;
+            b->cur1 = b->tgt1;
+        }
+        if (!band_identity(c, b) || !is_identity(&b->cur1)) b->active = 1;
     }
     if (jump) {
         c->ramp_left = 0;
         c->pre_cur = c->pre_tgt;
+        c->wd_cur = c->wd_tgt = wd;
+        c->wd_left = 0;
     } else {
-        for (int j = 0; j < EQE_NBAND; j++) {
+        for (int j = 0; j < EQE_NFILT; j++) {
             band_t *b = &c->band[j];
             b->inc.b0 = (b->tgt.b0 - b->cur.b0) / RAMP_LEN;
             b->inc.b1 = (b->tgt.b1 - b->cur.b1) / RAMP_LEN;
             b->inc.b2 = (b->tgt.b2 - b->cur.b2) / RAMP_LEN;
             b->inc.a1 = (b->tgt.a1 - b->cur.a1) / RAMP_LEN;
             b->inc.a2 = (b->tgt.a2 - b->cur.a2) / RAMP_LEN;
+            b->inc1.b0 = (b->tgt1.b0 - b->cur1.b0) / RAMP_LEN;
+            b->inc1.b1 = (b->tgt1.b1 - b->cur1.b1) / RAMP_LEN;
+            b->inc1.b2 = (b->tgt1.b2 - b->cur1.b2) / RAMP_LEN;
+            b->inc1.a1 = (b->tgt1.a1 - b->cur1.a1) / RAMP_LEN;
+            b->inc1.a2 = (b->tgt1.a2 - b->cur1.a2) / RAMP_LEN;
         }
         c->ramp_left = RAMP_LEN;
+        if (wd != c->wd_tgt || c->wd_left > 0) {
+            c->wd_tgt = wd;
+            c->wd_inc = (wd - c->wd_cur) / RAMP_LEN;
+            c->wd_left = c->wd_cur == wd ? 0 : RAMP_LEN;
+        }
     }
     c->w_step = 1.0 / XFADE_LEN;
     for (int ch = 0; ch < 2; ch++) {
@@ -586,16 +664,20 @@ static void apply_settings(eqe_ctx *c, int jump) {
 }
 
 static int xband_valid(const int32_t b[4]) {
-    if (b[0] < EQE_X_PEAK || b[0] > EQE_X_LOW_CUT) return 0;
+    int t = EQE_X_TYPE(b[0]);
+    if (b[0] < 0 || (b[0] & ~0x3F) || EQE_X_CH(b[0]) > EQE_CH_SIDE) return 0;
+    if (t < EQE_X_PEAK || t > EQE_X_LOW_CUT) return 0;
     if (b[1] < EQE_X_FMIN || b[1] > EQE_X_FMAX) return 0;
-    if (b[0] != EQE_X_LOW_CUT && (b[2] < -EQE_BAND_LIMIT || b[2] > EQE_BAND_LIMIT)) return 0;
-    if (b[0] == EQE_X_PEAK && (b[3] < EQE_X_BWMIN || b[3] > EQE_X_BWMAX)) return 0;
-    if (b[0] == EQE_X_LOW_CUT && (b[3] < EQE_X_QMIN || b[3] > EQE_X_QMAX)) return 0;
+    if (t != EQE_X_LOW_CUT && (b[2] < -EQE_BAND_LIMIT || b[2] > EQE_BAND_LIMIT)) return 0;
+    if (t == EQE_X_PEAK && (b[3] < EQE_X_BWMIN || b[3] > EQE_X_BWMAX)) return 0;
+    if (t == EQE_X_LOW_CUT && (b[3] < EQE_X_QMIN || b[3] > EQE_X_QMAX)) return 0;
     return 1;
 }
 
 static int settings_valid(const eqe_settings *s) {
-    if (s->layout != 3) return 0;
+    if (s->layout != 4) return 0;
+    if (s->width_pct < 0 || s->width_pct > EQE_WIDTH_MAX) return 0;
+    if (s->mono_hz != 0 && (s->mono_hz < EQE_MONO_MIN || s->mono_hz > EQE_MONO_MAX)) return 0;
     if (s->mode != 0 && s->mode != 1) return 0;
     if (s->nx < 0 || s->nx > EQE_NX) return 0;
     for (int j = 0; j < s->nx; j++)
@@ -611,22 +693,32 @@ static int settings_valid(const eqe_settings *s) {
     return 1;
 }
 
-/* Settings from a SET_PARAM value of n bytes: layout 3, or an older app's layout 2 or 1 (Easy
- * mode). Unused Expert slots are cleared. 1 when they are valid. */
+/* Settings from a SET_PARAM value of n bytes: layout 4, or an older app's layout 3 (no mid/side), 2
+ * or 1 (Easy mode). Unused Expert slots are cleared. 1 when they are valid. */
 static int settings_from(const char *v, uint32_t n, eqe_settings *s) {
     memset(s, 0, sizeof(*s));
     if (n == sizeof(eqe_settings)) {
         memcpy(s, v, n);
+        if (s->layout != 4) return 0;
+    } else if (n == EQE_SET3_BYTES) {
+        /* 0.7.1 .. 0.7.7 (and the CarPlay layer's control file from them): no channel in the band types */
+        memcpy(s, v, n);
         if (s->layout != 3) return 0;
+        for (int j = 0; j < s->nx && j < EQE_NX; j++)
+            if (s->x[j][0] & ~0xF) return 0;
+        s->layout = 4;
+        s->width_pct = 100;
     } else if (n == EQE_SET2_BYTES) {
         memcpy(s, v, n);
         if (s->layout != 2) return 0;
-        s->layout = 3;
+        s->layout = 4;
+        s->width_pct = 100;
     } else if (n == EQE_SET1_BYTES) {
         /* an app from before 0.6.6: layout 1, both end bands peaks */
         memcpy(s, v, n);
         if (s->layout != 1) return 0;
-        s->layout = 3;
+        s->layout = 4;
+        s->width_pct = 100;
         s->ends = 0;
     } else {
         return 0;
@@ -675,6 +767,71 @@ static double peak_gain(const coefs_t k[EQE_NBAND], double rate, double *at_hz) 
     return best;
 }
 
+/* 0x326, mid/side: each lane's response is the product of its filters' (complex), the side's times
+ * the width. Out of the left speaker comes (Hm + w Hs) / 2 of the left input plus (Hm - w Hs) / 2 of
+ * the right (the right speaker the same, mirrored), so the most a speaker can get at f, for any
+ * input with both sides within full scale, is (|Hm + w Hs| + |Hm - w Hs|) / 2: |Hm| for a mid-only
+ * signal, |w Hs| for a side-only one, more when the two lanes differ in phase. Equal lanes and
+ * w = 1 give back |H|. */
+static void coefs_h(const coefs_t *k, double w, double *re, double *im) {
+    double c1 = cos(w), s1 = sin(w), c2 = cos(2.0 * w), s2 = sin(2.0 * w);
+    double nr = k->b0 + k->b1 * c1 + k->b2 * c2, ni = -(k->b1 * s1 + k->b2 * s2);
+    double dr = 1.0 + k->a1 * c1 + k->a2 * c2, di = -(k->a1 * s1 + k->a2 * s2);
+    double den = dr * dr + di * di;
+    if (den <= 0.0) { *re = 0.0; *im = 0.0; return; }
+    *re = (nr * dr + ni * di) / den;
+    *im = (ni * dr - nr * di) / den;
+}
+
+static double ms_resp_db(const coefs_t k0[EQE_NFILT], const coefs_t k1[EQE_NFILT], double wd, double f, double rate) {
+    double w = 2.0 * EQE_PI * f / rate;
+    double mr = 1.0, mi = 0.0, sr = wd, si = 0.0;
+    for (int j = 0; j < EQE_NFILT; j++) {
+        double r, i, t;
+        if (!is_identity(&k0[j])) {
+            coefs_h(&k0[j], w, &r, &i);
+            t = mr * r - mi * i; mi = mr * i + mi * r; mr = t;
+        }
+        if (!is_identity(&k1[j])) {
+            coefs_h(&k1[j], w, &r, &i);
+            t = sr * r - si * i; si = sr * i + si * r; sr = t;
+        }
+    }
+    double a = hypot(mr + sr, mi + si), b = hypot(mr - sr, mi - si);
+    double g = 0.5 * (a + b);
+    return g > 1e-10 ? 20.0 * log10(g) : -200.0;
+}
+
+static double ms_peak_gain(const coefs_t k0[EQE_NFILT], const coefs_t k1[EQE_NFILT], double wd, double rate, double *at_hz) {
+    double nyq = 0.5 * rate;
+    double best = ms_resp_db(k0, k1, wd, 0.0, rate), at = 0.0;
+    double d = ms_resp_db(k0, k1, wd, nyq, rate);
+    if (d > best) { best = d; at = nyq; }
+    double fbest = -1.0;
+    for (double f = 1.0; f < nyq; f *= 1.01) {
+        d = ms_resp_db(k0, k1, wd, f, rate);
+        if (d > best) { best = d; at = f; fbest = f; }
+    }
+    if (fbest > 0.0) {
+        for (double f = fbest / 1.01; f < fbest * 1.01 && f < nyq; f *= 1.0005) {
+            d = ms_resp_db(k0, k1, wd, f, rate);
+            if (d > best) { best = d; at = f; }
+        }
+    }
+    *at_hz = at;
+    return best;
+}
+
+/* settings s use mid/side (width, mono bass, or an Expert band on the mid or the side only) */
+static int settings_ms(const eqe_settings *s) {
+    if (s->layout < 4) return 0;
+    if (s->width_pct != 100 || s->mono_hz != 0) return 1;
+    if (s->mode == 1)
+        for (int j = 0; j < s->nx && j < EQE_NX; j++)
+            if (EQE_X_CH(s->x[j][0]) != EQE_CH_LR) return 1;
+    return 0;
+}
+
 /* Answers EQE_PARAM_PEAK for settings s at this filter's rate, without touching what plays:
  * [0] the largest gain of s's solved band filters in 0.01 dB (rounded up; the preamp and the
  * on/off switch are not included), [1] where, in Hz (0 = 0 Hz), [2] the rate it was worked
@@ -696,7 +853,7 @@ static int peak_query(const eqe_ctx *c, const eqe_settings *s, int32_t out[3]) {
         t->set = *s;
         t->design_ends = 0;
         prepare_matrix(t);
-        coefs_t k[EQE_NBAND];
+        coefs_t k[EQE_NFILT];
         if (s->mode == 1) {
             for (int j = 0; j < EQE_NBAND; j++) k[j] = j < s->nx ? xband_coefs(s->x[j], t->rate) : kIdentity;
         } else {
@@ -704,8 +861,21 @@ static int peak_query(const eqe_ctx *c, const eqe_settings *s, int32_t out[3]) {
             solve_gains(t, g);
             for (int j = 0; j < EQE_NBAND; j++) k[j] = j < EQE_NB ? band_coefs(s->ends, j, g[j], t->rate) : kIdentity;
         }
-        double at;
-        double p = peak_gain(k, t->rate, &at);
+        double at, p;
+        if (!settings_ms(s)) {
+            p = peak_gain(k, t->rate, &at);
+        } else {
+            /* 0x326: each lane's filters, the width and the mono bass */
+            coefs_t k0[EQE_NFILT], k1[EQE_NFILT];
+            for (int j = 0; j < EQE_NBAND; j++) {
+                int ch = s->mode == 1 && j < s->nx ? EQE_X_CH(s->x[j][0]) : EQE_CH_LR;
+                k0[j] = ch == EQE_CH_SIDE ? kIdentity : k[j];
+                k1[j] = ch == EQE_CH_MID ? kIdentity : k[j];
+            }
+            k0[EQE_MONO] = kIdentity;
+            k1[EQE_MONO] = s->mono_hz > 0 ? lowcut(s->mono_hz, 0.70710678118654752, t->rate) : kIdentity;
+            p = ms_peak_gain(k0, k1, s->width_pct / 100.0, t->rate, &at);
+        }
         if (p > best + 1e-9) {
             best = p;
             best_at = at;
@@ -854,6 +1024,104 @@ static void bands_block(eqe_ctx *c, const int16_t *src, size_t n, band_t *const 
     }
 }
 
+/* 0x326: whether the bands must run on mid and side: a width other than 100 % (or on its way), or a
+ * filter whose two lanes differ (an Expert band on the mid or the side only, the mono bass, or one
+ * still ramping out of that). On a change the filters' states are carried over to the other lanes
+ * (the filters are linear and, while the lanes are left and right, the same on both, so the
+ * output carries on as if nothing changed). Called at the start of each buffer. */
+static void ms_update(eqe_ctx *c) {
+    int need = c->wd_cur != 1.0 || c->wd_tgt != 1.0 || c->wd_left > 0;
+    for (int j = 0; j < EQE_NFILT && !need; j++) {
+        const band_t *b = &c->band[j];
+        if (memcmp(&b->tgt, &b->tgt1, sizeof(coefs_t)) != 0) need = 1;
+        else if (c->ms && memcmp(&b->cur, &b->cur1, sizeof(coefs_t)) != 0) need = 1;
+    }
+    if (need == c->ms) return;
+    for (int j = 0; j < EQE_NFILT; j++) {
+        band_t *b = &c->band[j];
+        double a1 = b->z1[0], c1 = b->z1[1], a2 = b->z2[0], c2 = b->z2[1];
+        if (need) {
+            /* left/right -> mid/side; lane 1 starts from lane 0's coefficients (apply_settings made
+               them equal before setting a different target) */
+            b->z1[0] = (a1 + c1) * 0.5;
+            b->z1[1] = (a1 - c1) * 0.5;
+            b->z2[0] = (a2 + c2) * 0.5;
+            b->z2[1] = (a2 - c2) * 0.5;
+        } else {
+            b->z1[0] = a1 + c1;
+            b->z1[1] = a1 - c1;
+            b->z2[0] = a2 + c2;
+            b->z2[1] = a2 - c2;
+        }
+    }
+    c->ms = need;
+}
+
+/* 0x326: bands_block while the bands run on mid and side: the preamp, left/right to mid/side, each
+ * filter with each lane's own coefficients, the width on the side, and back to left/right. */
+static void bands_block_ms(eqe_ctx *c, const int16_t *src, size_t n, band_t *const *act, int nb) {
+    double *y = c->yb;
+    for (size_t f = 0; f < n; f++) {
+        if (c->pre_cur != c->pre_tgt) {
+            c->pre_cur += (c->pre_tgt - c->pre_cur) * c->pre_k;
+            if (fabs(c->pre_tgt - c->pre_cur) < 1e-12) c->pre_cur = c->pre_tgt;
+        }
+        int32_t il = src[2 * f], ir = src[2 * f + 1];
+        double xl = il * (1.0 / 32768.0) * c->pre_cur, xr = ir * (1.0 / 32768.0) * c->pre_cur;
+        y[2 * f] = (xl + xr) * 0.5;
+        y[2 * f + 1] = (xl - xr) * 0.5;
+    }
+    size_t rn = c->ramp_left <= 0 ? 0 : (size_t)c->ramp_left < n ? (size_t)c->ramp_left : n;
+    int ends = rn > 0 && (size_t)c->ramp_left <= n;
+    for (int k = 0; k < nb; k++) {
+        band_t *b = act[k];
+        coefs_t p = b->cur, q = b->cur1;
+        double m1 = b->z1[0], m2 = b->z2[0], s1 = b->z1[1], s2 = b->z2[1];
+        for (size_t f = 0; f < n; f++) {
+            double xm = y[2 * f], xs = y[2 * f + 1];
+            double ym = p.b0 * xm + m1;
+            m1 = p.b1 * xm - p.a1 * ym + m2;
+            m2 = p.b2 * xm - p.a2 * ym;
+            double ys = q.b0 * xs + s1;
+            s1 = q.b1 * xs - q.a1 * ys + s2;
+            s2 = q.b2 * xs - q.a2 * ys;
+            y[2 * f] = ym;
+            y[2 * f + 1] = ys;
+            if (f < rn) {
+                p.b0 += b->inc.b0; p.b1 += b->inc.b1; p.b2 += b->inc.b2; p.a1 += b->inc.a1; p.a2 += b->inc.a2;
+                q.b0 += b->inc1.b0; q.b1 += b->inc1.b1; q.b2 += b->inc1.b2; q.a1 += b->inc1.a1; q.a2 += b->inc1.a2;
+                if (f + 1 == rn && ends) {
+                    p = b->tgt;
+                    q = b->tgt1;
+                }
+            }
+        }
+        b->cur = p;
+        b->cur1 = q;
+        b->z1[0] = m1;
+        b->z2[0] = m2;
+        b->z1[1] = s1;
+        b->z2[1] = s2;
+    }
+    if (rn > 0) {
+        c->ramp_left -= (int)rn;
+        if (c->ramp_left == 0)
+            for (int j = 0; j < EQE_NFILT; j++) {
+                c->band[j].cur = c->band[j].tgt;
+                c->band[j].cur1 = c->band[j].tgt1;
+            }
+    }
+    for (size_t f = 0; f < n; f++) {
+        if (c->wd_left > 0) {
+            c->wd_cur += c->wd_inc;
+            if (--c->wd_left == 0) c->wd_cur = c->wd_tgt;
+        }
+        double m = y[2 * f], s = y[2 * f + 1] * c->wd_cur;
+        y[2 * f] = m + s;
+        y[2 * f + 1] = m - s;
+    }
+}
+
 /* One buffer. The per-sample work is only what the settings need (0.6.6):
  * - "transparent" (EQ on but flat, preamp 0 dB, no seat delay, the guard idle): the input goes
  *   through the look-ahead delay as in the bit-exact path, which gives exactly the same samples
@@ -867,11 +1135,12 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
     int32_t ipl = c->in_peak_l, ipr = c->in_peak_r, bpk = 0;
     uint64_t iss = 0, oss = 0;
     uint32_t clip = 0;
-    band_t *act[EQE_NBAND];
+    band_t *act[EQE_NFILT];
     int nb = 0;
-    for (int j = 0; j < EQE_NBAND; j++)
+    ms_update(c);
+    for (int j = 0; j < EQE_NFILT; j++)
         if (c->band[j].active) act[nb++] = &c->band[j];
-    int transparent = c->processing && nb == 0 && c->ramp_left == 0 && c->pre_cur == 1.0 && c->pre_tgt == 1.0 &&
+    int transparent = c->processing && nb == 0 && !c->ms && c->ramp_left == 0 && c->pre_cur == 1.0 && c->pre_tgt == 1.0 &&
                       c->w == 1.0 && c->w_tgt == 1.0 && c->dcur[0] == 0 && c->dcur[1] == 0 && c->dfade[0] == 0 &&
                       c->dfade[1] == 0 && c->gq_n == 0 && c->box_low == 0 && c->g2 == 1.0;
     size_t cbase = 0, cend = 0;
@@ -882,8 +1151,11 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
             size_t n = frames - f < EQE_CHUNK ? frames - f : EQE_CHUNK;
             cbase = f;
             cend = f + n;
-            blk = nb > 0 && c->processing && !transparent && c->w_tgt > 0.0;
-            if (blk) bands_block(c, src + 2 * f, n, act, nb);
+            blk = (nb > 0 || c->ms) && c->processing && !transparent && c->w_tgt > 0.0;
+            if (blk) {
+                if (c->ms) bands_block_ms(c, src + 2 * f, n, act, nb);
+                else bands_block(c, src + 2 * f, n, act, nb);
+            }
         }
         int32_t il = src[2 * f], ir = src[2 * f + 1];
         int32_t al = il < 0 ? -il : il, ar = ir < 0 ? -ir : ir;
@@ -932,6 +1204,42 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
                 }
                 yl = xl * c->pre_cur;
                 yr = xr * c->pre_cur;
+                if (c->ms) {
+                    /* 0x326: mid and side, each lane with its own coefficients, the width, back */
+                    double m = (yl + yr) * 0.5, s = (yl - yr) * 0.5;
+                    for (int n = 0; n < nb; n++) {
+                        band_t *b = act[n];
+                        double ym = b->cur.b0 * m + b->z1[0];
+                        b->z1[0] = b->cur.b1 * m - b->cur.a1 * ym + b->z2[0];
+                        b->z2[0] = b->cur.b2 * m - b->cur.a2 * ym;
+                        double ys = b->cur1.b0 * s + b->z1[1];
+                        b->z1[1] = b->cur1.b1 * s - b->cur1.a1 * ys + b->z2[1];
+                        b->z2[1] = b->cur1.b2 * s - b->cur1.a2 * ys;
+                        m = ym;
+                        s = ys;
+                    }
+                    if (c->ramp_left > 0) {
+                        for (int n = 0; n < nb; n++) {
+                            band_t *b = act[n];
+                            b->cur.b0 += b->inc.b0; b->cur.b1 += b->inc.b1; b->cur.b2 += b->inc.b2;
+                            b->cur.a1 += b->inc.a1; b->cur.a2 += b->inc.a2;
+                            b->cur1.b0 += b->inc1.b0; b->cur1.b1 += b->inc1.b1; b->cur1.b2 += b->inc1.b2;
+                            b->cur1.a1 += b->inc1.a1; b->cur1.a2 += b->inc1.a2;
+                        }
+                        if (--c->ramp_left == 0)
+                            for (int j = 0; j < EQE_NFILT; j++) {
+                                c->band[j].cur = c->band[j].tgt;
+                                c->band[j].cur1 = c->band[j].tgt1;
+                            }
+                    }
+                    if (c->wd_left > 0) {
+                        c->wd_cur += c->wd_inc;
+                        if (--c->wd_left == 0) c->wd_cur = c->wd_tgt;
+                    }
+                    s *= c->wd_cur;
+                    yl = m + s;
+                    yr = m - s;
+                } else {
                 /* filters */
                 for (int n = 0; n < nb; n++) {
                     band_t *b = act[n];
@@ -949,6 +1257,7 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
                     }
                     if (--c->ramp_left == 0)
                         for (int j = 0; j < EQE_NBAND; j++) c->band[j].cur = c->band[j].tgt;
+                }
                 }
             }
             /* listening position: per-channel delay, crossfading between taps when it changes */
@@ -1047,13 +1356,13 @@ static void process_frames(eqe_ctx *c, const int16_t *src, int16_t *dst, size_t 
     c->in_clip_sr += clip;
     c->in_clip_total += clip;
     /* keep the filter states out of the denormal range, and the running sum exact */
-    for (int j = 0; j < EQE_NBAND; j++) {
+    for (int j = 0; j < EQE_NFILT; j++) {
         band_t *b = &c->band[j];
         for (int ch = 0; ch < 2; ch++) {
             if (fabs(b->z1[ch]) < 1e-25) b->z1[ch] = 0.0;
             if (fabs(b->z2[ch]) < 1e-25) b->z2[ch] = 0.0;
         }
-        if (b->active && c->ramp_left == 0 && is_identity(&b->cur) && is_identity(&b->tgt) &&
+        if (b->active && c->ramp_left == 0 && band_identity(c, b) &&
             b->z1[0] == 0.0 && b->z1[1] == 0.0 && b->z2[0] == 0.0 && b->z2[1] == 0.0)
             b->active = 0;
     }
@@ -1376,18 +1685,22 @@ static void log_settings(eqe_ctx *c, const char *what) {
         b[0] = 0;
         for (int j = 0; j < s->nx && o < (int)sizeof(b) - 34; j++) {
             static const char *kT[] = {"?", "peak", "lshelf", "hshelf", "lowcut"};
-            o += snprintf(b + o, sizeof(b) - o, " %s@%d/%d/%d", kT[s->x[j][0] >= 1 && s->x[j][0] <= 4 ? s->x[j][0] : 0],
+            static const char *kC[] = {"", "(mid)", "(side)"};
+            int t = EQE_X_TYPE(s->x[j][0]), ch = EQE_X_CH(s->x[j][0]);
+            o += snprintf(b + o, sizeof(b) - o, " %s%s@%d/%d/%d", kT[t >= 1 && t <= 4 ? t : 0], kC[ch <= 2 ? ch : 0],
                           s->x[j][1] / 100, s->x[j][2], s->x[j][3]);
         }
-        LOGI("%s: eq %s, preamp %d, guard %d, Expert %d bands:%s, delay L %d R %d us", what, s->eq_on ? "on" : "off",
-             s->preamp_cdb, s->guard_on, s->nx, b, s->delay_us[0], s->delay_us[1]);
+        LOGI("%s: eq %s, preamp %d, guard %d, Expert %d bands:%s, delay L %d R %d us, width %d%%, mono bass %d Hz", what,
+             s->eq_on ? "on" : "off", s->preamp_cdb, s->guard_on, s->nx, b, s->delay_us[0], s->delay_us[1], s->width_pct,
+             s->mono_hz);
         return;
     }
-    LOGI("%s: eq %s, preamp %d, guard %d, bands %d %d %d %d %d %d %d %d %d %d (0.01 dB), ends %s/%s, delay L %d R %d us",
+    LOGI("%s: eq %s, preamp %d, guard %d, bands %d %d %d %d %d %d %d %d %d %d (0.01 dB), ends %s/%s, delay L %d R %d us, "
+         "width %d%%, mono bass %d Hz",
          what, s->eq_on ? "on" : "off", s->preamp_cdb, s->guard_on, s->band_cdb[0], s->band_cdb[1], s->band_cdb[2],
          s->band_cdb[3], s->band_cdb[4], s->band_cdb[5], s->band_cdb[6], s->band_cdb[7], s->band_cdb[8],
          s->band_cdb[9], (s->ends & EQE_ENDS_LOW) ? "shelf" : "peak", (s->ends & EQE_ENDS_HIGH) ? "shelf" : "peak",
-         s->delay_us[0], s->delay_us[1]);
+         s->delay_us[0], s->delay_us[1], s->width_pct, s->mono_hz);
 }
 
 #ifndef EQE_CORE_ONLY
@@ -1654,7 +1967,7 @@ static int32_t lib_create(const effect_uuid_t *uuid, int32_t sessionId, int32_t 
     c->magic = EQE_MAGIC;
     c->session = sessionId;
     c->io = ioId;
-    for (int j = 0; j < EQE_NBAND; j++) c->band[j].cur = c->band[j].tgt = kIdentity;
+    filters_init(c);
     c->pre_cur = c->pre_tgt = 1.0;
     c->w_step = 1.0 / XFADE_LEN;
     c->min_gain = 1.0;

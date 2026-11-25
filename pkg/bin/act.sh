@@ -39,7 +39,7 @@
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
-VER=0.7.7
+VER=0.7.8
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -3160,6 +3160,7 @@ curve_ok() {
     esac
     # (after 0.7.6) the same shape the app reads, so a line it cannot use never replaces a slot:
     # Easy "preamp,10 bands" (11 whole numbers); Expert "x;preamp" then up to 20 ";type:Hz:gain:width"
+    # (0.7.8: or ";type:Hz:gain:width:channel")
     set -f
     _cok=0
     case "$CURVE_LINE" in
@@ -3220,7 +3221,8 @@ curve_bands() {
         IFS=:
         set -- $_kg
         IFS=$_kifs
-        [ $# = 4 ] || return 1
+        # 0.7.8: a fifth value, the band's channel (1 mid, 2 side), only when it is not left and right
+        [ $# = 4 ] || [ $# = 5 ] || return 1
         for _kv in "$@"; do
             curve_int "$_kv" || return 1
         done

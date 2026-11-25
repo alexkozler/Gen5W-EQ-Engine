@@ -44,6 +44,16 @@ final class EqSettings {
     static final int X_QMIN = 500, X_QMAX = 2000, X_Q_DEFAULT = 707;
     /** The Easy page's end bands as shelves: their midpoints, in 0.01 Hz (eqengine.c). */
     static final int LOW_SHELF_CHZ = 5000, HIGH_SHELF_CHZ = 1130000;
+    /**
+     * 0.7.8 (filter 0x326, settings layout 4): an Expert band's channel, a fifth value b[4]: left and
+     * right alike (every band before), the mid only ((L + R) / 2, what both sides share) or the side
+     * only ((L - R) / 2, what differs). The stereo width (percent) and the mono bass (Hz, 0 = off)
+     * are Position-page settings, like the seat, not part of the EQ or its presets.
+     */
+    static final int CH_LR = 0, CH_MID = 1, CH_SIDE = 2;
+    static final String[] CH_NAMES = {"L+R", "Mid", "Side"};
+    static final int WIDTH_MIN = 0, WIDTH_MAX = 150, WIDTH_STEP = 10;
+    static final int[] MONO_CHOICES = {0, 80, 120, 150};
 
     boolean eqOn = true;
     int preamp = 0;
@@ -63,6 +73,8 @@ final class EqSettings {
     boolean cpEq = true;          // EQ on CarPlay (Settings; 0.7.4: on by default, one switch for the watch and its EQ)
     String cpwAck = "";           // 0.7.4: the last state/cpw_failed the app has told the user about (its id)
     String crashAck = "";         // after 0.7.6: the car start whose "kept restarting" the app has told the user about (its boot id)
+    int width = 100;              // 0.7.8: stereo width, percent (100 = as recorded)
+    int monoHz = 0;               // 0.7.8: mono bass below this frequency (0 = off)
     /** Loaded from settings another app version saved (or from none): detailed logging was reset. */
     boolean fromOtherVersion;
     static final int SEAT_DELAY_MIN = 500, SEAT_DELAY_MAX = 3000, SEAT_DELAY_STEP = 100;
@@ -89,7 +101,21 @@ final class EqSettings {
         s.cpEq = cpEq;
         s.cpwAck = cpwAck;
         s.crashAck = crashAck;
+        s.width = width;
+        s.monoHz = monoHz;
         return s;
+    }
+
+    /** An Expert band's channel (CH_*): its fifth value, left and right when it has none. */
+    static int ch(int[] b) {
+        return b.length > 4 ? clamp(b[4], CH_LR, CH_SIDE) : CH_LR;
+    }
+
+    /** 0.7.8: the stereo width, mono bass or a band on the mid or the side only is set. */
+    boolean usesMs() {
+        if (width != 100 || monoHz != 0) return true;
+        if (expert) for (int[] b : xb) if (ch(b) != CH_LR) return true;
+        return false;
     }
 
     static ArrayList<int[]> copyBands(ArrayList<int[]> from) {
@@ -143,7 +169,9 @@ final class EqSettings {
 
     /** A band's values put in range for its type (as the filter checks them). */
     static int[] clampBand(int[] b) {
-        int[] o = b.clone();
+        int[] o = new int[5];
+        System.arraycopy(b, 0, o, 0, Math.min(5, b.length));
+        o[4] = ch(o);
         o[0] = clamp(o[0], X_PEAK, X_LOW_CUT);
         o[1] = clamp(o[1], X_FMIN, X_FMAX);
         o[2] = o[0] == X_LOW_CUT ? 0 : clamp(o[2], -X_GAIN, X_GAIN);
@@ -215,6 +243,9 @@ final class EqSettings {
         for (int[] b : list) {
             if (sb.length() > 0) sb.append(';');
             sb.append(b[0]).append(':').append(b[1]).append(':').append(b[2]).append(':').append(b[3]);
+            // 0.7.8: the channel only when it is not left and right, so older versions keep reading
+            // every band they can play (they leave out a band with five values)
+            if (ch(b) != CH_LR) sb.append(':').append(ch(b));
         }
         return sb.toString();
     }
@@ -224,10 +255,10 @@ final class EqSettings {
         if (v == null) return out;
         for (String t : v.trim().split(";")) {
             String[] f = t.trim().split(":");
-            if (f.length != 4) continue;
+            if (f.length != 4 && f.length != 5) continue;
             try {
-                int[] b = new int[4];
-                for (int i = 0; i < 4; i++) b[i] = Integer.parseInt(f[i].trim());
+                int[] b = new int[5];
+                for (int i = 0; i < f.length; i++) b[i] = Integer.parseInt(f[i].trim());
                 if (out.size() < NX) out.add(clampBand(b));
             } catch (NumberFormatException ignored) {
                 // a damaged band is left out
@@ -237,14 +268,16 @@ final class EqSettings {
     }
 
     /**
-     * The engine's settings parameter, little-endian: layout 3 (int32[99]: layout 2, then the mode,
+     * The engine's settings parameter, little-endian: layout 4 (int32[101]: layout 3 with each band's
+     * channel in its type's upper bits, then the stereo width and the mono bass) for 0.7.8's filter;
+     * layout 3 (int32[99]: layout 2, then the mode,
      * the band count and 20 Expert bands) for 0.6.11's filter; layout 2 (int32[17], with the
      * end-band types) for 0.6.6 .. 0.6.10's; layout 1 (int32[16]) for an older one still in the
      * audio server. The older layouts carry the Easy EQ only.
      */
     byte[] toParam(int layout) {
-        int[] v = new int[layout >= 3 ? 19 + 4 * NX : layout == 2 ? 17 : 16];
-        v[0] = layout >= 3 ? 3 : layout == 2 ? 2 : 1;
+        int[] v = new int[layout >= 4 ? 21 + 4 * NX : layout == 3 ? 19 + 4 * NX : layout == 2 ? 17 : 16];
+        v[0] = layout >= 4 ? 4 : layout == 3 ? 3 : layout == 2 ? 2 : 1;
         v[1] = eqOn ? 1 : 0;
         v[2] = clamp(preamp, PRE_MIN, PRE_MAX);
         v[3] = guard ? 1 : 0;
@@ -256,7 +289,16 @@ final class EqSettings {
             v[17] = expert ? 1 : 0;
             int n = Math.min(NX, xb.size());
             v[18] = n;
-            for (int j = 0; j < n; j++) System.arraycopy(clampBand(xb.get(j)), 0, v, 19 + 4 * j, 4);
+            for (int j = 0; j < n; j++) {
+                int[] b = clampBand(xb.get(j));
+                System.arraycopy(b, 0, v, 19 + 4 * j, 4);
+                // layout 4: the channel in the type's upper bits (an older filter plays every band on both)
+                if (layout >= 4) v[19 + 4 * j] |= b[4] << 4;
+            }
+        }
+        if (layout >= 4) {
+            v[19 + 4 * NX] = clamp(width, WIDTH_MIN, WIDTH_MAX);
+            v[20 + 4 * NX] = monoHz <= 0 ? 0 : clamp(monoHz, 40, 250);
         }
         return Engine.intsToBytes(v);
     }
@@ -271,9 +313,10 @@ final class EqSettings {
 
     String positionName() {
         if (position == 0) return "Center";
-        if (position <= -100) return "Driver's seat";
-        if (position >= 100) return "Passenger's seat";
-        return Math.abs(position) + "% toward the " + (position < 0 ? "driver" : "passenger");
+        // (0.7.8: title case, as the Position page's card title)
+        if (position <= -100) return "Driver's Seat";
+        if (position >= 100) return "Passenger's Seat";
+        return Math.abs(position) + "% Toward the " + (position < 0 ? "Driver" : "Passenger");
     }
 
     String describe() {
@@ -281,10 +324,14 @@ final class EqSettings {
         sb.append("eq ").append(eqOn ? "on" : "off").append(", preamp ").append(db(preamp)).append(", clip guard ")
                 .append(guard ? "on" : "off").append(", position ").append(position).append(" (L ").append(delayUs(true))
                 .append(" us, R ").append(delayUs(false)).append(" us)");
+        if (width != 100 || monoHz != 0)
+            sb.append(", width ").append(width).append("%, mono bass ").append(monoHz > 0 ? "below " + monoHz + " Hz" : "off");
         if (expert) {
             sb.append(", Expert, ").append(xb.size()).append(" bands:");
             for (int[] b : xb) {
-                sb.append(' ').append(X_TYPES[clamp(b[0], 1, 4)].toLowerCase(Locale.US).replace(" ", "")).append(' ').append(hz(b[1]));
+                sb.append(' ').append(X_TYPES[clamp(b[0], 1, 4)].toLowerCase(Locale.US).replace(" ", ""));
+                if (ch(b) != CH_LR) sb.append('(').append(CH_NAMES[ch(b)].toLowerCase(Locale.US)).append(')');
+                sb.append(' ').append(hz(b[1]));
                 if (b[0] != X_LOW_CUT) sb.append(' ').append(db(b[2]));
                 if (b[0] == X_PEAK) sb.append(' ').append(String.format(Locale.US, "%.2foct", b[3] / 1000.0));
                 if (b[0] == X_LOW_CUT) sb.append(String.format(Locale.US, " Q%.2f", b[3] / 1000.0));
@@ -362,6 +409,11 @@ final class EqSettings {
                     else if (k.equals("cp_eq")) s.cpEq = !"0".equals(v);
                     else if (k.equals("cpw_ack")) s.cpwAck = v.length() < 120 ? v : "";
                     else if (k.equals("crash_ack")) s.crashAck = v.length() < 120 ? v : "";
+                    else if (k.equals("width")) s.width = clamp(Integer.parseInt(v), WIDTH_MIN, WIDTH_MAX);
+                    else if (k.equals("mono_bass")) {
+                        int m = Integer.parseInt(v);
+                        s.monoHz = m <= 0 ? 0 : clamp(m, 40, 250);
+                    }
                     else if (k.equals("bands")) {
                         String[] f = v.split(",");
                         for (int i = 0; i < NB && i < f.length; i++)
@@ -471,6 +523,8 @@ final class EqSettings {
         sb.append("cp_eq=").append(cpEq ? 1 : 0).append('\n');
         sb.append("cpw_ack=").append(cpwAck).append('\n');
         sb.append("crash_ack=").append(crashAck).append('\n');
+        sb.append("width=").append(width).append('\n');
+        sb.append("mono_bass=").append(monoHz).append('\n');
         sb.append("app=").append(MainActivity.VERSION).append('\n');
         sb.append("bands=");
         for (int i = 0; i < NB; i++) sb.append(i == 0 ? "" : ",").append(bands[i]);

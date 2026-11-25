@@ -45,7 +45,7 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements Engine.Listener, EqPanel.Listener, NavRail.Listener,
         CarView.Listener, HSlider.Listener, XPanel.Listener, WSlider.Listener {
-    static final String VERSION = "0.7.7";
+    static final String VERSION = "0.7.8";
     private static final String ACT = "sh /data/eqengine/bin/act.sh";
     private static final String STATE = BootStatus.STATE_DIR;
     private static final String LAB = "/data/eqengine/lab";
@@ -131,6 +131,9 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
     private TextView freqMinus, freqPlus, gainMinus, gainPlus;
     private final TextView[] typeChips = new TextView[4];
     private WSlider widthSlider;
+    // 0.7.8: the band's channel (a chip in the title row: L+R, Mid, Side), and the Position page's stereo rows
+    private TextView chChip, stereoValue, monoValue, widthOffChip;
+    private final TextView[] monoChips = new TextView[EqSettings.MONO_CHOICES.length];
     /** Undo: the EQ as it was before each change (newest first), and what a change in progress started from. */
     private final ArrayDeque<EqSettings> undo = new ArrayDeque<EqSettings>();
     private EqSettings undoBase;
@@ -672,7 +675,11 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
             delBandBtn.setAlpha(has ? 1f : 0.4f);
         }
         if (addBandBtn != null) addBandBtn.setAlpha(n < EqSettings.NX ? 1f : 0.4f);
+        chChip.setVisibility(has ? View.VISIBLE : View.INVISIBLE);
         if (!has) return;
+        int ch = EqSettings.ch(b);
+        setText(chChip, EqSettings.CH_NAMES[ch]);
+        Ui.chipSelected(chChip, ch != EqSettings.CH_LR);
         for (int t = 0; t < 4; t++) Ui.chipSelected(typeChips[t], b[0] == t + 1);
         setText(freqValue, EqSettings.hz(b[1]));
         boolean cut = b[0] == EqSettings.X_LOW_CUT;
@@ -780,6 +787,19 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         xpanel.setValues(s);
         syncBandCard();
         saveNow();
+    }
+
+    /** 0.7.8: the selected band to its next channel: L+R, Mid, Side. */
+    private void cycleChannel() {
+        int[] b = s.sel();
+        if (b == null) return;
+        beginEdit();
+        b = EqSettings.clampBand(b);
+        b[4] = (EqSettings.ch(b) + 1) % EqSettings.CH_NAMES.length;
+        editBand("band channel " + EqSettings.CH_NAMES[b[4]], true, b);
+        if (b[4] != EqSettings.CH_LR && engine.attached() && !engine.msFilter())
+            overlay.show("Bands on the mid or the side play from the next car start (the filter running now is the "
+                    + "previous version's); until then this band plays on both sides.", Overlay.INFO);
     }
 
     private void setType(int t) {
@@ -944,6 +964,11 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         setPosition(pos, done);
     }
 
+    /** 0.7.8: the width line on the car dragged; saved and logged when the finger lifts. */
+    public void onStereoWidth(int pct, boolean done) {
+        setWidth(pct, done);
+    }
+
     public void onSlide(int value, boolean done) {
         setPosition(value, done);
     }
@@ -966,16 +991,74 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         updatePositionViews();
     }
 
+    /** 0.7.8: the stereo width -/+ (10 % steps, 0 to 150 %). */
+    private void stepWidth(int dir) {
+        setWidth(EqSettings.clamp(s.width + dir * EqSettings.WIDTH_STEP, EqSettings.WIDTH_MIN, EqSettings.WIDTH_MAX));
+    }
+
+    /** 0.7.8: the stereo width, percent (100 = off, as recorded). */
+    private void setWidth(int pct) {
+        setWidth(pct, true);
+    }
+
+    private boolean widthDirty;
+
+    private void setWidth(int pct, boolean done) {
+        if (s.width != pct) {
+            s.width = pct;
+            engine.update(s);
+            updatePositionViews();
+            widthDirty = true;
+        }
+        if (done && widthDirty) {
+            widthDirty = false;
+            saveNow();
+            if (xpanel != null) xpanel.setValues(s);
+            EqLog.i("stereo width " + s.width + "%");
+            msNote();
+        }
+    }
+
+    /** 0.7.8: mono bass below hz (0 = off). */
+    private void setMono(int hz) {
+        if (s.monoHz == hz) return;
+        s.monoHz = hz;
+        engine.update(s);
+        saveNow();
+        updatePositionViews();
+        if (xpanel != null) xpanel.setValues(s);
+        EqLog.i("mono bass " + (hz > 0 ? "below " + hz + " Hz" : "off"));
+        msNote();
+    }
+
+    /** Once per screen: the stereo settings need this version's filter, which the next car start loads. */
+    private boolean msNoted;
+    private void msNote() {
+        if (msNoted || !engine.attached() || engine.msFilter() || (s.width == 100 && s.monoHz == 0)) return;
+        msNoted = true;
+        overlay.show("Stereo width and mono bass play from the next car start (the filter running now is the previous "
+                + "version's).", Overlay.INFO);
+    }
+
     private void updatePositionViews() {
         int dl = s.delayUs(true), dr = s.delayUs(false);
         int d = Math.max(dl, dr);
         car.setPosition(s.position, d / 1000f);
+        car.setWidth(s.width);
         posSlider.setValue(s.position);
         setText(posTitle, s.positionName());
-        setText(posDetail, d == 0 ? "No delay: both sides play at the same time."
+        // (0.7.8: one line either way, for the stereo rows below)
+        setText(posDetail, !s.eqOn ? "EQ is off on the EQ page: nothing applies now." : d == 0 ? "No delay: both sides play at the same time."
                 : (dl > 0 ? "Left" : "Right") + " speakers delayed " + String.format(Locale.US, "%.2f ms", d / 1000.0)
-                        + String.format(Locale.US, " (%.0f cm)", d / 1e6 * EqSettings.SPEED_OF_SOUND * 100)
-                        + (s.eqOn ? "" : "\nEQ is off on the EQ page, so nothing is applied now."));
+                        + String.format(Locale.US, " (%.0f cm)", d / 1e6 * EqSettings.SPEED_OF_SOUND * 100));
+        if (stereoValue != null) {
+            boolean later = engine != null && engine.attached() && !engine.msFilter() && (s.width != 100 || s.monoHz != 0);
+            setText(stereoValue, (s.width == 100 ? "off (as recorded)" : s.width + "%  (" + (s.width == 0 ? "mono"
+                    : s.width > 100 ? "wider" : "narrower") + ")") + (later ? " · next car start" : ""));
+            Ui.chipSelected(widthOffChip, s.width == 100);
+            setText(monoValue, s.monoHz > 0 ? "below " + s.monoHz + " Hz" : "off");
+            for (int i = 0; i < monoChips.length; i++) Ui.chipSelected(monoChips[i], s.monoHz == EqSettings.MONO_CHOICES[i]);
+        }
         setText(seatValue, String.format(Locale.US, "%.1f ms  (%.0f cm)", s.seatDelayUs / 1000.0,
                 s.seatDelayUs / 1e6 * EqSettings.SPEED_OF_SOUND * 100));
         Ui.chipSelected(posChips[0], s.position == -100);
@@ -2724,16 +2807,30 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
                 stepBand(-1);
             }
         });
-        r1.addView(bandPrev, lp(dp(56), dp(40), 0));
+        r1.addView(bandPrev, lp(dp(48), dp(40), 0));
         bandTitle = Ui.text(this, "", 19, Ui.ON_SURFACE, true);
         bandTitle.setGravity(Gravity.CENTER);
+        bandTitle.setSingleLine(true);
         r1.addView(bandTitle, lp(0, WRAP, 1f));
+        // 0.7.8: the band's channel, tapped through L+R, Mid and Side (no room for a row of its own)
+        chChip = Ui.chip(this, EqSettings.CH_NAMES[0], new View.OnClickListener() {
+            public void onClick(View v) {
+                cycleChannel();
+            }
+        });
+        chChip.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16);
+        chChip.setPadding(dp(12), 0, dp(12), 0);
+        chChip.setMinHeight(dp(36));
+        chChip.setSingleLine(true);
+        LinearLayout.LayoutParams chl = lp(WRAP, dp(36), 0);
+        chl.setMargins(dp(6), 0, dp(8), 0);
+        r1.addView(chChip, chl);
         bandNext = smallButton("▶", new View.OnClickListener() {
             public void onClick(View v) {
                 stepBand(1);
             }
         });
-        r1.addView(bandNext, lp(dp(56), dp(40), 0));
+        r1.addView(bandNext, lp(dp(48), dp(40), 0));
         card.addView(r1, lp(MATCH, dp(40), 0));
         // the rows below, hidden while there is no band (a note shows instead)
         FrameLayout below = new FrameLayout(this);
@@ -2998,7 +3095,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         return pg;
     }
 
-    private static final String[] TILE_NAMES = {"Boot step", "EQ filter", "Output", "Processing", "Levels", "App"};
+    private static final String[] TILE_NAMES = {"Boot Step", "EQ Filter", "Output", "Processing", "Levels", "App"};
 
     private View buildStatusPage() {
         LinearLayout pg = pageLayout();
@@ -3115,7 +3212,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         cols.addView(logs, lp(0, WRAP, 1.4f));
         cols.addView(new View(this), lp(dp(16), 1, 0));
 
-        LinearLayout tr = Ui.card(this, "Audio trace");
+        LinearLayout tr = Ui.card(this, "Audio Trace");
         TextView d = Ui.text(this, "Records " + TRACE_SECONDS + " s of Android's system log, with snapshots of the audio "
                 + "system before and after. All logs copies it to the stick.",
                 15, Ui.ON_SURFACE_VAR, false);
@@ -3166,7 +3263,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
 
     private View buildPositionPage() {
         LinearLayout pg = pageLayout();
-        pg.addView(headerLine("Listening position", "Times the speakers for one seat by delaying the side that is closer to it"),
+        pg.addView(headerLine("Positional Sound","Times the speakers for one seat by delaying the side that is closer to it"),
                 lp(MATCH, dp(HEADER_DP), 0));
         LinearLayout cols = new LinearLayout(this);
         cols.setOrientation(LinearLayout.HORIZONTAL);
@@ -3175,6 +3272,8 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
         pg.addView(cols, clp);
 
         LinearLayout carCard = Ui.card(this, null);
+        // (0.7.8: the car reaches the card's top edge, which cuts off its hood)
+        carCard.setPadding(dp(18), 0, dp(18), dp(12));
         car = new CarView(this);
         car.setListener(this);
         carCard.addView(car, lp(MATCH, 0, 1f));
@@ -3206,8 +3305,7 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
             chips.addView(posChips[i], cl);
         }
         info.addView(chips);
-        info.addView(new View(this), lp(1, dp(10), 0));
-        info.addView(Ui.divider(this));
+        // (0.7.8: the seat and its offset are one group, no divider between them)
         LinearLayout seat = new LinearLayout(this);
         seat.setGravity(Gravity.CENTER_VERTICAL);
         seat.setPadding(0, dp(10), 0, dp(4));
@@ -3230,13 +3328,66 @@ public class MainActivity extends Activity implements Engine.Listener, EqPanel.L
             }
         }), lp(dp(64), dp(46), 0));
         info.addView(seat);
-        TextView note = Ui.text(this, "How much farther the far side is from that seat. Tune it by ear from that seat with a "
-                + "centered voice: too much pulls the voice toward the far side, too little leaves it on the near side. Each "
-                + "side's front and rear speakers move together; the car's balance and fader still set the volumes.",
-                14, Ui.ON_SURFACE_VAR, false);
-        note.setLineSpacing(0, 1.15f);
-        note.setPadding(0, dp(8), 0, 0);
-        info.addView(note);
+        // 0.7.8: the stereo width and mono bass, in the room the seat offset's note had
+        info.addView(new View(this), lp(1, dp(6), 0));
+        info.addView(Ui.divider(this));
+        LinearLayout wrow = new LinearLayout(this);
+        wrow.setGravity(Gravity.CENTER_VERTICAL);
+        wrow.setPadding(0, dp(10), 0, dp(4));
+        LinearLayout wt = new LinearLayout(this);
+        wt.setOrientation(LinearLayout.VERTICAL);
+        wt.addView(Ui.text(this, "Stereo width", 18, Ui.ON_SURFACE, false));
+        stereoValue = Ui.text(this, "", 15, Ui.ON_SURFACE_VAR, false);
+        stereoValue.setPadding(0, dp(4), 0, 0);
+        stereoValue.setSingleLine(true);
+        wt.addView(stereoValue);
+        wrow.addView(wt, lp(0, WRAP, 1f));
+        // Off = 100 %, as recorded (lit there, as Mono bass's Off is when it is off)
+        widthOffChip = Ui.chip(this, "Off", new View.OnClickListener() {
+            public void onClick(View v) {
+                setWidth(100);
+            }
+        });
+        LinearLayout.LayoutParams wol = lp(WRAP, dp(42), 0);
+        wol.setMargins(0, 0, dp(8), 0);
+        wrow.addView(widthOffChip, wol);
+        wrow.addView(Ui.button(this, "−", Ui.TONAL, new View.OnClickListener() {
+            public void onClick(View v) {
+                stepWidth(-1);
+            }
+        }), lp(dp(64), dp(46), 0));
+        wrow.addView(new View(this), lp(dp(8), 1, 0));
+        wrow.addView(Ui.button(this, "+", Ui.TONAL, new View.OnClickListener() {
+            public void onClick(View v) {
+                stepWidth(1);
+            }
+        }), lp(dp(64), dp(46), 0));
+        info.addView(wrow);
+        info.addView(new View(this), lp(1, dp(6), 0));
+        info.addView(Ui.divider(this));
+        LinearLayout mrow = new LinearLayout(this);
+        mrow.setGravity(Gravity.CENTER_VERTICAL);
+        mrow.setPadding(0, dp(10), 0, 0);
+        LinearLayout mt = new LinearLayout(this);
+        mt.setOrientation(LinearLayout.VERTICAL);
+        mt.addView(Ui.text(this, "Mono bass", 18, Ui.ON_SURFACE, false));
+        monoValue = Ui.text(this, "", 15, Ui.ON_SURFACE_VAR, false);
+        monoValue.setPadding(0, dp(4), 0, 0);
+        monoValue.setSingleLine(true);
+        mt.addView(monoValue);
+        mrow.addView(mt, lp(0, WRAP, 1f));
+        for (int i = 0; i < monoChips.length; i++) {
+            final int hz = EqSettings.MONO_CHOICES[i];
+            monoChips[i] = Ui.chip(this, hz == 0 ? "Off" : "<" + hz, new View.OnClickListener() {
+                public void onClick(View v) {
+                    setMono(hz);
+                }
+            });
+            LinearLayout.LayoutParams cl = lp(WRAP, dp(42), 0);
+            cl.setMargins(i == 0 ? 0 : dp(8), 0, 0, 0);
+            mrow.addView(monoChips[i], cl);
+        }
+        info.addView(mrow);
         cols.addView(info, lp(0, MATCH, 1f));
         return pg;
     }

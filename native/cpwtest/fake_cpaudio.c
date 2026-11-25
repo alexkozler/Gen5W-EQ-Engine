@@ -106,6 +106,7 @@ const void *fake_last_ptr(void);
 
 #define LA_DELAY 63
 static int32_t eq_set[CPE_NSET];
+static int eq_nset = CPE_NSET3; /* values written: layout 3 (an app before 0.7.8) or layout 4 */
 static uint32_t eq_seq;
 static short hin[44100 * 2 * 8];
 static unsigned int hin_n;
@@ -121,6 +122,7 @@ static int32_t mono_ms(void) {
 /* layout 3: layout, eq_on, preamp, guard, 10 sliders, delay L R, ends, mode, nx, 20 x 4 */
 static void set_easy(int eq_on, int slider_1k) {
     memset(eq_set, 0, sizeof(eq_set));
+    eq_nset = CPE_NSET3;
     eq_set[0] = 3;
     eq_set[1] = eq_on;
     eq_set[3] = 1;
@@ -129,6 +131,7 @@ static void set_easy(int eq_on, int slider_1k) {
 
 static void set_expert_peak(int f_cHz, int gain_cdb, int bw) {
     memset(eq_set, 0, sizeof(eq_set));
+    eq_nset = CPE_NSET3;
     eq_set[0] = 3;
     eq_set[1] = 1;
     eq_set[3] = 1;
@@ -140,20 +143,32 @@ static void set_expert_peak(int f_cHz, int gain_cdb, int bw) {
     eq_set[22] = bw;
 }
 
+/* 0.7.8, layout 4: the layout 3 values, then the stereo width (percent) and the mono bass (Hz) */
+static void set_easy4(int width_pct, int mono_hz) {
+    memset(eq_set, 0, sizeof(eq_set));
+    eq_nset = CPE_NSET;
+    eq_set[0] = 4;
+    eq_set[1] = 1;
+    eq_set[3] = 1;
+    eq_set[99] = width_pct;
+    eq_set[100] = mono_hz;
+}
+
 static void write_ctl(const char *path, int on, int live_for_ms) {
     int32_t b[CPE_HDR + CPE_NSET];
+    size_t nb = (size_t)(CPE_HDR + eq_nset) * sizeof(int32_t);
     b[0] = (int32_t)CPE_MAGIC;
     b[1] = CPE_VERSION;
     b[2] = (int32_t)++eq_seq;
     b[3] = on;
     b[4] = live_for_ms > 0 ? mono_ms() + live_for_ms : mono_ms() - 1;
     b[5] = 0;
-    memcpy(b + CPE_HDR, eq_set, sizeof(eq_set));
+    memcpy(b + CPE_HDR, eq_set, (size_t)eq_nset * sizeof(int32_t));
     char tmp[600];
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
     if (f == NULL) return;
-    fwrite(b, sizeof(b), 1, f);
+    fwrite(b, nb, 1, f);
     fclose(f);
     rename(tmp, path);
 }
@@ -322,7 +337,7 @@ int cpa_eq(void) {
     snprintf(what, sizeof(what), "the live file: processing at 44100 Hz, 1024-frame buffers, the output peak (%d, a +6 dB tone: about 6538), the settings in use, processing time (%d ns)",
              L.blk_peak, L.avg_ns);
     CHECK(ok && L.state == CPL_PROCESSING && L.why == CPE_WHY_NONE && L.rate == 44100 && L.frames == 1024 && L.blk_seq >= 30 &&
-              L.blk_peak > 6400 && L.blk_peak < 6700 && L.ctl_seq == (int32_t)eq_seq && L.avg_ns > 0 && L.lib == 0x325,
+              L.blk_peak > 6400 && L.blk_peak < 6700 && L.ctl_seq == (int32_t)eq_seq && L.avg_ns > 0 && L.lib == 0x326,
           what);
     snprintf(what, sizeof(what), "the live view: analysed (%u), its strongest band is the one at 1 kHz (band %d, %.1f dBFS)", L.spec_seq,
              best, L.spec[best] / 100.0);
@@ -394,6 +409,28 @@ int cpa_eq(void) {
     play(p, 20, 1024, 44100);
     g = gain_db(8192);
     snprintf(what, sizeof(what), "Expert, a 1 kHz peak at +6 dB: %.2f dB", g);
+    CHECK(fabs(g - 6.0) < 0.15, what);
+
+    /* 9b. (0.7.8) a layout 4 control file: a stereo width of 150 % on the test tone (right at half
+       the left: mid 0.75, side 0.25 of the left), so the left comes out at 0.75 + 1.5 x 0.25 = 1.125
+       (+1.02 dB); then 0 % (mono): 0.75 (-2.50 dB) */
+    set_easy4(150, 0);
+    write_ctl(ctl, 1, 0);
+    play(p, 20, 1024, 44100);
+    g = gain_db(8192);
+    snprintf(what, sizeof(what), "layout 4: stereo width 150 %%: the left %.2f dB (+1.02 +-0.1)", g);
+    CHECK(fabs(g - 20 * log10(1.125)) < 0.1, what);
+    set_easy4(0, 120);
+    write_ctl(ctl, 1, 0);
+    play(p, 20, 1024, 44100);
+    g = gain_db(8192);
+    snprintf(what, sizeof(what), "layout 4: width 0 %% (mono) with mono bass: the left %.2f dB (-2.50 +-0.1)", g);
+    CHECK(fabs(g - 20 * log10(0.75)) < 0.1, what);
+    set_expert_peak(100000, 600, 1000);
+    write_ctl(ctl, 1, 0);
+    play(p, 20, 1024, 44100);
+    g = gain_db(8192);
+    snprintf(what, sizeof(what), "layout 3 again (an app before 0.7.8): the 1 kHz peak at +6 dB, as recorded width (%.2f dB)", g);
     CHECK(fabs(g - 6.0) < 0.15, what);
 
     /* 10. a control file that is not valid: the music goes dry (the last settings kept, EQ off) */

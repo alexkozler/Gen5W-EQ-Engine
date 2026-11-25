@@ -1,13 +1,13 @@
-EQ Engine 0.7.7 (NEMESIS package "eqengine")
+EQ Engine 0.7.8 (NEMESIS package "eqengine")
 ===========================================
 
-A 10-band EQ (or a parametric one with up to 20 bands), clip guard and
-listening-position delay for Android Auto, CarPlay (wired and wireless) and
-Bluetooth audio. Android's main output runs at 48 kHz, so Android Auto's
-48 kHz music is not converted at all; CarPlay plays at the rate the phone
-sends (44.1 or 48 kHz), also unconverted. Navigation and Android Auto's
-directions voice use a second output that EQ Engine does not touch; Siri and
-calls are never processed.
+A 10-band EQ (or a parametric one with up to 20 bands), clip guard,
+listening-position delay, stereo width and mono bass for Android Auto,
+CarPlay (wired and wireless) and Bluetooth audio. Android's main output runs
+at 48 kHz, so Android Auto's 48 kHz music is not converted at all; CarPlay
+plays at the rate the phone sends (44.1 or 48 kHz), also unconverted.
+Navigation and Android Auto's directions voice use a second output that EQ
+Engine does not touch; Siri and calls are never processed.
 Gen5W head units are in Hyundai, Kia and Genesis cars; see the project page
 for the cars it has been tested on. Loads at every start. Do everything below
 parked, never while reversing.
@@ -92,17 +92,35 @@ Pages (rail on the left)
     make a much bigger total than any one dot. The graph's scale grows
     (+-15, 27, 39 or 51 dB) so the orange line always fits; it changes when
     you let go of a dot, never under your finger.
+  - The chip in the card's top row sets what a band works on: L+R (both
+    speakers, as usual), Mid (only what the two speakers have in common: a
+    centered voice, the bass) or Side (only what differs between them: the
+    stereo spread, reverb, the room). With a band on Mid or Side, or stereo
+    width or mono bass set, the orange line is the mid's response and a
+    dashed green line the side's.
 - Both modes, bottom row: Flat (everything back to 0 dB; in Expert, no
   bands), User 1-4 (hold one to save the current EQ there; the four are
   shared, and one saved in the other mode switches to it), Curves on USB
   (save User 1-4 to the stick's EQENGINE_CURVES folder, to keep or share
   them, or load them from it) and Undo (steps back through up to 30 EQ
   changes; the list is lost when Android closes the app's screen).
-- Position: pick Driver, Center or Passenger (or anything between). The side
+- Position (the Positional Sound page): pick Driver, Center or Passenger (or
+  anything between; Driver is the left seat, Passenger the right). The side
   nearer that seat is delayed so both sides arrive together there (1.7 ms by
   default; Seat offset adjusts it). Tune it by ear from that seat with a
   centered voice: too much pulls the voice toward the far side, too little
   leaves it on the near side. Volumes stay with the car's balance and fader.
+  - Stereo width, 0 % (mono) to 150 % in 10 % steps (Off = 100 %, as
+    recorded): turns only what differs between the speakers up or down; a
+    centered voice and the bass stay as they are. On the car picture it is
+    the line across the windshield: drag the line to set it. Wider also
+    raises a sound panned to one side (at 150 % a sound only on the left
+    comes out 1.9 dB louder there); Auto and the clip guard allow for it.
+  - Mono bass, Off or below 80, 120 or 150 Hz: below that both speakers play
+    the same bass. Most music's deep bass is mono already, so it changes
+    little.
+  - These settings are not part of User 1-4 or Undo, and apply to Android
+    Auto, CarPlay and Bluetooth audio.
 - Settings:
   - Equalizer, Clip guard.
   - 48 kHz output (on by default), for what plays through Android (Android
@@ -166,9 +184,9 @@ cannot work in that run of the app anyway, so EQ Engine takes the layer off
 and restarts the app once, only with no phone connected; otherwise it asks
 you to restart the car). The layer loads an unchanged copy of the car's own
 library, hands everything to it, and runs EQ Engine's own filter on CarPlay's
-music: the EQ page's settings (Easy or Expert), the preamp, clip guard and
-listening position. It is checked first in a separate process, at the install
-and again after a factory software update.
+music: the EQ page's settings (Easy or Expert), the preamp, clip guard,
+listening position, stereo width and mono bass. It is checked first in a
+separate process, at the install and again after a factory software update.
 - CarPlay plays at the rate the phone sends, usually 44.1 kHz and sometimes
   48 kHz, so nothing is converted, and 48 kHz output and the converter do
   not apply to it. Added delay: 1.4 ms (the clip guard's look-ahead), plus

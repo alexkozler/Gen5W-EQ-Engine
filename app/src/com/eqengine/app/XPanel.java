@@ -26,6 +26,9 @@ import java.util.ArrayList;
  * the preamp leaves more than 3 dB of the boost to the clip guard.
  * The curves are drawn here from the same formulas as the filter (XDesign); the sound is the
  * filter's own.
+ * 0.7.8: the orange line is the mid's (left and right bands plus the mid-only ones: what a centred
+ * voice gets); while the stereo width, mono bass or a band on one channel is set, a dashed green
+ * line shows the side's (left and right bands, the side-only ones, the width and the mono bass).
  */
 final class XPanel extends View implements LiveLayer.Geometry {
     interface Listener {
@@ -65,6 +68,9 @@ final class XPanel extends View implements LiveLayer.Geometry {
     private final Paint pDash = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pDot = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pDotText = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pSide = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pLegend = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static final int SIDE_COLOR = Color.rgb(108, 214, 140);
     private final RectF r = new RectF();
     private final Path path = new Path();
 
@@ -77,6 +83,11 @@ final class XPanel extends View implements LiveLayer.Geometry {
     // the curves, per band and summed, at NPTS log-spaced points
     private float[][] bandDb = new float[0][];
     private final float[] sumDb = new float[NPTS];
+    // 0.7.8: the side's curve, each band's channel as summed, and the side's own width and mono bass
+    private final float[] sideDb = new float[NPTS];
+    private int[] bandCh = new int[0];
+    private int width = 100, monoHz;
+    private boolean ms;
     private final double[] ptHz = new double[NPTS];
     /** the scale now (dB either side of 0), and the summed curve's largest boost (20 Hz .. 20 kHz) */
     private float range = RANGES[0];
@@ -132,6 +143,14 @@ final class XPanel extends View implements LiveLayer.Geometry {
         pDotText.setTextAlign(Paint.Align.CENTER);
         pDotText.setTypeface(Typeface.DEFAULT_BOLD);
         pDotText.setTextSize(13 * d);
+        pSide.setColor(SIDE_COLOR);
+        pSide.setStyle(Paint.Style.STROKE);
+        pSide.setStrokeJoin(Paint.Join.ROUND);
+        pSide.setStrokeWidth(Math.max(2.5f, 2f * d));
+        pSide.setPathEffect(new DashPathEffect(new float[] {8 * d, 5 * d}, 0));
+        pLegend.setTextAlign(Paint.Align.RIGHT);
+        pLegend.setTypeface(Typeface.DEFAULT_BOLD);
+        pLegend.setTextSize(13 * d);
         for (int i = 0; i < NPTS; i++) ptHz[i] = Math.pow(10, LO + (HI - LO) * i / (NPTS - 1));
     }
 
@@ -158,6 +177,11 @@ final class XPanel extends View implements LiveLayer.Geometry {
         }
         bands = nb;
         sel = s.xb.isEmpty() ? -1 : EqSettings.clamp(s.xSel, 0, s.xb.size() - 1);
+        if (s.width != width || s.monoHz != monoHz) {
+            width = s.width;
+            monoHz = s.monoHz;
+            nchanged = -1;
+        }
         if (nchanged == 1) {
             recomputeBand(changed);
             fitRange();
@@ -177,13 +201,25 @@ final class XPanel extends View implements LiveLayer.Geometry {
 
     private void recompute() {
         if (bandDb.length != bands.size()) bandDb = new float[bands.size()][NPTS];
-        for (int i = 0; i < NPTS; i++) sumDb[i] = 0f;
+        if (bandCh.length != bands.size()) bandCh = new int[bands.size()];
+        // the side's own part: the width (a level) and the mono bass (a low cut at its frequency)
+        double[] mono = monoHz > 0 ? XDesign.coefs(new int[] {EqSettings.X_LOW_CUT, monoHz * 100, 0, 707}, rate) : null;
+        float wdb = width > 0 ? (float) (20 * Math.log10(width / 100.0)) : -200f;
+        ms = width != 100 || monoHz > 0;
+        for (int i = 0; i < NPTS; i++) {
+            sumDb[i] = 0f;
+            sideDb[i] = wdb + (float) XDesign.db(mono, ptHz[i], rate);
+        }
         for (int j = 0; j < bands.size(); j++) {
             double[] k = XDesign.coefs(bands.get(j), rate);
+            int ch = EqSettings.ch(bands.get(j));
+            bandCh[j] = ch;
+            if (ch != EqSettings.CH_LR) ms = true;
             for (int i = 0; i < NPTS; i++) {
                 float v = (float) XDesign.db(k, ptHz[i], rate);
                 bandDb[j][i] = v;
-                sumDb[i] += v;
+                if (ch != EqSettings.CH_SIDE) sumDb[i] += v;
+                if (ch != EqSettings.CH_MID) sideDb[i] += v;
             }
         }
         sumMaxNow();
@@ -191,8 +227,11 @@ final class XPanel extends View implements LiveLayer.Geometry {
     }
 
     private void sumMaxNow() {
-        float m = bands.isEmpty() ? 0f : -1e9f;
-        for (int i = 0; i < NPTS; i++) m = Math.max(m, sumDb[i]);
+        float m = bands.isEmpty() && !ms ? 0f : -1e9f;
+        for (int i = 0; i < NPTS; i++) {
+            m = Math.max(m, sumDb[i]);
+            if (ms) m = Math.max(m, sideDb[i]);
+        }
         sumMax = m;
     }
 
@@ -203,7 +242,10 @@ final class XPanel extends View implements LiveLayer.Geometry {
     private void fitRange() {
         if (mode == 3) return;
         float need = 0f;
-        for (int i = 0; i < NPTS; i++) need = Math.max(need, Math.abs(sumDb[i]));
+        for (int i = 0; i < NPTS; i++) {
+            need = Math.max(need, Math.abs(sumDb[i]));
+            if (ms && sideDb[i] > -60f) need = Math.max(need, Math.abs(sideDb[i]));
+        }
         for (int[] b : bands) if (b[0] != EqSettings.X_LOW_CUT) need = Math.max(need, Math.abs(b[2] / 100f));
         float r = RANGES[RANGES.length - 1];
         for (float c : RANGES) {
@@ -237,14 +279,17 @@ final class XPanel extends View implements LiveLayer.Geometry {
 
     /** One band changed (a drag): only its curve is worked out again, and the sum follows. */
     private void recomputeBand(int j) {
-        if (j < 0 || j >= bandDb.length) {
+        // (0.7.8: a band moved to another channel changes which curves it is in: all again)
+        if (j < 0 || j >= bandDb.length || j >= bandCh.length || bandCh[j] != EqSettings.ch(bands.get(j))) {
             recompute();
             return;
         }
         double[] k = XDesign.coefs(bands.get(j), rate);
+        int ch = bandCh[j];
         for (int i = 0; i < NPTS; i++) {
             float v = (float) XDesign.db(k, ptHz[i], rate);
-            sumDb[i] += v - bandDb[j][i];
+            if (ch != EqSettings.CH_SIDE) sumDb[i] += v - bandDb[j][i];
+            if (ch != EqSettings.CH_MID) sideDb[i] += v - bandDb[j][i];
             bandDb[j][i] = v;
         }
         sumMaxNow();
@@ -340,11 +385,23 @@ final class XPanel extends View implements LiveLayer.Geometry {
             drawLine(c, bandDb[j], pBand);
         }
         if (sel >= 0 && sel < bandDb.length) drawLine(c, bandDb[sel], pSel);
-        // the whole EQ
+        // the whole EQ (0.7.8: the mid's, and the side's when it differs)
         pSum.setAlpha(eqOn ? 230 : 80);
         if (bandDb.length > 0) drawLine(c, sumDb, pSum);
         else c.drawLine(gx0, y(0), gx1, y(0), pSum);
+        if (ms) {
+            pSide.setAlpha(eqOn ? 230 : 80);
+            drawLine(c, sideDb, pSide);
+        }
         c.restore();
+        if (ms) {
+            float ly = gy0 + pLegend.getTextSize() + 4 * d;
+            pLegend.setColor(SIDE_COLOR);
+            c.drawText("Side", gx1 - 6 * d, ly, pLegend);
+            float sw = pLegend.measureText("Side") + 12 * d;
+            pLegend.setColor(Ui.CURVE);
+            c.drawText("Mid", gx1 - 6 * d - sw, ly, pLegend);
+        }
         // the selected peak's bandwidth
         if (sel >= 0 && sel < bands.size() && bands.get(sel)[0] == EqSettings.X_PEAK) {
             int[] b = bands.get(sel);

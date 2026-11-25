@@ -524,6 +524,21 @@ static void set_desc(const eqe_settings *s, char *b, size_t n) {
         size_t l = strlen(b);
         snprintf(b + l, n - l, ", seat delay L %d R %d us", s->delay_us[0], s->delay_us[1]);
     }
+    if (settings_ms(s)) {
+        /* 0.7.8: mid/side */
+        int mid = 0, side = 0;
+        if (s->mode == 1)
+            for (int j = 0; j < s->nx && j < EQE_NX; j++) {
+                mid += EQE_X_CH(s->x[j][0]) == EQE_CH_MID;
+                side += EQE_X_CH(s->x[j][0]) == EQE_CH_SIDE;
+            }
+        size_t l = strlen(b);
+        if (s->mono_hz)
+            snprintf(b + l, n - l, ", width %d%%, mono bass below %d Hz, %d mid and %d side bands", s->width_pct, s->mono_hz,
+                     mid, side);
+        else
+            snprintf(b + l, n - l, ", width %d%%, no mono bass, %d mid and %d side bands", s->width_pct, mid, side);
+    }
 }
 
 /* ---- the live file (written under g_eq_lock only, so there is one writer at a time) */
@@ -638,7 +653,7 @@ static void eq_apply(int jump) {
 /* the filter as the audio server's lib_create makes it (once, from whichever thread is first) */
 static void eq_init(void) {
     eqe_ctx *c = &g_eq;
-    for (int j = 0; j < EQE_NBAND; j++) c->band[j].cur = c->band[j].tgt = kIdentity;
+    filters_init(c);
     c->pre_cur = c->pre_tgt = 1.0;
     c->w_step = 1.0 / XFADE_LEN;
     c->min_gain = 1.0;
@@ -743,7 +758,9 @@ static int32_t eq_block(const int16_t *src, int16_t *dst, unsigned int n, int64_
 
 /* ---- the control thread */
 
-static int read_ctl(int32_t *b, size_t n) {
+/* the whole control file into b (room for n bytes); its length, or 0 when it is missing, longer
+   than n or cannot be read */
+static size_t read_ctl(int32_t *b, size_t n) {
     int fd = open(CPE_CTL, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
     size_t got = 0;
@@ -753,9 +770,9 @@ static int read_ctl(int32_t *b, size_t n) {
         got += (size_t)r;
     }
     char extra;
-    ssize_t more = read(fd, &extra, 1);
+    ssize_t more = got == n ? read(fd, &extra, 1) : 0;
     close(fd);
-    return got == n && more == 0;
+    return more == 0 ? got : 0;
 }
 
 /* After 0.7.6: what the app's Auto (EQE_PARAM_PEAK) and Copy Easy EQ (EQE_PARAM_GAINS) ask Android's
@@ -807,8 +824,10 @@ static void *eq_thread(void *arg) {
     for (;;) {
         int32_t b[CPE_HDR + CPE_NSET];
         eqe_settings s;
-        int ok = read_ctl(b, sizeof(b)) && (uint32_t)b[0] == CPE_MAGIC && b[1] == CPE_VERSION &&
-                 settings_from((const char *)(b + CPE_HDR), (uint32_t)sizeof(eqe_settings), &s);
+        /* 0.7.8: layout 4 (mid/side), or layout 3 from an app before it */
+        size_t len = read_ctl(b, sizeof(b));
+        int ok = (len == sizeof(b) || len == (CPE_HDR + CPE_NSET3) * sizeof(int32_t)) && (uint32_t)b[0] == CPE_MAGIC &&
+                 b[1] == CPE_VERSION && settings_from((const char *)(b + CPE_HDR), (uint32_t)(len - CPE_HDR * sizeof(int32_t)), &s);
         int off = access(CPE_OFF, F_OK) == 0;
         int64_t now = now_ns();
         int live = ok && (int32_t)(b[4] - (int32_t)(now / 1000000LL)) > 0;

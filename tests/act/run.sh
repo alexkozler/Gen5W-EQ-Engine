@@ -1066,6 +1066,12 @@ printf '%s\n' 'x;-300;1:100000:250:1000;3:800000:-600:0' > $T/usb6/EQENGINE_CURV
 printf '%s\n' 'x;0;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1;1:1:1:1' > $T/usb6/EQENGINE_CURVES/user4.txt
 run curves load $T/usb6
 ok "a '-' inside a number and 21 bands are left alone; Expert with no bands and with two are loaded" "[ $(rc) = 0 ] && grep -q 'Loaded 2 curve(s)' $T/out.txt && grep -q 'Left alone, not a curve file: User 1, User 4.' $T/out.txt && [ \"\$(cat $CS2/preset2.txt)\" = 'x;-300' ] && [ \"\$(cat $CS2/preset3.txt)\" = 'x;-300;1:100000:250:1000;3:800000:-600:0' ]"
+# 0.7.8: a band's channel as a fifth value (mid 1, side 2); six values are still not a band
+rm -f $T/usb6/EQENGINE_CURVES/user*.txt
+printf '%s\n' 'x;-300;1:100000:600:1000:1;3:800000:-600:0' > $T/usb6/EQENGINE_CURVES/user1.txt
+printf '%s\n' 'x;-300;1:100000:600:1000:2:9' > $T/usb6/EQENGINE_CURVES/user2.txt
+run curves load $T/usb6
+ok "0.7.8: a band with its channel (five values) is loaded; six values are left alone" "[ $(rc) = 0 ] && grep -q 'Loaded 1 curve(s)' $T/out.txt && grep -q 'Left alone, not a curve file: User 2.' $T/out.txt && [ \"\$(cat $CS2/preset1.txt)\" = 'x;-300;1:100000:600:1000:1;3:800000:-600:0' ]"
 rm -rf $T/usb6/EQENGINE_CURVES
 run curves load $T/usb6
 ok "curves load: no folder on the stick: refused, says how to make one" "[ $(rc) = 1 ] && grep -q 'has no EQENGINE_CURVES folder' $T/out.txt"
