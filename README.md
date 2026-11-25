@@ -29,16 +29,15 @@ It is a plain NEMESIS package. It is **not** an HMG-API mod and does not need HM
 alongside it, including HMG-API's wireless CarPlay and Android Auto package
 ([how](#eq-on-carplay-and-other-add-ons)).
 
-**Current version: 0.7.8**: 0.7.7 plus [stereo width and mono bass](#positional-sound), Expert
-bands on the mid or the side only, and a Positional Sound page that shows the width on the car.
-Tested on the Ioniq 5 below with Android Auto (stereo width and mono bass). What changed:
-[CHANGELOG.md](CHANGELOG.md).
+**Current version: 0.7.8**, tested on the Ioniq 5 below: 0.7.7 plus
+[stereo width and mono bass](#positional-sound), Expert bands on the mid or the side only, and a
+Positional Sound page that shows the width on the car. What changed: [CHANGELOG.md](CHANGELOG.md).
 
 ## Verified vehicles
 
 | Car | Region | Audio system | Head unit software | Tested with |
 |---|---|---|---|---|
-| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 | 0.7.8: Android Auto; 0.7.7: CarPlay (wired and wireless) |
+| 2022 Hyundai Ioniq 5 SEL | USA | Standard (non-Bose) | 260507 | 0.7.8: Android Auto, CarPlay |
 | 2024 Hyundai Ioniq 6 Preferred AWD | Canada | Bose | 260903 | 0.6.6: Android Auto |
 | 2025 Hyundai Ioniq 6 Limited | USA | Bose | 260903 | 0.6.6: Android Auto |
 | 2022 Genesis G70 3.3T Sport AWD | Canada | Lexicon | 260903 | 0.7.6: Android Auto, CarPlay (wired and wireless) |

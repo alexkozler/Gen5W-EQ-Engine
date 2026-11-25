@@ -3,7 +3,7 @@
 ## 0.7.8
 
 All the changes from 0.7.7, and stereo width, mono bass and Expert bands on the mid or the side
-(tested on the Ioniq 5: an update over 0.7.7, then stereo width and mono bass with Android Auto).
+(tested on the Ioniq 5: Android Auto, CarPlay, an update over the previous version).
 
 ### Positional Sound (the Position page)
 
