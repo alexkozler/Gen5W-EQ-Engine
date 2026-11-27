@@ -28,6 +28,14 @@
  *                              libCarPlayAndroid.so as a file (nothing of it runs here): "cpcheck ok
  *                              the factory library exports JNI_OnLoad and needs libCarPlayAudio.so;
  *                              TinyALSA: 7 of 7 functions"
+ *   eqe_lab ns <pid> <program> [args]
+ *                              runs <program> (an absolute path) in the mount namespace of process
+ *                              <pid> (/proc/<pid>/ns/mnt, setns). For EQ Engine's bind mounts
+ *                              under NEMESIS 1.17's LivePatch: a folder LivePatch shows through a
+ *                              "farm" is a private mount, so a mount made on a file in it reaches
+ *                              only the namespace it was made in, and the zygote (which the CarPlay
+ *                              app is forked from) may not be in the boot step's. Prints one "ns
+ *                              failed: ..." line and exits 1 if it cannot enter it.
  *
  * The rate comes from /proc/asound/cardN/pcmMp/sub0/status: hw_ptr is the number of frames the
  * hardware has taken since the link started and tstamp is when the kernel last updated it, so the
@@ -40,7 +48,7 @@
  * Hyundai's driver and, for "sampling_rate", reads the driver's rate back and rebuilds its mixer
  * at that rate (Android 4.4.2, MixerThread::checkForNewParameters_l).
  */
-#define _POSIX_C_SOURCE 200809L /* nanosleep and pread on PC test builds */
+#define _GNU_SOURCE /* nanosleep, pread and syscall on PC test builds */
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -51,8 +59,12 @@
 #include <time.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS 0x00020000
+#endif
 
 #ifndef MNT_DETACH
 #define MNT_DETACH 2
@@ -482,8 +494,40 @@ out:
 
 static int usage(void) {
     fprintf(stderr, "usage: eqe_lab rate [ms] | get <io> <keys> | set <io> <key=value> | check | umount <path> | imports <file>"
-                    " | cpcheck <watch> <copy>\n");
+                    " | cpcheck <watch> <copy> | ns <pid> <program> [args]\n");
     return 2;
+}
+
+/* "ns <pid> <program> [args]" (after 0.7.8): enters the mount namespace of process <pid>, then runs
+   <program> there. setns through syscall(): Android 4.4's libc has no setns() wrapper; the call is
+   in kernels since 3.0, and /proc/<pid>/ns/mnt since 3.8 (the car's is 3.18). This process is
+   single-threaded, as setns(CLONE_NEWNS) needs. EQE_PROC moves /proc for the PC tests. */
+static int cmd_ns(char **argv) {
+    char *end;
+    long pid = strtol(argv[2], &end, 10);
+    if (*end != 0 || pid < 1 || pid > 4194304 || argv[3][0] != '/' || strstr(argv[3], "..") != NULL) return usage();
+    const char *proc = getenv("EQE_PROC");
+    char p[256];
+    snprintf(p, sizeof p, "%s/%ld/ns/mnt", proc != NULL && proc[0] == '/' ? proc : "/proc", pid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        printf("ns failed: %s: %s\n", p, strerror(errno));
+        return 1;
+    }
+    if (syscall(__NR_setns, fd, CLONE_NEWNS) != 0) {
+        printf("ns failed: setns %s: %s\n", p, strerror(errno));
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    if (chdir("/") != 0) {
+        printf("ns failed: chdir /: %s\n", strerror(errno));
+        return 1;
+    }
+    fflush(stdout);
+    execv(argv[3], argv + 3);
+    printf("ns failed: %s: %s\n", argv[3], strerror(errno));
+    return 1;
 }
 
 /* "cpcheck <watch> <copy>": the CarPlay watch loads here, finds all 7 of the car's TinyALSA functions
@@ -537,6 +581,7 @@ int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "umount") == 0) return cmd_umount(argv[2]);
     if (argc == 3 && strcmp(argv[1], "imports") == 0) return cmd_imports(argv[2]);
     if (argc == 4 && strcmp(argv[1], "cpcheck") == 0) return cmd_cpcheck(argv[2], argv[3]);
+    if (argc >= 4 && strcmp(argv[1], "ns") == 0) return cmd_ns(argv);
     if (argc >= 2 && strcmp(argv[1], "rate") == 0) {
         int ms = argc >= 3 ? atoi(argv[2]) : 3000;
         if (ms < 0 || ms > 60000) return usage();

@@ -49,7 +49,7 @@
 # Toolbox only: no awk, sed, grep, head or busybox.
 
 umask 022
-VER=0.7.9
+VER=0.8.0
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -100,6 +100,7 @@ event() {
 # found (none without a farm), so it may run before the mount.
 real_path() {
     RP=""
+    _rp_t=${2:-}
     _rp_r=${1#/}
     _rp_n=0
     while [ -n "$_rp_r" ]; do
@@ -111,12 +112,12 @@ real_path() {
             ''|.) continue ;;
             ..) RP=${RP%/*}; continue ;;
         esac
-        if [ -L "$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
+        if [ -L "$_rp_t$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
             _rp_n=$((_rp_n + 1))
             # the link's target from toolbox ls -l ("... name -> target")
             _rp_l=""
             set -f
-            set -- $(ls -l "$RP/$_rp_c" 2>/dev/null)
+            set -- $(ls -l "$_rp_t$RP/$_rp_c" 2>/dev/null)
             set +f
             while [ $# -gt 1 ]; do
                 [ "$1" = "->" ] && { _rp_l=$2; break; }

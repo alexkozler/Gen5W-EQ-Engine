@@ -1,31 +1,37 @@
 # Changelog
 
-## 0.7.9 (pre-release)
+## 0.8.0 (pre-release)
 
 All the changes from 0.7.8, and EQ on CarPlay with NEMESIS 1.17's LivePatch (tested on a PC, with
-real mounts laid out as LivePatch makes them; not yet tested on a car):
+real mounts and mount namespaces laid out as on a car with that setup; not yet tested on a car):
 
 ### EQ on CarPlay with Enhanced Phone Projection on NEMESIS 1.17 or later
 
 - NEMESIS 1.17's LivePatch shows a folder in which a package adds a new file through a read-only
-  layer of symlinks laid over the folder; Enhanced Phone Projection 3.x adds one to `/system/lib`.
-  That layer hid EQ on CarPlay's file, and 0.7.8 then took the factory file it saw for another
-  package's: EQ on CarPlay stayed off and said "another package has a file laid over
-  /system/lib/libCarPlayAndroid.so". Android Auto and Bluetooth audio were not affected.
+  layer of symlinks laid over the folder, pointing at a view of the stock files; Enhanced Phone
+  Projection 3.x adds one to `/system/lib`. That view is a private mount, so a file laid over one of
+  its files reaches only the mount namespace it was laid over in, and on a car with this setup
+  Android's zygote, which starts the CarPlay app, is in another one. With 0.7.8 the CarPlay app got
+  the factory library there, and EQ on CarPlay stayed off and said "another package has a file laid
+  over /system/lib/libCarPlayAndroid.so". Android Auto and Bluetooth audio were not affected.
 - At the car start, EQ on CarPlay is laid over once Android's zygote runs (LivePatch builds its
   layers just before it; the CarPlay app is started from the zygote seconds later), on the file the
-  layer points to.
+  layer points to, and inside the zygote's mount namespace when that is another one (`eqe_lab ns`).
 - Whether another package's file is in the way is judged by the file the CarPlay app would open:
   EQ Engine's own, the factory file (on `/system`'s own filesystem, directly or through LivePatch's
   stock view) or something else.
-- If LivePatch builds the layer again later, EQ Engine's background check lays EQ on CarPlay over
-  again for the CarPlay app's next start (a few tries at most, never over another package's file).
+- If LivePatch builds the layer again later, or a new zygote starts, EQ Engine's background check
+  lays EQ on CarPlay over again for the CarPlay app's next start (a few tries at most, never over
+  another package's file).
 - Turning it off, EQ Engine off, uninstalling and the rescue stick take EQ Engine's files off where
-  the layer shows them.
-- The same for Android's effects list, should a package ever add a file to `/system/etc`: the
-  overlay is laid again where the layer shows the list, so a later audio restart still loads EQ
-  Engine.
-- The car report notes when the CarPlay library is reached through such a layer.
+  the layer shows them, in the zygote's mount namespace too.
+- Without such a layer (NEMESIS 1.16 or older, or no package adding a file to `/system/lib`),
+  everything is laid over, checked and taken off as in 0.7.8.
+- Android's effects list: should a package ever add a file to `/system/etc`, the overlay is laid
+  again where the layer shows the list (in EQ Engine's own mount namespace).
+- The car report notes when the CarPlay library is reached through such a layer, and the mount
+  namespaces of EQ Engine's scripts, init, the zygote and the CarPlay app; All logs also saves the
+  zygote's and the CarPlay app's mount tables.
 
 ## 0.7.8
 

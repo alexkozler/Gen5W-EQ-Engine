@@ -403,18 +403,26 @@ S
 #!/bin/sh
 # mount -o bind SRC DST
 [ "$1" = "-o" ] && [ "$2" = "bind" ] || exit 1
-p=$(readlink -f "$4"); [ -n "$p" ] || p=$4
-cp "$p" "$p.under" && cp "$3" "$p" && echo "none $p none rw 0 0" >> /tmp/eqeact/proc/mounts
+# (0.8.0) run through eqe_lab ns (EQEACT_NS=<pid>): in that process's view ($T/proc/<pid>/root)
+# and mount table ($T/proc/<pid>/mounts)
+V=""; TAB=/tmp/eqeact/proc/mounts
+[ -n "$EQEACT_NS" ] && { V=/tmp/eqeact/proc/$EQEACT_NS/root; TAB=/tmp/eqeact/proc/$EQEACT_NS/mounts; }
+p=$(readlink -f "$V$4"); [ -n "$p" ] || p=$V$4
+l=$p; [ -n "$V" ] && l=${p#$(readlink -f "$V")}
+cp "$p" "$p.under" && cp "$3" "$p" && echo "none $l none rw 0 0" >> $TAB
 S
     cat > $T/stubs/umount <<'S'
 #!/bin/sh
-p=$(readlink -f "$1"); [ -n "$p" ] || p=$1
-grep -q " $p " /tmp/eqeact/proc/mounts || exit 1
+V=""; TAB=/tmp/eqeact/proc/mounts
+[ -n "$EQEACT_NS" ] && { V=/tmp/eqeact/proc/$EQEACT_NS/root; TAB=/tmp/eqeact/proc/$EQEACT_NS/mounts; }
+p=$(readlink -f "$V$1"); [ -n "$p" ] || p=$V$1
+l=$p; [ -n "$V" ] && l=${p#$(readlink -f "$V")}
+grep -q " $l " $TAB || exit 1
 [ -f /tmp/eqeact/umount_fail ] && { echo "failed: Device or resource busy" >&2; exit 1; }
 # the audio server has the file loaded
 [ -f /tmp/eqeact/busy ] && { echo "failed: Device or resource busy" >&2; exit 1; }
 cp "$p.under" "$p" && rm -f "$p.under"
-grep -v " $p " /tmp/eqeact/proc/mounts > /tmp/eqeact/proc/mounts.n; mv /tmp/eqeact/proc/mounts.n /tmp/eqeact/proc/mounts
+grep -v " $l " $TAB > $TAB.n; mv $TAB.n $TAB
 S
     # eqe_lab: link rates from the simulated kernel, sampling_rate through the simulated mixer and driver
     cat > $T/data/eqengine/bin/eqe_lab <<'S'
@@ -425,12 +433,20 @@ case "$1" in
 check) echo "symbols 4 of 4" ;;
 umount)
     echo "umount $2" >> $T/umount.log
-    p=$(readlink -f "$2"); [ -n "$p" ] || p=$2
-    grep -q " $p " $T/proc/mounts || { echo "failed: Invalid argument"; exit 1; }
+    V=""; TAB=$T/proc/mounts
+    [ -n "$EQEACT_NS" ] && { V=$T/proc/$EQEACT_NS/root; TAB=$T/proc/$EQEACT_NS/mounts; }
+    p=$(readlink -f "$V$2"); [ -n "$p" ] || p=$V$2
+    l=$p; [ -n "$V" ] && l=${p#$(readlink -f "$V")}
+    grep -q " $l " $TAB || { echo "failed: Invalid argument"; exit 1; }
     [ -f $T/umount_fail ] && { echo "failed: Device or resource busy"; exit 1; }
     cp "$p.under" "$p" && rm -f "$p.under"
-    grep -v " $p " $T/proc/mounts > $T/proc/mounts.n; mv $T/proc/mounts.n $T/proc/mounts
+    grep -v " $l " $TAB > $TAB.n; mv $TAB.n $TAB
     echo "detached $2" ;;
+ns)
+    # (0.8.0) runs the program "in process $2's mount namespace": the mount and umount stand-ins
+    # then work on that process's view and table
+    echo "ns $*" >> $T/ns.log
+    n=$2; shift 2; EQEACT_NS=$n exec "$@" ;;
 rate)
     # rate_none: that many counts get nothing (the link stopped during the count)
     if [ -f $T/rate_none ] && [ "$(cat $T/rate_none)" -gt 0 ]; then
@@ -1219,7 +1235,12 @@ $T/stubs/dipo_fd $n
 echo "b2800000-b2810000 r-xp 00000000 b3:19 88   /system/lib/libCarPlayAndroid.so" >> $T/proc/$n/maps
 m=0
 # (after 0.7.8) the app gets the watch when the file it opens is the watch (through a farm too)
-cmp -s $T/system/lib/libCarPlayAndroid.so $T/data/eqengine/lib/eqe_cpwatch.so && m=1
+# (0.8.0) the app is forked from the zygote (pid 150): its view when the zygote has one of its own
+V=""; [ -e $T/proc/150/root ] && V=$T/proc/150/root
+f=$T/system/lib/libCarPlayAndroid.so
+# (its absolute symlink is followed inside that view, as the kernel does in the zygote's)
+[ -n "$V" ] && [ -L "$V$f" ] && f=$(readlink "$V$f")
+cmp -s "$V$f" $T/data/eqengine/lib/eqe_cpwatch.so && m=1
 if [ $m = 1 ] && [ ! -f $T/cps_noload ]; then
     [ -f $T/cps_nocopy ] || echo "b2700000-b2710000 r-xp 00000000 b3:19 89   /data/eqengine/lib/libCarPlayAndroid.car.so" >> $T/proc/$n/maps
     st=watching
@@ -1458,6 +1479,45 @@ rm -f $CS/disabled
 cpwsetup; farm; echo "another package's CarPlay library" > $LP/out/system/lib/libCarPlayAndroid.so; rm -f $JNI; ln -s $LP/out/system/lib/libCarPlayAndroid.so $JNI
 run cpwatch 1
 ok "another package's LivePatch file behind the farm (on /data): refused, nothing laid over it" "[ $(rc) = 1 ] && grep -q 'EQE_CPW refused: another package has a file laid over' $T/out.txt && ! grep -q \" $LP/out\" $T/proc/mounts && grep -qx \"another package's CarPlay library\" $JNI"
+
+echo "-- (0.8.0) the zygote in a mount namespace of its own, with the farm (an owner's unit: NEMESIS 1.17, Enhanced Phone Projection, HMG-API)"
+ZR=$T/zroot
+# the zygote's (pid 150) view ($T/proc/150/root) and mount table: the same farm, its stock view's
+# file without the watch (a mount made in this script's namespace inside the private stock view
+# would not reach it), and a mount namespace other than this script's
+nsfarm() {
+    farm
+    rm -rf $ZR; mkdir -p $ZR$STKD $ZR$T/system/lib
+    cp $STK $ZR$STK; ln -s $STK $ZR$JNI
+    ln -s $ZR $T/proc/150/root
+    cp $T/proc/mounts $T/proc/150/mounts
+    mkdir -p $T/proc/self/ns $T/proc/150/ns
+    ln -sf 'mnt:[4026531840]' $T/proc/self/ns/mnt; ln -sf 'mnt:[4026532001]' $T/proc/150/ns/mnt
+}
+zstk() { grep -q " $STK " $T/proc/150/mounts; }
+cpwsetup; nsfarm; run cpwatch 1
+ok "zygote in a mount namespace of its own, with the farm: turning it on is not refused; on from the next car start" "[ $(rc) = 0 ] && grep -q 'EQE_CPW on from the next car start' $T/out.txt && [ \"\$(cat $CS/cpw_want)\" = \"1 $FMD5 1000\" ]"
+farmstart
+ok "... the car start lays the watch over in the zygote's mount namespace, on the file the farm shows there; this script's view keeps the factory file" "grep -q 'in the mount namespace of the zygote (pid 150), at $STK' $T/boot_out.txt && zstk && ! stkmounted && cmp -s $ZR$STK $CPWF && [ \"\$(md5sum < $JNI | cut -c1-32)\" = $FMD5 ] && grep -q '^ns ns 150 ' $T/ns.log"
+ok "... the app, forked from the zygote, gets the watch (on that owner's unit it got the factory library)" "grep -qx 'start 2300 mounted=1' $T/dipo_starts.log"
+run cpwguard
+ok "... the guard: on in the app" "[ \"\$(cst state)\" = on ] && [ \"\$(cst pid)\" = 2300 ]"
+run cpwatch 1
+ok "... cpwatch on: already on (found in the zygote's mount table)" "[ $(rc) = 0 ] && grep -q 'EQE_CPW already on' $T/out.txt"
+# a new zygote's mount namespace without the watch (a framework restart)
+cp $ZR$STK.under $ZR$STK; rm -f $ZR$STK.under; grep -v " $STK " $T/proc/150/mounts > $T/proc/150/mounts.n; mv $T/proc/150/mounts.n $T/proc/150/mounts
+run cpwguard
+ok "the watch gone from the zygote's mount namespace: the guard lays it over there again" "grep -q 'laid over again' $CS/cpw_result && zstk && cmp -s $ZR$STK $CPWF && ! stkmounted"
+run cpwatch 0
+ok "off: taken off in the zygote's mount namespace, the factory library there again" "[ $(rc) = 0 ] && ! zstk && [ \"\$(md5sum < $ZR$STK | cut -c1-32)\" = $FMD5 ] && [ \"\$(cst state)\" = ending ]"
+cpwsetup; nsfarm; run cpwatch 1; farmstart; run off
+ok "EQ Engine off: taken off in the zygote's mount namespace" "! zstk && [ \"\$(md5sum < $ZR$STK | cut -c1-32)\" = $FMD5 ] && [ ! -f $CS/cpw_want ]"
+rm -f $CS/disabled
+cpwsetup; nsfarm; rm -f $T/proc/150/root; ln -sf 'mnt:[4026531840]' $T/proc/150/ns/mnt; run cpwatch 1; farmstart
+ok "the farm, the zygote in this script's mount namespace: laid over here, as before" "stkmounted && cmp -s $JNI $CPWF && ! grep -q 'mount namespace of the zygote' $T/boot_out.txt && [ ! -s $T/ns.log ] && grep -qx 'start 2300 mounted=1' $T/dipo_starts.log"
+cpwsetup; mkdir -p $T/proc/self/ns $T/proc/150/ns; ln -sf 'mnt:[4026531840]' $T/proc/self/ns/mnt; ln -sf 'mnt:[4026532001]' $T/proc/150/ns/mnt
+run cpwatch 1; carstart
+ok "no farm (NEMESIS 1.16, or no package adding a file to /system/lib), the zygote's mount namespace another: laid over at the path here, as through 0.7.8" "jmounted && cmp -s $JNI $CPWF && [ ! -s $T/ns.log ] && grep -qx 'start 2300 mounted=1' $T/dipo_starts.log"
 
 echo "-- the car start waits for Android's zygote (after 0.7.8: LivePatch's farms are built by then)"
 cpwsetup; run cpwatch 1; rm -rf $T/proc/150; echo 3 > $T/zygote_in; rm -rf $T/proc/$(cat $T/dipo_pid)

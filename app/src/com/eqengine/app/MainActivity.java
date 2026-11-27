@@ -45,7 +45,7 @@ import java.util.Locale;
  */
 public class MainActivity extends Activity implements Engine.Listener, EqPanel.Listener, NavRail.Listener,
         CarView.Listener, HSlider.Listener, XPanel.Listener, WSlider.Listener {
-    static final String VERSION = "0.7.9";
+    static final String VERSION = "0.8.0";
     private static final String ACT = "sh /data/eqengine/bin/act.sh";
     private static final String STATE = BootStatus.STATE_DIR;
     private static final String LAB = "/data/eqengine/lab";

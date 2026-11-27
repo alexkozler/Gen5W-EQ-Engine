@@ -29,6 +29,7 @@ mkdir -p "$OUT"
 # followed, into RP (as in act.sh).
 real_path() {
     RP=""
+    _rp_t=${2:-}
     _rp_r=${1#/}
     _rp_n=0
     while [ -n "$_rp_r" ]; do
@@ -40,12 +41,12 @@ real_path() {
             ''|.) continue ;;
             ..) RP=${RP%/*}; continue ;;
         esac
-        if [ -L "$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
+        if [ -L "$_rp_t$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
             _rp_n=$((_rp_n + 1))
             # the link's target from toolbox ls -l ("... name -> target")
             _rp_l=""
             set -f
-            set -- $(ls -l "$RP/$_rp_c" 2>/dev/null)
+            set -- $(ls -l "$_rp_t$RP/$_rp_c" 2>/dev/null)
             set +f
             while [ $# -gt 1 ]; do
                 [ "$1" = "->" ] && { _rp_l=$2; break; }
@@ -73,6 +74,30 @@ mounted_at() {
 
 mounted() {
     mounted_at $TARGET
+}
+
+# mt_has <table> <path>: something is listed as mounted at <path> in that mount table (0.8.0)
+mt_has() {
+    while read _d _m _rest; do
+        [ "$_m" = "$2" ] && return 0
+    done < $1
+    return 1
+}
+
+# Android's zygote: /proc/<pid>/stat names it "(zygote)", its parent is init (0.8.0)
+zygote_pid() {
+    for _zf in $PROC/[0-9]*/stat; do
+        [ -f $_zf ] || continue
+        _zl=""
+        { read -r _zl < $_zf; } 2>/dev/null
+        set -f
+        set -- $_zl
+        set +f
+        [ "$2" = "(zygote)" ] && [ "$4" = 1 ] || continue
+        echo "$1"
+        return 0
+    done
+    return 1
 }
 
 # 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its
@@ -141,6 +166,25 @@ keep_other() {
             echo "another package's file is laid over $t: left as it is"
         fi
     done
+    # (0.8.0) EQ on CarPlay's layer laid over in the zygote's mount namespace (with a NEMESIS
+    # LivePatch farm over /system/lib and the zygote in another mount namespace): taken off there
+    Z=$(zygote_pid)
+    if [ -n "$Z" ] && [ -f "$PROC/$Z/mounts" ]; then
+        real_path "$R/system/lib/libCarPlayAndroid.so" "$PROC/$Z/root"
+        t=$RP
+        f=$D/lib/eqe_cpwatch.so
+        UM=$(command -v umount)
+        i=0
+        while [ $i -lt 5 ] && mt_has "$PROC/$Z/mounts" "$t" && ours "$PROC/$Z/root$t" "$f" && [ -x $D/bin/eqe_lab ]; do
+            $D/bin/eqe_lab ns $Z $UM "$t" > /dev/null 2>&1 || $D/bin/eqe_lab ns $Z $D/bin/eqe_lab umount "$t" > /dev/null 2>&1
+            i=$((i + 1))
+        done
+        if mt_has "$PROC/$Z/mounts" "$t" && ours "$PROC/$Z/root$t" "$f"; then
+            echo "EQ on CarPlay's layer is still laid over $t in the zygote's mount namespace: it goes away when the head unit restarts"
+        elif [ $i -gt 0 ]; then
+            echo "EQ on CarPlay's layer taken off $t in the zygote's mount namespace"
+        fi
+    fi
     rm -f $D/state/lab_active
     # the CarPlay watch's choice for later car starts (0.6.10), and 0.6.7's setting for the CarPlay
     # app's next start, if either is still there

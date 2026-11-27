@@ -32,11 +32,15 @@ mv "$p.under.$$" "$p.under"
 S
     cat > $T/stubs/umount <<'S'
 #!/bin/sh
-p=$(readlink -f "$1"); [ -n "$p" ] || p=$1
-grep -q " $p " /tmp/eqeinst/proc/mounts || exit 1
-echo "umount $1" >> /tmp/eqeinst/umount.log
+# (0.8.0) run through eqe_lab ns (EQEINST_NS=<pid>): in that process's view and mount table
+V=""; TAB=/tmp/eqeinst/proc/mounts
+[ -n "$EQEINST_NS" ] && { V=/tmp/eqeinst/proc/$EQEINST_NS/root; TAB=/tmp/eqeinst/proc/$EQEINST_NS/mounts; }
+p=$(readlink -f "$V$1"); [ -n "$p" ] || p=$V$1
+l=$p; [ -n "$V" ] && l=${p#$(readlink -f "$V")}
+grep -q " $l " $TAB || exit 1
+echo "umount${EQEINST_NS:+ (in $EQEINST_NS)} $1" >> /tmp/eqeinst/umount.log
 [ -f "$p.under" ] && mv "$p.under" "$p"
-grep -v " $p " /tmp/eqeinst/proc/mounts > /tmp/eqeinst/proc/mounts.n; mv /tmp/eqeinst/proc/mounts.n /tmp/eqeinst/proc/mounts
+grep -v " $l " $TAB > $TAB.n; mv $TAB.n $TAB
 S
     cat > $T/stubs/setprop <<'S'
 #!/bin/sh
@@ -95,7 +99,7 @@ setup() {
     cp $R/pkg/bin/act.sh $T/pkg/bin/act.sh
     printf '#!/bin/sh\nexit 0\n' > $T/pkg/bin/alsactl_dump
     # eqe_lab umount <path>: as umount (the detach); cpcheck: the layer checks out
-    printf '#!/bin/sh\n[ "$1" = umount ] && exec /tmp/eqeinst/stubs/umount "$2"\n[ "$1" = cpcheck ] && { echo "cpcheck ok (stand-in)"; exit 0; }\nexit 1\n' > $T/pkg/bin/eqe_lab
+    printf '#!/bin/sh\n[ "$1" = umount ] && exec /tmp/eqeinst/stubs/umount "$2"\n[ "$1" = cpcheck ] && { echo "cpcheck ok (stand-in)"; exit 0; }\n[ "$1" = ns ] && { n=$2; shift 2; EQEINST_NS=$n exec "$@"; }\nexit 1\n' > $T/pkg/bin/eqe_lab
     chmod +x $T/pkg/bin/*
     cp $R/pkg/conf/audio_effects.conf $T/pkg/conf/audio_effects.conf
     for l in libeqengine libaudio-resampler eqe_drvwatch eqe_cpwatch; do
@@ -236,6 +240,29 @@ $T/stubs/mount -o bind $D/lib/eqe_cpwatch.so $T/system/lib/libCarPlayAndroid.so
 mkdir -p $T/stick; RUNDIR=$T/stick runs $R/rescue/eqengine-off.sh
 RF=$(ls $T/stick/EQENGINE-RESCUE/rescue_*.txt 2>/dev/null | head -n1)
 ok "rescue: the same, said as removed (not as another package's file)" "[ \"\$(cat $T/system/etc/audio_effects.conf)\" = 'factory effects list' ] && [ \"\$(cat $T/system/lib/libCarPlayAndroid.so)\" = 'factory CarPlay JNI library' ] && ! grep -q livepatch $T/proc/mounts && grep -q 'overlay removed' \"$RF\" && ! grep -q 'another package' \"$RF\""
+
+echo "== (0.8.0) EQ on CarPlay's layer laid over in the zygote's own mount namespace (a LivePatch farm over /system/lib)"
+ZR=$T/zroot
+ZSTK=$T/data/nemesis/livepatch/stock/system/lib/libCarPlayAndroid.so
+izy() {  # the zygote (pid 165): its view and mount table, the farm, and $1 mounted on the file it shows
+    mkdir -p $T/proc/165 ${ZR}${ZSTK%/*} $ZR$T/system/lib
+    echo "165 (zygote) S 1 165 0 0 -1 4194560 100 0 0 0 10 5 0 0 20 0 9 0 292 30000000 2000 4294967295" > $T/proc/165/stat
+    echo "factory CarPlay JNI library" > $ZR$ZSTK.under
+    cat "$1" > $ZR$ZSTK
+    ln -s $ZSTK $ZR$T/system/lib/libCarPlayAndroid.so
+    ln -s $ZR $T/proc/165/root
+    { echo "/dev/block/system /system ext4 ro 0 0"; echo "none $ZSTK none rw 0 0"; } > $T/proc/165/mounts
+}
+setup; runs $R/pkg/scripts/post.sh; izy $D/lib/eqe_cpwatch.so; rm -f $T/umount.log
+runs $R/pkg/scripts/preun.sh
+ok "preuninstall: EQ on CarPlay's layer taken off in the zygote's mount namespace" "[ \"\$(cat $ZR$ZSTK)\" = 'factory CarPlay JNI library' ] && ! grep -q ' $ZSTK ' $T/proc/165/mounts && grep -q 'umount (in 165)' $T/umount.log"
+setup; runs $R/pkg/scripts/post.sh; echo "another package's CarPlay library" > $T/other.so; izy $T/other.so; rm -f $T/umount.log
+runs $R/pkg/scripts/preun.sh
+ok "preuninstall: another package's file there is left alone" "grep -qx \"another package's CarPlay library\" $ZR$ZSTK && grep -q ' $ZSTK ' $T/proc/165/mounts && [ ! -s $T/umount.log ]"
+setup; runs $R/pkg/scripts/post.sh; izy $D/lib/eqe_cpwatch.so
+mkdir -p $T/stick; RUNDIR=$T/stick runs $R/rescue/eqengine-off.sh
+RF=$(ls $T/stick/EQENGINE-RESCUE/rescue_*.txt 2>/dev/null | head -n1)
+ok "rescue: taken off in the zygote's mount namespace too, and said" "[ \"\$(cat $ZR$ZSTK)\" = 'factory CarPlay JNI library' ] && ! grep -q ' $ZSTK ' $T/proc/165/mounts && grep -q \"EQ on CarPlay's layer taken off $ZSTK in the zygote's mount namespace\" \"$RF\""
 
 echo "$SH: $pass passed, $fail failed"
 [ $fail = 0 ]

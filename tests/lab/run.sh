@@ -188,5 +188,22 @@ done
 ok "300 randomly damaged copies: each read or refused cleanly ($fz_ok read, $fz_err refused)" "[ $fz_bad = 0 ]"
 fi
 
+echo "== (0.8.0) ns <pid> <program> [args]: in another process's mount namespace"
+ns() { $O/eqe_lab ns "$@" > $O/ns.out 2> $O/ns.err; echo $? > $O/ns.rc; }
+nsrc() { cat $O/ns.rc; }
+ns x /bin/echo hi
+ok "ns: a pid that is not a number: usage, nothing run" "[ \$(nsrc) = 2 ] && [ ! -s $O/ns.out ]"
+ns 0 /bin/echo hi
+ok "ns: pid 0: usage" "[ \$(nsrc) = 2 ]"
+ns 1 echo hi
+ok "ns: a program without an absolute path: usage" "[ \$(nsrc) = 2 ] && [ ! -s $O/ns.out ]"
+ns 1 /bin/../bin/echo hi
+ok "ns: a program path with ..: usage" "[ \$(nsrc) = 2 ]"
+mkdir -p $O/proc/77
+EQE_PROC=$O/proc ns 77 /bin/echo hi
+ok "ns: the process has no mount namespace file: one 'ns failed' line, nothing run" "[ \$(nsrc) = 1 ] && [ \"\$(cat $O/ns.out)\" = 'ns failed: $O/proc/77/ns/mnt: No such file or directory' ]"
+ns $$ /bin/echo hi
+ok "ns: into this shell's own namespace: run there, or (without CAP_SYS_ADMIN) one 'ns failed: setns' line" "{ [ \$(nsrc) = 0 ] && [ \"\$(cat $O/ns.out)\" = hi ]; } || { [ \$(nsrc) = 1 ] && grep -q '^ns failed: setns /proc/$$/ns/mnt: ' $O/ns.out; }"
+
 echo "lab helper: $pass passed, $fail failed"
 [ $fail = 0 ]

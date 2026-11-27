@@ -39,7 +39,7 @@
 # Prints EQE_OK at the end when the action completed, or EQE_WAIT (then the reason) when a restart
 # was refused because another one is running or the last one was too recent.
 
-VER=0.7.9
+VER=0.8.0
 D=/data/eqengine
 S=$D/state
 TARGET=/system/etc/audio_effects.conf
@@ -135,10 +135,13 @@ mounted() {
 # before the farm is hidden by it, although /proc/mounts still lists it there; a mount made after it
 # lands on the file the symlink points to, which is what a process opening the path gets. So EQ
 # Engine's mounts are made, found and taken off at the path real_path gives.
-# real_path <path>: the path with every symlink on the way followed, into RP. Builtins, plus one
-# ls for each symlink found (none without a farm).
+# real_path <path> [<root>]: the path with every symlink on the way followed, into RP. With <root>
+# (0.8.0: a process's $PROC/<pid>/root), the path is walked as that process sees it: an absolute
+# link starts again at <root>, and RP is the path inside it. Builtins, plus one ls for each symlink
+# found (none without a farm).
 real_path() {
     RP=""
+    _rp_t=${2:-}
     _rp_r=${1#/}
     _rp_n=0
     while [ -n "$_rp_r" ]; do
@@ -150,12 +153,12 @@ real_path() {
             ''|.) continue ;;
             ..) RP=${RP%/*}; continue ;;
         esac
-        if [ -L "$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
+        if [ -L "$_rp_t$RP/$_rp_c" ] && [ $_rp_n -lt 16 ]; then
             _rp_n=$((_rp_n + 1))
             # the link's target from toolbox ls -l ("... name -> target")
             _rp_l=""
             set -f
-            set -- $(ls -l "$RP/$_rp_c" 2>/dev/null)
+            set -- $(ls -l "$_rp_t$RP/$_rp_c" 2>/dev/null)
             set +f
             while [ $# -gt 1 ]; do
                 [ "$1" = "->" ] && { _rp_l=$2; break; }
@@ -172,16 +175,17 @@ real_path() {
     [ -n "$RP" ] || RP=/
 }
 
-# dev_at <mount point>: the device of the last mount listed there, into DV ("" if none)
+# dev_at <mount point> [<table>]: the device of the last mount listed there, into DV ("" if none).
+# <table>: a mount table (0.8.0: a process's $PROC/<pid>/mounts), this script's by default.
 dev_at() {
     DV=""
     while read _dv_d _dv_m _dv_r; do
         [ "$_dv_m" = "$1" ] && DV=$_dv_d
-    done < $PROC/mounts
+    done < ${2:-$PROC/mounts}
 }
 
-# dev_of <path>: the device of the mount the file at <path> is on (the last of the longest mount
-# points that is the path itself or a folder above it), into DV
+# dev_of <path> [<table>]: the device of the mount the file at <path> is on (the last of the
+# longest mount points that is the path itself or a folder above it), into DV
 dev_of() {
     DV=""
     _dv_l=-1
@@ -194,7 +198,27 @@ dev_of() {
             DV=$_dv_d
             _dv_l=${#_dv_m}
         fi
-    done < $PROC/mounts
+    done < ${2:-$PROC/mounts}
+}
+
+# mt_has <table> <path>: something is listed as mounted at <path> in that mount table
+mt_has() {
+    while read _mt_d _mt_m _mt_r; do
+        [ "$_mt_m" = "$2" ] && return 0
+    done < $1
+    return 1
+}
+
+# ns_id <pid|self>: that process's mount namespace ("mnt:[4026531840]"), into NSI ("" if unknown)
+ns_id() {
+    NSI=""
+    set -f
+    set -- $(ls -l $PROC/$1/ns/mnt 2>/dev/null)
+    set +f
+    while [ $# -gt 1 ]; do
+        [ "$1" = "->" ] && { NSI=$2; break; }
+        shift
+    done
 }
 
 # 0 = the file at $1 is now EQ Engine's own $2, byte for byte (0.7.6: EQ Engine unmounts only its
@@ -1766,6 +1790,22 @@ cp_process_probe() {
     # (after 0.7.8) its JNI library seen through a symlink: a NEMESIS LivePatch farm over its folder
     real_path $CPW_T
     [ "$RP" != "$CPW_T" ] && echo "  its JNI library is reached through a symlink (a NEMESIS LivePatch farm over its folder): $RP"
+    # (0.8.0) the mount namespaces of this script (EQ Engine's boot step's), init, the zygote and the
+    # app, and the mounts the zygote and the app have on that library
+    ns_id self; _nsa=$NSI
+    ns_id 1; _ns1=$NSI
+    _nsz=""
+    [ -n "$_pz" ] && { ns_id $_pz; _nsz=$NSI; }
+    ns_id $_pp; _nsp=$NSI
+    echo "  mount namespaces: EQ Engine's scripts ${_nsa:-?}, init ${_ns1:-?}, the zygote ${_nsz:-?}, the CarPlay app ${_nsp:-?}"
+    for _np in $_pz $_pp; do
+        [ -f $PROC/$_np/mounts ] || continue
+        while read _mt_d _mt_m _mt_r; do
+            case "$_mt_m" in
+                */libCarPlayAndroid.so) echo "  pid $_np has a mount on $_mt_m (from $_mt_d)" ;;
+            esac
+        done < $PROC/$_np/mounts
+    done
     dumpsys package $CP_APP 2>/dev/null | {
         _pn=0
         while read -r _pl; do
@@ -2251,30 +2291,90 @@ cpw_file_ok() {
     [ -n "$_cw" ] && [ "$(md5of $CPW)" = "$_cw" ]
 }
 
+# (0.8.0) Where the watch is laid over: the zygote's mount namespace. A folder LivePatch shows
+# through a farm is a private mount, so a mount made on a file in it stays in the namespace it was
+# made in. On an owner's unit (NEMESIS 1.17, Enhanced Phone Projection 3.0.0, HMG-API) the CarPlay
+# app, forked from the zygote seconds after the boot step's mount on the file the farm shows, mapped
+# the factory library from the system partition: the zygote was not in the boot step's mount
+# namespace. Without a farm the old way works everywhere (a mount under the shared /system reaches
+# every namespace). So when the path goes through a symlink and the zygote's mount namespace is not
+# this script's, the watch is laid over, checked and taken off in the zygote's: CPW_NS is the
+# zygote's pid; else "" and everything is as before (NEMESIS 1.16, or no package adding a file to
+# /system/lib). Worked out again only when the zygote it was worked out for is gone (the keeper's
+# guard asks every 3 s).
+CPW_NS=""
+CPW_NSZ=""
+cpw_ns() {
+    [ -n "$CPW_NSZ" ] && [ -d "$PROC/$CPW_NSZ" ] && return 0
+    CPW_NS=""
+    CPW_NSZ=$(zygote_pid) || CPW_NSZ=""
+    [ -n "$CPW_NSZ" ] || return 0
+    real_path $CPW_T
+    [ "$RP" != "$CPW_T" ] || return 0
+    [ -x $LABBIN ] || return 0
+    ns_id self
+    _ns_me=$NSI
+    ns_id $CPW_NSZ
+    [ -n "$NSI" ] && [ "$NSI" != "$_ns_me" ] && CPW_NS=$CPW_NSZ
+    return 0
+}
+
+# the mount table and the root to look at: the zygote's ($PROC/<pid>/mounts and /root) when CPW_NS
+# is set, else this script's (CPW_TAB, CPW_RT)
+cpw_tab() {
+    cpw_ns
+    if [ -n "$CPW_NS" ]; then
+        CPW_TAB=$PROC/$CPW_NS/mounts
+        CPW_RT=$PROC/$CPW_NS/root
+    else
+        CPW_TAB=$PROC/mounts
+        CPW_RT=""
+    fi
+}
+
+# runs "$@" where the watch is laid over: in the zygote's mount namespace (eqe_lab ns, which takes
+# an absolute path) when CPW_NS is set, else here
+cpw_run() {
+    if [ -n "$CPW_NS" ]; then
+        _cr_p=$1
+        shift
+        case "$_cr_p" in
+            /*) ;;
+            *) _cr_p=$(command -v "$_cr_p") || return 1 ;;
+        esac
+        $LABBIN ns $CPW_NS $_cr_p "$@"
+    else
+        "$@"
+    fi
+}
+
 # 0.7.6: what is mounted at the CarPlay app's JNI library path is checked by whose file it is.
 # (after 0.7.8) at the path the app really opens (real_path: through a LivePatch farm over
-# /system/lib, the stock view's file), which is left in CPW_MP.
+# /system/lib, the stock view's file), which is left in CPW_MP; (0.8.0) in the zygote's mount
+# namespace when it is another (cpw_tab).
 # 0 = EQ Engine's watch is the file there now (the top of anything mounted there).
 cpw_mounted() {
-    real_path $CPW_T
+    cpw_tab
+    real_path $CPW_T $CPW_RT
     CPW_MP=$RP
-    mounted_at $CPW_MP || return 1
+    mt_has $CPW_TAB $CPW_MP || return 1
     _mw=""
     [ -f $CPWSUM ] && read _mw < $CPWSUM
-    [ -n "$_mw" ] && [ "$(md5of $CPW_MP)" = "$_mw" ]
+    [ -n "$_mw" ] && [ "$(md5of $CPW_RT$CPW_MP)" = "$_mw" ]
 }
 
 # (after 0.7.8) 0 = the file the app opens there is the factory one: nothing mounted on it, and it
 # is on /system's own filesystem (directly, or through LivePatch's stock view, a bind of /system).
 # Where /system is not a mount of its own (the tests' plain folders), nothing mounted on it.
 cpw_factory() {
-    real_path $CPW_T
+    cpw_tab
+    real_path $CPW_T $CPW_RT
     CPW_MP=$RP
-    mounted_at $CPW_MP && return 1
-    dev_at $SYS/system
+    mt_has $CPW_TAB $CPW_MP && return 1
+    dev_at $SYS/system $CPW_TAB
     [ -n "$DV" ] || return 0
     _fsd=$DV
-    dev_of $CPW_MP
+    dev_of $CPW_MP $CPW_TAB
     [ "$DV" = "$_fsd" ]
 }
 
@@ -2293,7 +2393,7 @@ cpw_foreign() {
 cpw_unmount() {
     _ui=0
     while cpw_mounted && [ $_ui -lt 4 ]; do
-        umount $CPW_MP 2>/dev/null || { [ -x $LABBIN ] && $LABBIN umount $CPW_MP > /dev/null 2>&1; }
+        cpw_run umount $CPW_MP 2>/dev/null || { [ -x $LABBIN ] && cpw_run $LABBIN umount $CPW_MP > /dev/null 2>&1; }
         _ui=$((_ui + 1))
         cpw_mounted && sleep 1
     done
@@ -2312,10 +2412,12 @@ cpw_copy() {
 
 # Lays the watch over the CarPlay app's JNI library and checks that what is there now is the watch
 # (its md5 from the install): 0, else the mount is taken off again and 1. (after 0.7.8) On the file
-# the app really opens (real_path), which mount would follow a farm's symlink to anyway.
+# the app really opens (real_path), which mount would follow a farm's symlink to anyway; (0.8.0)
+# in the zygote's mount namespace when it is another (cpw_run).
 cpw_mount() {
-    real_path $CPW_T
-    if ! $MOUNT -o bind $CPW $RP || ! cpw_mounted; then
+    cpw_tab
+    real_path $CPW_T $CPW_RT
+    if ! cpw_run $MOUNT -o bind $CPW $RP || ! cpw_mounted; then
         cpw_unmount
         return 1
     fi
@@ -2521,7 +2623,9 @@ cpw_boot() {
         return 1
     fi
     cpw_state waiting "" "laid over at the car start; waiting for the CarPlay app to load it"
-    cpw_result "laid over the CarPlay app's JNI library at the car start (uptime $(uptime_s))"
+    _cn=""
+    [ -n "$CPW_NS" ] && _cn=", in the mount namespace of the zygote (pid $CPW_NS), at $CPW_MP"
+    cpw_result "laid over the CarPlay app's JNI library at the car start (uptime $(uptime_s)$_cn)"
 }
 
 # The keeper's check (every few seconds; act.sh cpwguard runs it once) while the watch is laid
@@ -2538,12 +2642,15 @@ CPW_RELAYS=0
 cpw_relay() {
     [ $CPW_RELAYS -lt 3 ] || return 0
     [ -f $CPW_WANT ] && [ ! -f $S/disabled ] || return 0
-    real_path $CPW_T
-    mounted_at $RP && return 0
+    # (0.8.0) as the zygote sees it (a new zygote after a framework restart may have a new mount
+    # namespace without the watch: cpw_ns works it out again then)
+    cpw_tab
+    real_path $CPW_T $CPW_RT
+    mt_has $CPW_TAB $RP && return 0
     cpw_factory || return 0
     CPW_RELAYS=$((CPW_RELAYS + 1))
     if cpw_mount; then
-        cpw_result "laid over again: the CarPlay app's next start would have opened the factory library (a NEMESIS LivePatch farm laid over its folder after the watch); the app running now keeps what it has"
+        cpw_result "laid over again: the CarPlay app's next start would have opened the factory library (a NEMESIS LivePatch farm laid over its folder after the watch, or a new zygote); the app running now keeps what it has"
     else
         cpw_result "could not be laid over again where the CarPlay app opens its library ($CPW_MP)"
     fi
@@ -3521,13 +3628,14 @@ save)
         carplay_probe list > carplay_probe.txt 2>&1
         # the CarPlay app's process as it runs (to compare a start with the CarPlay watch, through
         # the wrap property, with a normal one): its status, personality, command line,
-        # environment and maps
+        # environment and maps; (0.8.0) its mount table, and the zygote's
         _sp=$(cp_pid)
         if [ -n "$_sp" ]; then
-            for f in status personality cmdline environ maps; do
+            for f in status personality cmdline environ maps mounts; do
                 cat $PROC/$_sp/$f > "dipo_$f.txt" 2>/dev/null
             done
         fi
+        _zp=$(zygote_pid) && cat $PROC/$_zp/mounts > zygote_mounts.txt 2>/dev/null
         dump_to media.audio_flinger audioflinger.txt 15
         dump_to meminfo meminfo_apps.txt 15
         /system/bin/logcat -d -v time > logcat.txt 2>&1
